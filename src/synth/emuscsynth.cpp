@@ -202,17 +202,12 @@ bool CEmuSCSynth::Initialize()
 	for (size_t i = 0; i < ROMPaths.nWaveROMCount; ++i)
 		WavePaths.push_back(static_cast<const char*>(ROMPaths.WaveROMPaths[i]));
 
-	// libEmuSC reports ROM problems by throwing std::string
-	try
+	// libEmuSC reports ROM problems by throwing std::string, but other
+	// failures (std::bad_alloc and friends) must also degrade to "synth
+	// unavailable" here — an uncaught exception would terminate the kernel
+	auto FailInit = [this](const char* pMessage)
 	{
-		m_pControlROM = new EmuSC::ControlRom(static_cast<const char*>(ROMPaths.ControlROMPath),
-		                                       static_cast<const char*>(ROMPaths.CPUROMPath));
-		m_pWaveROM    = new EmuSC::WaveRom(WavePaths, *m_pControlROM);
-		m_pSynth      = new EmuSC::Synth(*m_pControlROM, *m_pWaveROM, MapSoundMap(m_SoundMap));
-	}
-	catch (const std::string& Error)
-	{
-		LOGERR("libEmuSC failed to load ROMs: %s", Error.c_str());
+		LOGERR("libEmuSC failed to load ROMs: %s", pMessage);
 
 		if (m_pSynth)
 		{
@@ -231,6 +226,26 @@ bool CEmuSCSynth::Initialize()
 		}
 
 		return false;
+	};
+
+	try
+	{
+		m_pControlROM = new EmuSC::ControlRom(static_cast<const char*>(ROMPaths.ControlROMPath),
+		                                       static_cast<const char*>(ROMPaths.CPUROMPath));
+		m_pWaveROM    = new EmuSC::WaveRom(WavePaths, *m_pControlROM);
+		m_pSynth      = new EmuSC::Synth(*m_pControlROM, *m_pWaveROM, MapSoundMap(m_SoundMap));
+	}
+	catch (const std::string& Error)
+	{
+		return FailInit(Error.c_str());
+	}
+	catch (const std::exception& Error)
+	{
+		return FailInit(Error.what());
+	}
+	catch (...)
+	{
+		return FailInit("unknown error");
 	}
 
 	m_pSynth->set_audio_format(m_nSampleRate, 2);
