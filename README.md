@@ -1,6 +1,6 @@
 # mt32-pi — EmuSC fork
 
-This is a fork of **[dwhinham/mt32-pi](https://github.com/dwhinham/mt32-pi)**, based on upstream **v0.13.1**. The upstream README follows below, unmodified.
+This is a fork of **[dwhinham/mt32-pi](https://github.com/dwhinham/mt32-pi)**, based on upstream **v0.13.1**. The upstream README follows below, with one exception: the upstream author's personal note on the project's status is not repeated here — see the [upstream README](https://github.com/dwhinham/mt32-pi/blob/master/README.md#please-note).
 
 ## How this fork differs
 
@@ -12,20 +12,6 @@ It adds a **third synth engine — [EmuSC](https://github.com/skjelten/emusc)** 
 - Bare-metal fixes found via QEMU boot-testing: Circle patches to libEmuSC in `patches/emusc-0.7.0-circle.patch` (notably, `exit(0)` on unsupported ROMs becomes a thrown exception instead of a silent kernel halt) and the zone allocator's malloc reserve is raised from 32 MB to 96 MB for libEmuSC's decoded sample cache
 
 **Release:** [v0.13.1-emusc.1](https://github.com/ckeisc/mt32-pi/releases/tag/v0.13.1-emusc.1) — prebuilt SD bundle for Raspberry Pi 3 / Pi Zero 2 W (mt32-pi Lite).
-
----
-
-## Please note
-
-**It's unlikely that there will be any further releases of mt32-pi.**
-
-I have endured a sustained campaign of abuse from members of the VOGONS forum, been labelled a "clout-chaser", had threats sent to my personal email address, code been used in other projects without proper accreditation, my 3D print designs stolen and sold by faceless eBay/Etsy sellers, personal attacks made towards me when people don't get their feature request... the list goes on and on.
-
-*There is only so much I can take.*
-
-My mental health has been in decline as a direct result of this behavior; the joy of working on this project has pretty much gone. There is nothing to be gained from putting time and hard work into it any more. There is no gratitude, no encouragement - just entitled behavior and grift.
-
-To those who supported this project in the past, especially whilst I was a struggling student who needed all the uplift I could get, thank you sincerely.
 
 ---
 
