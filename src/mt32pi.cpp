@@ -119,7 +119,8 @@ CMT32Pi::CMT32Pi(CI2CMaster* pI2CMaster, CSPIMaster* pSPIMaster, CInterruptSyste
 	  m_nMasterVolume(100),
 	  m_pCurrentSynth(nullptr),
 	  m_pMT32Synth(nullptr),
-	  m_pSoundFontSynth(nullptr)
+	  m_pSoundFontSynth(nullptr),
+	  m_pEmuSCSynth(nullptr)
 {
 	s_pThis = this;
 }
@@ -275,11 +276,16 @@ bool CMT32Pi::Initialize(bool bSerialMIDIAvailable)
 	LCDLog(TLCDLogType::Startup, "Init FluidSynth");
 	InitSoundFontSynth();
 
+	LCDLog(TLCDLogType::Startup, "Init EmuSC");
+	InitEmuSCSynth();
+
 	// Set initial synthesizer
 	if (m_pConfig->SystemDefaultSynth == CConfig::TSystemDefaultSynth::MT32)
 		m_pCurrentSynth = m_pMT32Synth;
 	else if (m_pConfig->SystemDefaultSynth == CConfig::TSystemDefaultSynth::SoundFont)
 		m_pCurrentSynth = m_pSoundFontSynth;
+	else if (m_pConfig->SystemDefaultSynth == CConfig::TSystemDefaultSynth::EmuSC)
+		m_pCurrentSynth = m_pEmuSCSynth;
 
 	if (!m_pCurrentSynth)
 	{
@@ -290,6 +296,8 @@ bool CMT32Pi::Initialize(bool bSerialMIDIAvailable)
 			m_pCurrentSynth = m_pMT32Synth;
 		else if (m_pSoundFontSynth)
 			m_pCurrentSynth = m_pSoundFontSynth;
+		else if (m_pEmuSCSynth)
+			m_pCurrentSynth = m_pEmuSCSynth;
 		else
 		{
 			LOGPANIC("No synths available; ROMs/SoundFonts not found");
@@ -406,6 +414,24 @@ bool CMT32Pi::InitSoundFontSynth()
 	}
 
 	m_pSoundFontSynth->SetUserInterface(&m_UserInterface);
+
+	return true;
+}
+
+bool CMT32Pi::InitEmuSCSynth()
+{
+	assert(m_pEmuSCSynth == nullptr);
+
+	m_pEmuSCSynth = new CEmuSCSynth(m_pConfig->AudioSampleRate, m_pConfig->EmuSCGain, m_pConfig->EmuSCSoundMap);
+	if (!m_pEmuSCSynth->Initialize())
+	{
+		LOGWARN("EmuSC init failed; no SC-55 ROMs present?");
+		delete m_pEmuSCSynth;
+		m_pEmuSCSynth = nullptr;
+		return false;
+	}
+
+	m_pEmuSCSynth->SetUserInterface(&m_UserInterface);
 
 	return true;
 }
@@ -534,6 +560,8 @@ void CMT32Pi::UITask()
 				Status.Synth = TMisterSynth::MT32;
 			else if (m_pCurrentSynth == m_pSoundFontSynth)
 				Status.Synth = TMisterSynth::SoundFont;
+			else if (m_pCurrentSynth == m_pEmuSCSynth)
+				Status.Synth = TMisterSynth::EmuSC;
 
 			if (m_pMT32Synth)
 				Status.MT32ROMSet = static_cast<u8>(m_pMT32Synth->GetROMSet());
@@ -802,6 +830,12 @@ void CMT32Pi::UpdateUSB(bool bStartup)
 				else
 					InitSoundFontSynth();
 
+				if (!m_pEmuSCSynth)
+				{
+					LCDLog(TLCDLogType::Spinner, "EmuSC ROM rescan");
+					InitEmuSCSynth();
+				}
+
 				if (m_pSoundFontSynth)
 					LCDLog(TLCDLogType::Notice, "%d SoundFonts avail", m_pSoundFontSynth->GetSoundFontManager().GetSoundFontCount());
 			}
@@ -1043,6 +1077,8 @@ void CMT32Pi::ProcessEventQueue()
 					m_pMT32Synth->AllSoundOff();
 				if (m_pSoundFontSynth)
 					m_pSoundFontSynth->AllSoundOff();
+				if (m_pEmuSCSynth)
+					m_pEmuSCSynth->AllSoundOff();
 				break;
 
 			case TEventType::DisplayImage:
@@ -1069,16 +1105,38 @@ void CMT32Pi::ProcessButtonEvent(const TButtonEvent& Event)
 
 	if (Event.Button == TButton::Button1 && !Event.bRepeat)
 	{
-		// Swap synths
+		// Cycle through the available synths
 		if (m_pCurrentSynth == m_pMT32Synth)
-			SwitchSynth(TSynth::SoundFont);
+		{
+			if (m_pSoundFontSynth)
+				SwitchSynth(TSynth::SoundFont);
+			else if (m_pEmuSCSynth)
+				SwitchSynth(TSynth::EmuSC);
+		}
+		else if (m_pCurrentSynth == m_pSoundFontSynth)
+		{
+			if (m_pEmuSCSynth)
+				SwitchSynth(TSynth::EmuSC);
+			else if (m_pMT32Synth)
+				SwitchSynth(TSynth::MT32);
+		}
 		else
-			SwitchSynth(TSynth::MT32);
+		{
+			if (m_pMT32Synth)
+				SwitchSynth(TSynth::MT32);
+			else if (m_pSoundFontSynth)
+				SwitchSynth(TSynth::SoundFont);
+		}
 	}
 	else if (Event.Button == TButton::Button2 && !Event.bRepeat)
 	{
 		if (m_pCurrentSynth == m_pMT32Synth)
 			NextMT32ROMSet();
+		else if (m_pCurrentSynth == m_pEmuSCSynth)
+		{
+			// No ROM-set switching for EmuSC yet; a single ROM set is supported
+			LCDLog(TLCDLogType::Notice, "%s", m_pEmuSCSynth->GetModelName());
+		}
 		else
 		{
 			// Next SoundFont
@@ -1123,6 +1181,8 @@ void CMT32Pi::SwitchSynth(TSynth NewSynth)
 		pNewSynth = m_pMT32Synth;
 	else if (NewSynth == TSynth::SoundFont)
 		pNewSynth = m_pSoundFontSynth;
+	else if (NewSynth == TSynth::EmuSC)
+		pNewSynth = m_pEmuSCSynth;
 
 	if (pNewSynth == nullptr)
 	{
@@ -1138,7 +1198,7 @@ void CMT32Pi::SwitchSynth(TSynth NewSynth)
 
 	m_pCurrentSynth->AllSoundOff();
 	m_pCurrentSynth = pNewSynth;
-	const char* pMode = NewSynth == TSynth::MT32 ? "MT-32 mode" : "SoundFont mode";
+	const char* pMode = NewSynth == TSynth::MT32 ? "MT-32 mode" : (NewSynth == TSynth::EmuSC ? "EmuSC mode" : "SoundFont mode");
 	LOGNOTE("Switching to %s", pMode);
 	LCDLog(TLCDLogType::Notice, pMode);
 }
@@ -1200,8 +1260,10 @@ void CMT32Pi::SetMasterVolume(s32 nVolume)
 		m_pMT32Synth->SetMasterVolume(m_nMasterVolume);
 	if (m_pSoundFontSynth)
 		m_pSoundFontSynth->SetMasterVolume(m_nMasterVolume);
+	if (m_pEmuSCSynth)
+		m_pEmuSCSynth->SetMasterVolume(m_nMasterVolume);
 
-	if (m_pCurrentSynth == m_pSoundFontSynth)
+	if (m_pCurrentSynth == m_pSoundFontSynth || m_pCurrentSynth == m_pEmuSCSynth)
 		LCDLog(TLCDLogType::Notice, "Volume: %d", m_nMasterVolume);
 }
 

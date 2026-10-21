@@ -5,7 +5,7 @@
 include Config.mk
 
 .DEFAULT_GOAL=all
-.PHONY: submodules circle-stdlib mt32emu fluidsynth all clean veryclean
+.PHONY: submodules circle-stdlib mt32emu fluidsynth emusc all clean veryclean
 
 #
 # Functions to apply/reverse patches only if not completely applied/reversed already
@@ -132,10 +132,37 @@ $(FLUIDSYNTHBUILDDIR)/.done: $(CIRCLESTDLIBHOME)/.done
 	@cmake --build $(FLUIDSYNTHBUILDDIR) --target libfluidsynth
 	@touch $@
 
+
+#
+# Build libEmuSC
+#
+emusc: $(EMUSCBUILDDIR)/.done
+
+$(EMUSCBUILDDIR)/.done: $(CIRCLESTDLIBHOME)/.done
+	@${APPLY_PATCH} $(EMUSCHOME)/.. patches/emusc-0.7.0-circle.patch
+
+	@CFLAGS="$(CFLAGS_EXTERNAL)" \
+	CXXFLAGS="$(CFLAGS_EXTERNAL)" \
+	cmake -B $(EMUSCBUILDDIR) \
+		 $(CMAKE_TOOLCHAIN_FLAGS) \
+		 -DCMAKE_CXX_FLAGS_RELEASE="-Ofast" \
+		 -DCMAKE_CXX_FLAGS="-include $(CURDIR)/include/emuscirclecompat.h" \
+		 -DCMAKE_BUILD_TYPE=Release \
+		 -DBUILD_SHARED_LIBS=OFF \
+		 $(EMUSCHOME) \
+		 >/dev/null
+	@cmake --build $(EMUSCBUILDDIR)
+
+# Stage the public headers as <emusc/*.h> (libEmuSC's own install rules
+# omit some headers that synth.h includes, so copy them all)
+	@mkdir -p $(EMUSCBUILDDIR)/include/emusc
+	@cp $(EMUSCHOME)/src/*.h $(EMUSCBUILDDIR)/include/emusc/
+	@touch $@
+
 #
 # Build kernel itself
 #
-all: circle-stdlib mt32emu fluidsynth
+all: circle-stdlib mt32emu fluidsynth emusc
 	@$(MAKE) -f Kernel.mk $(KERNEL).img $(KERNEL).hex
 
 #
@@ -163,3 +190,7 @@ mrproper: clean
 
 # Clean FluidSynth
 	@$(RM) -r $(FLUIDSYNTHBUILDDIR)
+
+# Clean libEmuSC
+	@${REVERSE_PATCH} $(EMUSCHOME)/.. patches/emusc-0.7.0-circle.patch
+	@$(RM) -r $(EMUSCBUILDDIR)

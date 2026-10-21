@@ -95,4 +95,8 @@ FLUIDSYNTHHOME=$(realpath external/fluidsynth)
 FLUIDSYNTHBUILDDIR=build-fluidsynth
 FLUIDSYNTHLIB=$(FLUIDSYNTHBUILDDIR)/src/libfluidsynth.a
 
+EMUSCHOME=$(realpath external/emusc/libemusc)
+EMUSCBUILDDIR=build-emusc
+EMUSCLIB=$(EMUSCBUILDDIR)/src/libemusc.a
+
 INIHHOME=$(realpath external/inih)

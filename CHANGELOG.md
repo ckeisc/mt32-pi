@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- New EmuSC synthesizer engine based on [libEmuSC](https://github.com/skjelten/emusc) v0.7.0, emulating the Roland Sound Canvas SC-55 family. Select it with `default_synth = emusc`, by cycling synths with the control buttons, via the custom SysEx synth-switch command (parameter `2`), or from MiSTer (new status value `0xA3`). SC-55 ROM dumps are loaded from the `roms/sc55` directory on SD/USB (control/CPU/wave ROMs are identified by file size; wave ROMs load in filename order). New `[emusc]` config section with `gain` and `sound_map` (`gs`/`gs_gm`/`mt32`) options.
+
 ## [0.13.1] - 2023-03-18
 
 ### Changed

@@ -29,6 +29,7 @@ OBJS		:=	src/config.o \
 			src/power.o \
 			src/rommanager.o \
 			src/soundfontmanager.o \
+			src/synth/emuscsynth.o \
 			src/synth/mt32synth.o \
 			src/synth/soundfontsynth.o \
 			src/zoneallocator.o
@@ -47,6 +48,9 @@ OBJS		+=	$(INIHHOME)/ini.o
 INCLUDE		+=	-I $(INIHHOME)
 EXTRACLEAN	+=	$(INIHHOME)/ini.d \
 			$(INIHHOME)/ini.o
+
+# libEmuSC requires C++17; the rest of the kernel is built as C++14
+src/synth/emuscsynth.o: STANDARD = -std=c++17 -Wno-aligned-new
 
 include $(CIRCLEHOME)/Rules.mk
 
@@ -83,6 +87,9 @@ EXTRALIBS	+=	$(MT32EMULIB)
 INCLUDE		+=	-I $(FLUIDSYNTHBUILDDIR)/include \
 			-I $(FLUIDSYNTHHOME)/include
 EXTRALIBS	+=	$(FLUIDSYNTHLIB)
+
+INCLUDE		+=	-I $(EMUSCBUILDDIR)/include
+EXTRALIBS	+=	$(EMUSCLIB)
 
 #
 # Generate version string from git tag

@@ -32,6 +32,7 @@ enum class TMisterSynth : u8
 	Mute      = 0xA0,
 	MT32      = 0xA1,
 	SoundFont = 0xA2,
+	EmuSC     = 0xA3,
 	Unknown   = 0xFF,
 };
 
