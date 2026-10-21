@@ -28,6 +28,7 @@
 
 #include "control/rotaryencoder.h"
 #include "lcd/drivers/ssd1306.h"
+#include "synth/emuscsynth.h"
 #include "synth/mt32romset.h"
 #include "synth/mt32synth.h"
 #include "utility.h"
@@ -37,7 +38,8 @@ class CConfig
 public:
 	#define ENUM_SYSTEMDEFAULTSYNTH(ENUM) \
 		ENUM(MT32, mt32)                  \
-		ENUM(SoundFont, soundfont)
+		ENUM(SoundFont, soundfont)        \
+		ENUM(EmuSC, emusc)
 
 	#define ENUM_AUDIOOUTPUTDEVICE(ENUM) \
 		ENUM(PWM, pwm)                   \
@@ -54,6 +56,7 @@ public:
 	using TMT32EmuResamplerQuality = CMT32Synth::TResamplerQuality;
 	using TMT32EmuMIDIChannels     = CMT32Synth::TMIDIChannels;
 	using TMT32EmuROMSet           = TMT32ROMSet;
+	using TEmuSCSoundMap           = CEmuSCSynth::TSoundMap;
 
 	using TLCDRotation             = CSSD1306::TLCDRotation;
 	using TLCDMirror               = CSSD1306::TLCDMirror;
@@ -96,6 +99,7 @@ public:
 	static bool ParseOption(const char* pString, TMT32EmuResamplerQuality* pOut);
 	static bool ParseOption(const char* pString, TMT32EmuMIDIChannels* pOut);
 	static bool ParseOption(const char* pString, TMT32EmuROMSet* pOut);
+	static bool ParseOption(const char* pString, TEmuSCSoundMap* pOut);
 	static bool ParseOption(const char* pString, TLCDType* pOut);
 	static bool ParseOption(const char* pString, TControlScheme* pOut);
 	static bool ParseOption(const char* pString, TEncoderType* pOut);

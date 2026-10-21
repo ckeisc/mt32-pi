@@ -89,6 +89,11 @@ CFG(chorus_voices,		int,				FluidSynthDefaultChorusVoices,		3						)
 CFG(chorus_speed,		float,				FluidSynthDefaultChorusSpeed,		0.3						)
 END_SECTION
 
+BEGIN_SECTION(emusc)
+CFG(gain,			float,			EmuSCGain,				1.0f						)
+CFG(sound_map,		TEmuSCSoundMap,		EmuSCSoundMap,				TEmuSCSoundMap::GS				)
+END_SECTION
+
 BEGIN_SECTION(lcd)
 CFG(type,			TLCDType,			LCDType,				TLCDType::None					)
 CFG(width,			int,				LCDWidth,				20						)
