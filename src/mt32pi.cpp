@@ -273,9 +273,11 @@ bool CMT32Pi::Initialize(bool bSerialMIDIAvailable)
 	LCDLog(TLCDLogType::Startup, "Init mt32emu");
 	InitMT32Synth();
 
-	LCDLog(TLCDLogType::Startup, "Init FluidSynth");
-	InitSoundFontSynth();
-
+	// Fork: EmuSC replaces FluidSynth. The SoundFont synth is never
+	// constructed, so no SoundFonts are loaded and [soundfont] settings
+	// have no effect; EmuSC occupies the SoundFont slot instead (see
+	// SwitchSynth). This lets unmodified MiSTer cores/Main select EmuSC
+	// via the existing SoundFont (0xA2) state.
 	LCDLog(TLCDLogType::Startup, "Init EmuSC");
 	InitEmuSCSynth();
 
@@ -283,7 +285,7 @@ bool CMT32Pi::Initialize(bool bSerialMIDIAvailable)
 	if (m_pConfig->SystemDefaultSynth == CConfig::TSystemDefaultSynth::MT32)
 		m_pCurrentSynth = m_pMT32Synth;
 	else if (m_pConfig->SystemDefaultSynth == CConfig::TSystemDefaultSynth::SoundFont)
-		m_pCurrentSynth = m_pSoundFontSynth;
+		m_pCurrentSynth = m_pEmuSCSynth;
 	else if (m_pConfig->SystemDefaultSynth == CConfig::TSystemDefaultSynth::EmuSC)
 		m_pCurrentSynth = m_pEmuSCSynth;
 
@@ -561,7 +563,9 @@ void CMT32Pi::UITask()
 			else if (m_pCurrentSynth == m_pSoundFontSynth)
 				Status.Synth = TMisterSynth::SoundFont;
 			else if (m_pCurrentSynth == m_pEmuSCSynth)
-				Status.Synth = TMisterSynth::EmuSC;
+				// Fork: EmuSC occupies the SoundFont slot, so report it as
+				// SoundFont (0xA2) — a state unmodified cores/Main understand
+				Status.Synth = TMisterSynth::SoundFont;
 
 			if (m_pMT32Synth)
 				Status.MT32ROMSet = static_cast<u8>(m_pMT32Synth->GetROMSet());
@@ -824,20 +828,12 @@ void CMT32Pi::UpdateUSB(bool bStartup)
 				else
 					InitMT32Synth();
 
-				LCDLog(TLCDLogType::Spinner, "SoundFont rescan");
-				if (m_pSoundFontSynth)
-					m_pSoundFontSynth->GetSoundFontManager().ScanSoundFonts();
-				else
-					InitSoundFontSynth();
-
+				// Fork: no SoundFont rescan — FluidSynth is replaced by EmuSC
 				if (!m_pEmuSCSynth)
 				{
 					LCDLog(TLCDLogType::Spinner, "EmuSC ROM rescan");
 					InitEmuSCSynth();
 				}
-
-				if (m_pSoundFontSynth)
-					LCDLog(TLCDLogType::Notice, "%d SoundFonts avail", m_pSoundFontSynth->GetSoundFontManager().GetSoundFontCount());
 			}
 		}
 	}
@@ -1180,7 +1176,8 @@ void CMT32Pi::SwitchSynth(TSynth NewSynth)
 	if (NewSynth == TSynth::MT32)
 		pNewSynth = m_pMT32Synth;
 	else if (NewSynth == TSynth::SoundFont)
-		pNewSynth = m_pSoundFontSynth;
+		// Fork: the SoundFont slot is occupied by EmuSC
+		pNewSynth = m_pEmuSCSynth;
 	else if (NewSynth == TSynth::EmuSC)
 		pNewSynth = m_pEmuSCSynth;
 
@@ -1198,7 +1195,7 @@ void CMT32Pi::SwitchSynth(TSynth NewSynth)
 
 	m_pCurrentSynth->AllSoundOff();
 	m_pCurrentSynth = pNewSynth;
-	const char* pMode = NewSynth == TSynth::MT32 ? "MT-32 mode" : (NewSynth == TSynth::EmuSC ? "EmuSC mode" : "SoundFont mode");
+	const char* pMode = pNewSynth == m_pMT32Synth ? "MT-32 mode" : (pNewSynth == m_pEmuSCSynth ? "EmuSC mode" : "SoundFont mode");
 	LOGNOTE("Switching to %s", pMode);
 	LCDLog(TLCDLogType::Notice, pMode);
 }
