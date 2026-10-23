@@ -234,12 +234,13 @@ const char* FriendlyModelName(Romset Romset)
 
 } // namespace
 
-CNukedSC55Synth::CNukedSC55Synth(unsigned nSampleRate, float nGain, bool bOversampling)
+CNukedSC55Synth::CNukedSC55Synth(unsigned nSampleRate, float nGain, bool bOversampling, TH8Engine H8Engine)
 	: CSynthBase(nSampleRate),
 	  m_pEmulator(nullptr),
 	  m_pRomsetInfo(nullptr),
 	  m_nGain(nGain),
 	  m_bOversampling(bOversampling),
+	  m_H8Engine(H8Engine),
 	  m_nVolume(100),
 	  m_nNativeRate(0),
 	  m_dResampleRatio(1.0),
@@ -252,6 +253,33 @@ CNukedSC55Synth::CNukedSC55Synth(unsigned nSampleRate, float nGain, bool bOversa
 	  m_ModelName{},
 	  m_ROMVersion{}
 {
+}
+
+const char* CNukedSC55Synth::H8EngineName(TH8Engine Engine)
+{
+	return Engine == TH8Engine::Legacy ? "legacy" : "decoder2";
+}
+
+namespace
+{
+
+H8Engine ToBackendEngine(CNukedSC55Synth::TH8Engine Engine)
+{
+	return Engine == CNukedSC55Synth::TH8Engine::Legacy ? H8Engine::Legacy : H8Engine::Decoder2;
+}
+
+}
+
+const char* CNukedSC55Synth::CycleH8Engine()
+{
+	m_Lock.Acquire();
+	m_H8Engine = (m_H8Engine == TH8Engine::Decoder2) ? TH8Engine::Legacy : TH8Engine::Decoder2;
+	if (m_pEmulator)
+		m_pEmulator->SetH8Engine(ToBackendEngine(m_H8Engine));
+	m_Lock.Release();
+
+	CDiagLog::Get().LogLine("h8_engine synth=nuked engine=%s", H8EngineName(m_H8Engine));
+	return H8EngineName(m_H8Engine);
 }
 
 CNukedSC55Synth::~CNukedSC55Synth()
@@ -312,6 +340,7 @@ bool CNukedSC55Synth::Initialize()
 	Files.clear();
 	Files.shrink_to_fit();
 
+
 	RomLoadStatusSet LoadStatus;
 	if (!LoadRomset(*m_pRomsetInfo, &LoadStatus))
 	{
@@ -320,6 +349,7 @@ bool CNukedSC55Synth::Initialize()
 		m_pRomsetInfo = nullptr;
 		return false;
 	}
+
 
 	m_pEmulator = new Emulator;
 
@@ -337,6 +367,7 @@ bool CNukedSC55Synth::Initialize()
 
 	m_pEmulator->GetPCM().enable_oversampling = m_bOversampling;
 
+
 	if (!m_pEmulator->LoadRoms(pDefinition->romset, *m_pRomsetInfo))
 	{
 		LOGERR("LoadRoms failed for romset %s", pDefinition->name);
@@ -353,6 +384,10 @@ bool CNukedSC55Synth::Initialize()
 	m_pEmulator->SetSampleCallback([](void* pUserData, const AudioFrame<int32_t>& Frame) {
 		static_cast<CNukedSC55Synth*>(pUserData)->OnSample(Frame.left, Frame.right);
 	}, this);
+
+	// Apply the configured H8 execution path before reset/priming so
+	// the whole boot sequence runs on the selected engine.
+	m_pEmulator->SetH8Engine(ToBackendEngine(m_H8Engine));
 
 	m_pEmulator->Reset();
 
@@ -388,8 +423,8 @@ bool CNukedSC55Synth::Initialize()
 	LOGNOTE("Nuked-SC55 initialized: romset %s (%s v%s), native rate %u Hz, oversampling %s",
 	        pDefinition->name, m_ModelName, m_ROMVersion, m_nNativeRate, m_bOversampling ? "on" : "off");
 
-	CDiagLog::Get().LogLine("init synth=nuked romset=%s rate=%u oversampling=%s heap_free_low_kb=%u prime_insn=%llu prime_emu_us=%llu prime_pcm_us=%llu",
-	                        pDefinition->name, m_nNativeRate, m_bOversampling ? "on" : "off",
+	CDiagLog::Get().LogLine("init synth=nuked romset=%s rate=%u oversampling=%s h8_engine=%s heap_free_low_kb=%u prime_insn=%llu prime_emu_us=%llu prime_pcm_us=%llu",
+	                        pDefinition->name, m_nNativeRate, m_bOversampling ? "on" : "off", H8EngineName(m_H8Engine),
 	                        static_cast<unsigned>(CMemorySystem::Get()->GetHeapFreeSpace(HEAP_LOW) / 1024),
 	                        static_cast<unsigned long long>(NukedProfile().nInstructions),
 	                        static_cast<unsigned long long>(NukedProfile().nTotalUs),
@@ -649,7 +684,8 @@ void CNukedSC55Synth::UpdateLCD(CLCD& LCD, unsigned int nTicks)
 			const u64 nWindowUs = nNowUs - Stats.nWindowStartUs;
 			if (nTotalDelta > 0 && nWindowUs > 0)
 			{
-				DiagLog.LogLine("profile synth=nuked emu_pct=%llu mcu_pct=%llu pcm_pct=%llu insn_per_sec=%llu",
+				DiagLog.LogLine("profile synth=nuked engine=%s emu_pct=%llu mcu_pct=%llu pcm_pct=%llu insn_per_sec=%llu",
+				                H8EngineName(m_H8Engine),
 				                static_cast<unsigned long long>(nTotalDelta * 100 / nWindowUs),
 				                static_cast<unsigned long long>((nTotalDelta - nPCMDelta) * 100 / nTotalDelta),
 				                static_cast<unsigned long long>(nPCMDelta * 100 / nTotalDelta),

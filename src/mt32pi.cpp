@@ -455,7 +455,7 @@ bool CMT32Pi::InitNukedSC55Synth()
 {
 	assert(m_pNukedSC55Synth == nullptr);
 
-	m_pNukedSC55Synth = new CNukedSC55Synth(m_pConfig->AudioSampleRate, m_pConfig->NukedGain, m_pConfig->NukedOversampling);
+	m_pNukedSC55Synth = new CNukedSC55Synth(m_pConfig->AudioSampleRate, m_pConfig->NukedGain, m_pConfig->NukedOversampling, m_pConfig->NukedH8Engine);
 	if (!m_pNukedSC55Synth->Initialize())
 	{
 		LOGWARN("Nuked-SC55 init failed; no complete SC-55 ROM set present?");
@@ -1197,8 +1197,9 @@ void CMT32Pi::ProcessButtonEvent(const TButtonEvent& Event)
 		}
 		else if (m_pCurrentSynth == m_pNukedSC55Synth)
 		{
-			// No ROM-set switching for Nuked-SC55 yet; a single ROM set is supported
-			LCDLog(TLCDLogType::Notice, "%s", m_pNukedSC55Synth->GetModelName());
+			// Nuked-SC55 uses a single ROM set, so Button 2 instead
+			// cycles the H8 execution path (decoder2 <-> legacy)
+			LCDLog(TLCDLogType::Notice, "H8 engine: %s", m_pNukedSC55Synth->CycleH8Engine());
 		}
 		else
 		{

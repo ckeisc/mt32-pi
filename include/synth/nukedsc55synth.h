@@ -38,8 +38,20 @@ struct RomsetInfo;
 class CNukedSC55Synth : public CSynthBase
 {
 public:
-	CNukedSC55Synth(unsigned nSampleRate, float nGain, bool bOversampling);
+	#define ENUM_NUKEDH8ENGINE(ENUM) \
+		ENUM(Decoder2, decoder2)     \
+		ENUM(Legacy, legacy)
+
+	CONFIG_ENUM(TH8Engine, ENUM_NUKEDH8ENGINE);
+
+	CNukedSC55Synth(unsigned nSampleRate, float nGain, bool bOversampling, TH8Engine H8Engine);
 	virtual ~CNukedSC55Synth() override;
+
+	// Cycle the H8 execution path (Button 2 while this synth is
+	// active). Takes effect between instructions; returns the config
+	// string name of the newly selected engine.
+	const char* CycleH8Engine();
+	static const char* H8EngineName(TH8Engine Engine);
 
 	// CSynthBase
 	virtual bool Initialize() override;
@@ -71,6 +83,7 @@ private:
 
 	float m_nGain;
 	bool m_bOversampling;
+	TH8Engine m_H8Engine;
 	u8 m_nVolume;
 
 	unsigned m_nNativeRate;

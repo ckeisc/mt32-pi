@@ -21,8 +21,30 @@ index 637f3e2..625eb3e 100644
  endif()
  
  # ASIO
+diff --git a/src/backend/decoder2/cache.h b/src/backend/decoder2/cache.h
+index 6d49868..68e7617 100644
+--- a/src/backend/decoder2/cache.h
++++ b/src/backend/decoder2/cache.h
+@@ -64,6 +64,17 @@ public:
+ 
+     size_t CountCached() const;
+ 
++    // mt32-pi: drop all decoded instructions. Used when the H8
++    // execution path is switched at runtime, so decodes made under
++    // one path can never be consumed by the other. Cleared in place:
++    // this runs when the host heap may have only a few MB free, so it
++    // must never allocate.
++    void Reset()
++    {
++        if (m_cache)
++            m_cache->fill(DecodedInstruction{});
++    }
++
+ private:
+     std::unique_ptr<ArrayType> m_cache;
+ };
 diff --git a/src/backend/emu.cpp b/src/backend/emu.cpp
-index 976c02c..0c4a746 100644
+index 976c02c..43cc683 100644
 --- a/src/backend/emu.cpp
 +++ b/src/backend/emu.cpp
 @@ -17,6 +17,7 @@
@@ -33,7 +55,7 @@ index 976c02c..0c4a746 100644
  #include "lcd.h"
  #include "mcu.h"
  #include "mcu_timer.h"
-@@ -159,8 +160,37 @@ void Emulator::PostSystemReset(EMU_SystemReset reset)
+@@ -159,8 +160,55 @@ void Emulator::PostSystemReset(EMU_SystemReset reset)
      }
  }
  
@@ -58,6 +80,24 @@ index 976c02c..0c4a746 100644
 +    return g_nukedProfile;
 +}
 +
++void Emulator::SetH8Engine(H8Engine engine)
++{
++    if (MCU_GetH8Engine() == engine)
++        return;
++
++    MCU_SetH8Engine(engine);
++
++#if NUKED_ENABLE_DECODER2
++    if (m_mcu)
++        m_mcu->icache.Reset();
++#endif
++}
++
++H8Engine Emulator::GetH8Engine() const
++{
++    return MCU_GetH8Engine();
++}
++
  void Emulator::Step()
  {
 +    if (const auto pClock = NukedProfileClock())
@@ -71,6 +111,23 @@ index 976c02c..0c4a746 100644
      MCU_Step(*m_mcu);
  }
  
+diff --git a/src/backend/emu.h b/src/backend/emu.h
+index 006ebd0..30550e4 100644
+--- a/src/backend/emu.h
++++ b/src/backend/emu.h
+@@ -68,6 +68,12 @@ public:
+ 
+     void SetSampleCallback(mcu_sample_callback callback, void* userdata);
+ 
++    // mt32-pi: runtime H8 execution-path selection (see mcu.h). Takes
++    // effect between instructions; switching flushes the decoder2
++    // instruction cache.
++    void SetH8Engine(H8Engine engine);
++    H8Engine GetH8Engine() const;
++
+     // Loads roms from buffers referenced by `info`. If the slot for a rom in `info` has a non-empty `rom_data`, it
+     // will be loaded even if the romset doesn't require it.
+     //
 diff --git a/src/backend/lcd.h b/src/backend/lcd.h
 index 5207950..d57dfd2 100644
 --- a/src/backend/lcd.h
@@ -90,7 +147,7 @@ index 5207950..d57dfd2 100644
  class LCD_Backend
  {
 diff --git a/src/backend/mcu.cpp b/src/backend/mcu.cpp
-index 41e6b9f..ca2c1df 100644
+index 41e6b9f..4b9eb96 100644
 --- a/src/backend/mcu.cpp
 +++ b/src/backend/mcu.cpp
 @@ -25,6 +25,7 @@
@@ -101,7 +158,44 @@ index 41e6b9f..ca2c1df 100644
  
  void MCU_ErrorTrap(mcu_t& mcu)
  {
-@@ -904,8 +905,13 @@ void MCU_Step(mcu_t& mcu)
+@@ -784,14 +785,32 @@ void MCU_Write16(mcu_t& mcu, uint32_t address, uint16_t value)
+     MCU_Write(mcu, address + 1, (uint8_t)(value & 0xff));
+ }
+ 
++namespace
++{
++    H8Engine g_h8Engine = H8Engine::Decoder2;
++}
++
++void MCU_SetH8Engine(H8Engine engine)
++{
++    g_h8Engine = engine;
++}
++
++H8Engine MCU_GetH8Engine()
++{
++    return g_h8Engine;
++}
++
+ void MCU_ReadInstruction(mcu_t& mcu)
+ {
+ #if NUKED_ENABLE_DECODER2
+-    decoder2::FetchDecodeExecuteNext(mcu);
+-#else
+-    uint8_t operand = MCU_ReadCodeAdvance(mcu);
+-    MCU_Operand_Table[operand](mcu, operand);
++    if (g_h8Engine == H8Engine::Decoder2)
++        decoder2::FetchDecodeExecuteNext(mcu);
++    else
+ #endif
++    {
++        uint8_t operand = MCU_ReadCodeAdvance(mcu);
++        MCU_Operand_Table[operand](mcu, operand);
++    }
+ 
+     if (mcu.sr & STATUS_T)
+     {
+@@ -904,8 +923,13 @@ void MCU_Step(mcu_t& mcu)
          mcu.ex_ignore = 0;
  
      if (!mcu.sleep)
@@ -115,6 +209,31 @@ index 41e6b9f..ca2c1df 100644
      mcu.cycles += 12; // FIXME: assume 12 cycles per instruction
  
      // if (mcu.cycles % 24000000 == 0)
+diff --git a/src/backend/mcu.h b/src/backend/mcu.h
+index 6737cd6..a026090 100644
+--- a/src/backend/mcu.h
++++ b/src/backend/mcu.h
+@@ -303,6 +303,20 @@ void MCU_Reset(mcu_t& mcu);
+ void MCU_PatchROM(mcu_t& mcu);
+ void MCU_Step(mcu_t& mcu);
+ 
++// mt32-pi: runtime-selectable H8 execution path. Both interpreters are
++// compiled in; the selection is consulted per instruction in
++// MCU_ReadInstruction and may be changed between steps (all state is
++// shared in mcu_t). JIT is reserved for a future dynamic recompiler.
++enum class H8Engine : uint8_t
++{
++    Decoder2 = 0,
++    Legacy   = 1,
++    JIT      = 2,
++};
++
++void MCU_SetH8Engine(H8Engine engine);
++H8Engine MCU_GetH8Engine();
++
+ void MCU_ErrorTrap(mcu_t& mcu);
+ 
+ uint8_t MCU_Read(mcu_t& mcu, uint32_t address);
 diff --git a/src/backend/nuked_profile.h b/src/backend/nuked_profile.h
 new file mode 100644
 index 0000000..9ea3a05
