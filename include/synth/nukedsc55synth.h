@@ -79,6 +79,22 @@ private:
 	u64 m_nWrittenFrames;		// Total native frames produced (callback)
 	u64 m_nLastActiveFrame;		// Native frame index of the last above-threshold sample
 
+	// Render timing statistics for the diagnostic log; accumulated in
+	// RenderFrames() (audio context, brief stats lock) and flushed
+	// periodically from UpdateLCD() when [diagnostics] is enabled.
+	struct TRenderStats
+	{
+		u64 nCalls          = 0;
+		u64 nFrames         = 0;
+		u64 nTotalUs        = 0;
+		u64 nMaxUs          = 0;
+		u64 nMisses         = 0;
+		u64 nUnderrunFrames = 0;
+		u64 nWindowStartUs  = 0;
+	};
+	TRenderStats m_Stats;
+	CSpinLock m_StatsLock;
+
 	float m_RingBuffer[RingBufferFrames][2];
 
 	char m_ModelName[16];

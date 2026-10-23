@@ -28,6 +28,7 @@
 
 #include <cstdarg>
 
+#include "diaglog.h"
 #include "lcd/drivers/hd44780.h"
 #include "lcd/drivers/ssd1306.h"
 #include "lcd/ui.h"
@@ -270,6 +271,12 @@ bool CMT32Pi::Initialize(bool bSerialMIDIAvailable)
 		delete m_pControl;
 		m_pControl = nullptr;
 	}
+
+	// Diagnostic log (no-op unless [diagnostics] enabled = on)
+	CDiagLog::Get().Initialize();
+	CDiagLog::Get().LogLine("boot sample_rate=%u chunk_size=%u heap_free_low_kb=%u",
+	                        m_pConfig->AudioSampleRate, m_pConfig->AudioChunkSize,
+	                        static_cast<unsigned>(CMemorySystem::Get()->GetHeapFreeSpace(HEAP_LOW) / 1024));
 
 	LCDLog(TLCDLogType::Startup, "Init mt32emu");
 	InitMT32Synth();
@@ -1259,6 +1266,7 @@ void CMT32Pi::SwitchSynth(TSynth NewSynth)
 	const char* pMode = NewSynth == TSynth::MT32 ? "MT-32 mode" : (NewSynth == TSynth::EmuSC ? "EmuSC mode" : (NewSynth == TSynth::NukedSC55 ? "Nuked-SC55 mode" : "SoundFont mode"));
 	LOGNOTE("Switching to %s", pMode);
 	LCDLog(TLCDLogType::Notice, pMode);
+	CDiagLog::Get().LogLine("switch synth=%s", pMode);
 }
 
 void CMT32Pi::SwitchMT32ROMSet(TMT32ROMSet ROMSet)

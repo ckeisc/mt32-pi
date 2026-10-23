@@ -61,7 +61,8 @@ endif
 	@echo "DEFINE += -DNO_BUSY_WAIT" >> $(CIRCLE_CONFIG)
 
 # The Nuked-SC55 backend pushes the kernel image past Circle's default
-# 2 MB KERNEL_MAX_SIZE, which would leave the kernel stack inside .rodata
+# 2 MB KERNEL_MAX_SIZE, which would leave the kernel stack inside .rodata.
+# 4 MB is kept deliberately (Joe, 2026-10-23) so the image has room to grow.
 	@echo "DEFINE += -DKERNEL_MAX_SIZE=4194304" >> $(CIRCLE_CONFIG)
 
 # Enable PWM audio output on GPIO 12/13 for the Pi Zero 2 W

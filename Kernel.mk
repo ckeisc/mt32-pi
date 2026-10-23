@@ -32,6 +32,7 @@ OBJS		:=	src/config.o \
 			src/synth/emuscsynth.o \
 			src/synth/mt32synth.o \
 			src/synth/nukedsc55synth.o \
+			src/diaglog.o \
 			src/synth/soundfontsynth.o \
 			src/zoneallocator.o
 

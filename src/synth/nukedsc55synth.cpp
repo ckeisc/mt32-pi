@@ -26,10 +26,14 @@
 #include <strings.h>
 #include <vector>
 
+#include <circle/cputhrottle.h>
 #include <circle/logger.h>
+#include <circle/memory.h>
+#include <circle/timer.h>
 #include <fatfs/ff.h>
 
 #include "config.h"
+#include "diaglog.h"
 #include "lcd/ui.h"
 #include "synth/nukedsc55synth.h"
 #include "utility.h"
@@ -155,7 +159,7 @@ bool ScanROMFiles(std::vector<TROMFile>& OutFiles)
 // files. MK1 definitions (the SC-55) are preferred, as with the other
 // Sound Canvas engine the plain SC-55 set is the reference set; any other
 // complete set is accepted as a fallback.
-const RomsetDefinition* MatchRomset(const std::vector<TROMFile>& Files, const TROMFile* pMatchedFiles[ROMLOCATION_COUNT])
+const RomsetDefinition* MatchRomset(std::vector<TROMFile>& Files, TROMFile* pMatchedFiles[ROMLOCATION_COUNT])
 {
 	const auto Definitions = GetStandardRomsetDefinitions();
 
@@ -173,8 +177,8 @@ const RomsetDefinition* MatchRomset(const std::vector<TROMFile>& Files, const TR
 			for (const RomLocation Location : Definition.GetValidLocations())
 			{
 				const SHA256_Digest& Wanted = Definition.GetHash(Location);
-				const TROMFile* pMatch      = nullptr;
-				for (const TROMFile& File : Files)
+				TROMFile* pMatch            = nullptr;
+				for (TROMFile& File : Files)
 				{
 					if (File.Digest == Wanted)
 					{
@@ -241,6 +245,8 @@ CNukedSC55Synth::CNukedSC55Synth(unsigned nSampleRate, float nGain, bool bOversa
 	  m_dReadPosition(0.0),
 	  m_nWrittenFrames(0),
 	  m_nLastActiveFrame(0),
+	  m_Stats{},
+	  m_StatsLock(TASK_LEVEL),
 	  m_RingBuffer{},
 	  m_ModelName{},
 	  m_ROMVersion{}
@@ -279,7 +285,7 @@ bool CNukedSC55Synth::Initialize()
 		return false;
 	}
 
-	const TROMFile* pMatchedFiles[ROMLOCATION_COUNT];
+	TROMFile* pMatchedFiles[ROMLOCATION_COUNT];
 	const RomsetDefinition* pDefinition = MatchRomset(Files, pMatchedFiles);
 	if (!pDefinition)
 	{
@@ -289,14 +295,16 @@ bool CNukedSC55Synth::Initialize()
 
 	// Hand the backend the raw (still scrambled) ROM images; LoadRomset()
 	// unscrambles the wave ROMs in place, exactly as it does for files it
-	// loads itself. The RomsetInfo must outlive the emulator: LoadRoms()
-	// is documented to potentially reference the data.
+	// loads itself. The buffers are moved (not copied) out of the scan
+	// results so the images are only held once. The RomsetInfo object
+	// itself is kept for the emulator's lifetime, but its rom_data is
+	// released again after LoadRoms() (see below).
 	m_pRomsetInfo = new RomsetInfo;
 	for (size_t i = 0; i < ROMLOCATION_COUNT; ++i)
 	{
 		if (pMatchedFiles[i])
 		{
-			m_pRomsetInfo->rom_data[i] = pMatchedFiles[i]->Data;
+			m_pRomsetInfo->rom_data[i] = std::move(pMatchedFiles[i]->Data);
 			LOGNOTE("ROM %s <- %s", ToCString(static_cast<RomLocation>(i)), static_cast<const char*>(pMatchedFiles[i]->Name));
 		}
 	}
@@ -347,6 +355,12 @@ bool CNukedSC55Synth::Initialize()
 
 	m_pEmulator->Reset();
 
+	// LoadRoms() copies every ROM into the backend's internal buffers
+	// (Emulator::LoadRom), nothing references rom_data afterwards, and
+	// upstream's own frontend releases it at this point too. Freeing the
+	// staging images returns several MB to the kernel heap.
+	m_pRomsetInfo->PurgeRomData();
+
 	// Run the firmware through (part of) its power-on sequence now so the
 	// module is awake by the time it is selected; any remaining boot time
 	// elapses during normal rendering, as it would on real hardware.
@@ -366,6 +380,10 @@ bool CNukedSC55Synth::Initialize()
 
 	LOGNOTE("Nuked-SC55 initialized: romset %s (%s v%s), native rate %u Hz, oversampling %s",
 	        pDefinition->name, m_ModelName, m_ROMVersion, m_nNativeRate, m_bOversampling ? "on" : "off");
+
+	CDiagLog::Get().LogLine("init synth=nuked romset=%s rate=%u oversampling=%s heap_free_low_kb=%u",
+	                        pDefinition->name, m_nNativeRate, m_bOversampling ? "on" : "off",
+	                        static_cast<unsigned>(CMemorySystem::Get()->GetHeapFreeSpace(HEAP_LOW) / 1024));
 
 	return true;
 }
@@ -470,6 +488,11 @@ size_t CNukedSC55Synth::RenderFrames(float* pOutBuffer, size_t nFrames)
 
 	const float nScale = m_nGain * (static_cast<float>(m_nVolume) / 100.0f);
 
+	CDiagLog& DiagLog        = CDiagLog::Get();
+	const bool bDiag         = DiagLog.IsEnabled();
+	const u64 nStartUs       = bDiag ? CTimer::Get()->GetClockTicks() : 0;
+	u64 nUnderrunFrames      = 0;
+
 	m_Lock.Acquire();
 
 	// Step the emulator until enough native-rate frames are available
@@ -493,6 +516,7 @@ size_t CNukedSC55Synth::RenderFrames(float* pOutBuffer, size_t nFrames)
 			pOutBuffer[i * 2]     = 0.0f;
 			pOutBuffer[i * 2 + 1] = 0.0f;
 			m_dReadPosition       = static_cast<double>(m_nWrittenFrames);
+			++nUnderrunFrames;
 			continue;
 		}
 
@@ -504,6 +528,25 @@ size_t CNukedSC55Synth::RenderFrames(float* pOutBuffer, size_t nFrames)
 		pOutBuffer[i * 2 + 1] = (pA[1] + (pB[1] - pA[1]) * nFrac) * nScale;
 
 		m_dReadPosition += m_dResampleRatio;
+	}
+
+	if (bDiag)
+	{
+		const u64 nElapsedUs = CTimer::Get()->GetClockTicks() - nStartUs;
+		const u64 nBudgetUs  = static_cast<u64>(nFrames) * 1000000ULL / m_nSampleRate;
+
+		m_StatsLock.Acquire();
+		if (m_Stats.nCalls == 0)
+			m_Stats.nWindowStartUs = nStartUs;
+		++m_Stats.nCalls;
+		m_Stats.nFrames += nFrames;
+		m_Stats.nTotalUs += nElapsedUs;
+		if (nElapsedUs > m_Stats.nMaxUs)
+			m_Stats.nMaxUs = nElapsedUs;
+		if (nElapsedUs > nBudgetUs)
+			++m_Stats.nMisses;
+		m_Stats.nUnderrunFrames += nUnderrunFrames;
+		m_StatsLock.Release();
 	}
 
 	m_Lock.Release();
@@ -549,4 +592,32 @@ void CNukedSC55Synth::UpdateLCD(CLCD& LCD, unsigned int nTicks)
 	float ChannelLevels[16], PeakLevels[16];
 	m_MIDIMonitor.GetChannelLevels(nTicks, ChannelLevels, PeakLevels, 1 << 9);
 	CUserInterface::DrawChannelLevels(LCD, nBarHeight, ChannelLevels, PeakLevels, 16, true);
+
+	// Flush accumulated render timing statistics to the diagnostic log
+	CDiagLog& DiagLog = CDiagLog::Get();
+	if (DiagLog.IsEnabled())
+	{
+		const u64 nNowUs = CTimer::Get()->GetClockTicks();
+
+		m_StatsLock.Acquire();
+		const TRenderStats Stats = m_Stats;
+		const bool bDue          = Stats.nCalls > 0 && Stats.nWindowStartUs != 0 &&
+		                  nNowUs - Stats.nWindowStartUs >= static_cast<u64>(DiagLog.IntervalSeconds()) * 1000000ULL;
+		if (bDue)
+			m_Stats = TRenderStats{};
+		m_StatsLock.Release();
+
+		if (bDue)
+		{
+			CCPUThrottle* pThrottle = CCPUThrottle::Get();
+			DiagLog.LogLine("render synth=nuked calls=%llu frames=%llu avg_us=%llu max_us=%llu miss_pct=%llu underrun_frames=%llu temp_c=%u",
+			                static_cast<unsigned long long>(Stats.nCalls),
+			                static_cast<unsigned long long>(Stats.nFrames),
+			                static_cast<unsigned long long>(Stats.nTotalUs / Stats.nCalls),
+			                static_cast<unsigned long long>(Stats.nMaxUs),
+			                static_cast<unsigned long long>(Stats.nMisses * 100 / Stats.nCalls),
+			                static_cast<unsigned long long>(Stats.nUnderrunFrames),
+			                pThrottle ? pThrottle->GetTemperature() : 0);
+		}
+	}
 }

@@ -21,3 +21,21 @@ index 637f3e2..625eb3e 100644
  endif()
  
  # ASIO
+diff --git a/src/backend/lcd.h b/src/backend/lcd.h
+index 5207950..d57dfd2 100644
+--- a/src/backend/lcd.h
++++ b/src/backend/lcd.h
+@@ -25,8 +25,11 @@
+ struct mcu_t;
+ struct lcd_t;
+ 
+-static const int lcd_width_max = 1024;
+-static const int lcd_height_max = 1024;
++// mt32-pi: the largest canvas any supported device requests in
++// LCD_Start() is 820x268 (JV-880); the upstream 1024x1024 framebuffer
++// costs 4 MiB of kernel heap that a bare-metal build never displays.
++static const int lcd_width_max = 832;
++static const int lcd_height_max = 288;
+ 
+ class LCD_Backend
+ {
