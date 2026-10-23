@@ -45,6 +45,7 @@
 #include "nukedcirclecompat.h"
 
 #include "emu.h"
+#include "nuked_profile.h"
 #include "pcm.h"
 #include "rom.h"
 #include "rom_io.h"
@@ -355,6 +356,12 @@ bool CNukedSC55Synth::Initialize()
 
 	m_pEmulator->Reset();
 
+	// Enable backend phase profiling only when the diag log is on, so
+	// normal operation carries none of its cost. Installed before the
+	// priming steps below so the boot sequence is profiled too.
+	if (CDiagLog::Get().IsEnabled())
+		NukedProfileSetClock([]() -> uint64_t { return CTimer::Get()->GetClockTicks(); });
+
 	// LoadRoms() copies every ROM into the backend's internal buffers
 	// (Emulator::LoadRom), nothing references rom_data afterwards, and
 	// upstream's own frontend releases it at this point too. Freeing the
@@ -381,9 +388,18 @@ bool CNukedSC55Synth::Initialize()
 	LOGNOTE("Nuked-SC55 initialized: romset %s (%s v%s), native rate %u Hz, oversampling %s",
 	        pDefinition->name, m_ModelName, m_ROMVersion, m_nNativeRate, m_bOversampling ? "on" : "off");
 
-	CDiagLog::Get().LogLine("init synth=nuked romset=%s rate=%u oversampling=%s heap_free_low_kb=%u",
+	CDiagLog::Get().LogLine("init synth=nuked romset=%s rate=%u oversampling=%s heap_free_low_kb=%u prime_insn=%llu prime_emu_us=%llu prime_pcm_us=%llu",
 	                        pDefinition->name, m_nNativeRate, m_bOversampling ? "on" : "off",
-	                        static_cast<unsigned>(CMemorySystem::Get()->GetHeapFreeSpace(HEAP_LOW) / 1024));
+	                        static_cast<unsigned>(CMemorySystem::Get()->GetHeapFreeSpace(HEAP_LOW) / 1024),
+	                        static_cast<unsigned long long>(NukedProfile().nInstructions),
+	                        static_cast<unsigned long long>(NukedProfile().nTotalUs),
+	                        static_cast<unsigned long long>(NukedProfile().nPCMUs));
+
+	// Baseline for the periodic flush: don't charge priming to the
+	// first render interval.
+	m_nLastProfileTotalUs = NukedProfile().nTotalUs;
+	m_nLastProfilePCMUs   = NukedProfile().nPCMUs;
+	m_nLastProfileInsn    = NukedProfile().nInstructions;
 
 	return true;
 }
@@ -618,6 +634,27 @@ void CNukedSC55Synth::UpdateLCD(CLCD& LCD, unsigned int nTicks)
 			                static_cast<unsigned long long>(Stats.nMisses * 100 / Stats.nCalls),
 			                static_cast<unsigned long long>(Stats.nUnderrunFrames),
 			                pThrottle ? pThrottle->GetTemperature() : 0);
+
+			// Backend phase split for the same window: emulator wall
+			// share of one core, MCU+peripherals vs PCM share of the
+			// emulator's time, and the H8 instruction rate.
+			const NukedProfileData& Profile = NukedProfile();
+			const u64 nTotalDelta          = Profile.nTotalUs - m_nLastProfileTotalUs;
+			const u64 nPCMDelta            = Profile.nPCMUs - m_nLastProfilePCMUs;
+			const u64 nInsnDelta           = Profile.nInstructions - m_nLastProfileInsn;
+			m_nLastProfileTotalUs          = Profile.nTotalUs;
+			m_nLastProfilePCMUs            = Profile.nPCMUs;
+			m_nLastProfileInsn             = Profile.nInstructions;
+
+			const u64 nWindowUs = nNowUs - Stats.nWindowStartUs;
+			if (nTotalDelta > 0 && nWindowUs > 0)
+			{
+				DiagLog.LogLine("profile synth=nuked emu_pct=%llu mcu_pct=%llu pcm_pct=%llu insn_per_sec=%llu",
+				                static_cast<unsigned long long>(nTotalDelta * 100 / nWindowUs),
+				                static_cast<unsigned long long>((nTotalDelta - nPCMDelta) * 100 / nTotalDelta),
+				                static_cast<unsigned long long>(nPCMDelta * 100 / nTotalDelta),
+				                static_cast<unsigned long long>(nInsnDelta * 1000000ULL / nWindowUs));
+			}
 		}
 	}
 }

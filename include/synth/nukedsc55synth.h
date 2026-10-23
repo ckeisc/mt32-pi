@@ -95,6 +95,12 @@ private:
 	TRenderStats m_Stats;
 	CSpinLock m_StatsLock;
 
+	// Backend profiling snapshots (see nuked_profile.h in the backend):
+	// cumulative counters are read and diffed at each diag flush.
+	u64 m_nLastProfileTotalUs = 0;
+	u64 m_nLastProfilePCMUs   = 0;
+	u64 m_nLastProfileInsn    = 0;
+
 	float m_RingBuffer[RingBufferFrames][2];
 
 	char m_ModelName[16];

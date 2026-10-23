@@ -21,6 +21,56 @@ index 637f3e2..625eb3e 100644
  endif()
  
  # ASIO
+diff --git a/src/backend/emu.cpp b/src/backend/emu.cpp
+index 976c02c..0c4a746 100644
+--- a/src/backend/emu.cpp
++++ b/src/backend/emu.cpp
+@@ -17,6 +17,7 @@
+ 
+ #include "emu.h"
+ #include "diagnostics.h"
++#include "nuked_profile.h"
+ #include "lcd.h"
+ #include "mcu.h"
+ #include "mcu_timer.h"
+@@ -159,8 +160,37 @@ void Emulator::PostSystemReset(EMU_SystemReset reset)
+     }
+ }
+ 
++namespace
++{
++    NukedProfileClockFn g_nukedProfileClock = nullptr;
++    NukedProfileData g_nukedProfile;
++}
++
++void NukedProfileSetClock(NukedProfileClockFn pFn)
++{
++    g_nukedProfileClock = pFn;
++}
++
++NukedProfileClockFn NukedProfileClock()
++{
++    return g_nukedProfileClock;
++}
++
++NukedProfileData& NukedProfile()
++{
++    return g_nukedProfile;
++}
++
+ void Emulator::Step()
+ {
++    if (const auto pClock = NukedProfileClock())
++    {
++        const uint64_t nStart = pClock();
++        MCU_Step(*m_mcu);
++        NukedProfile().nTotalUs += pClock() - nStart;
++        return;
++    }
++
+     MCU_Step(*m_mcu);
+ }
+ 
 diff --git a/src/backend/lcd.h b/src/backend/lcd.h
 index 5207950..d57dfd2 100644
 --- a/src/backend/lcd.h
@@ -39,3 +89,98 @@ index 5207950..d57dfd2 100644
  
  class LCD_Backend
  {
+diff --git a/src/backend/mcu.cpp b/src/backend/mcu.cpp
+index 41e6b9f..ca2c1df 100644
+--- a/src/backend/mcu.cpp
++++ b/src/backend/mcu.cpp
+@@ -25,6 +25,7 @@
+ #include "mcu_timer.h"
+ #include "pcm.h"
+ #include "submcu.h"
++#include "nuked_profile.h"
+ 
+ void MCU_ErrorTrap(mcu_t& mcu)
+ {
+@@ -904,8 +905,13 @@ void MCU_Step(mcu_t& mcu)
+         mcu.ex_ignore = 0;
+ 
+     if (!mcu.sleep)
++    {
+         MCU_ReadInstruction(mcu);
+ 
++        if (NukedProfileClock())
++            ++NukedProfile().nInstructions;
++    }
++
+     mcu.cycles += 12; // FIXME: assume 12 cycles per instruction
+ 
+     // if (mcu.cycles % 24000000 == 0)
+diff --git a/src/backend/nuked_profile.h b/src/backend/nuked_profile.h
+new file mode 100644
+index 0000000..9ea3a05
+--- /dev/null
++++ b/src/backend/nuked_profile.h
+@@ -0,0 +1,26 @@
++#pragma once
++
++// mt32-pi diagnostics profiling (not part of upstream Nuked-SC55).
++//
++// Coarse phase accounting for the optimization work: wall time inside
++// Emulator::Step split into PCM rendering vs everything else (H8
++// instruction execution, timers, UART, analog), plus the executed
++// instruction count. A host installs a microsecond clock to enable it;
++// with no clock installed (the default) every seam costs one predictable
++// branch and accumulates nothing.
++
++#include <cstdint>
++
++struct NukedProfileData
++{
++    uint64_t nTotalUs      = 0; // wall time inside Emulator::Step
++    uint64_t nPCMUs        = 0; // wall time inside rendering PCM_Update calls
++    uint64_t nInstructions = 0; // H8 instructions executed
++    uint64_t nPCMUpdates   = 0; // PCM_Update calls that rendered >= 1 tick
++};
++
++using NukedProfileClockFn = uint64_t (*)();
++
++void NukedProfileSetClock(NukedProfileClockFn pFn);
++NukedProfileClockFn NukedProfileClock();
++NukedProfileData& NukedProfile();
+diff --git a/src/backend/pcm.cpp b/src/backend/pcm.cpp
+index b8a4e27..96f0d75 100644
+--- a/src/backend/pcm.cpp
++++ b/src/backend/pcm.cpp
+@@ -23,6 +23,7 @@
+ #include "pcm.h"
+ #include "mcu.h"
+ #include "mcu_interrupt.h"
++#include "nuked_profile.h"
+ #include <cstdint>
+ #include <cstring>
+ 
+@@ -573,6 +574,11 @@ void PCM_GetConfig(PCM_Config& config, uint8_t config_byte)
+ 
+ void PCM_Update(pcm_t& pcm, uint64_t cycles)
+ {
++    // mt32-pi profiling: only calls that will render at least one tick
++    // take clock readings, so the common no-op call costs one comparison.
++    const NukedProfileClockFn pProfileClock = NukedProfileClock();
++    const uint64_t nProfileStart = (pProfileClock && pcm.cycles < cycles) ? pProfileClock() : 0;
++
+     while (pcm.cycles < cycles)
+     {
+         const uint32_t voice_active = pcm.voice_mask & pcm.voice_mask_pending;
+@@ -1560,6 +1566,12 @@ void PCM_Update(pcm_t& pcm, uint64_t cycles)
+ 
+         pcm.cycles += pcm.mcu->is_jv880 ? (new_cycles * 25) / 29 : new_cycles;
+     }
++
++    if (nProfileStart)
++    {
++        NukedProfile().nPCMUs += pProfileClock() - nProfileStart;
++        ++NukedProfile().nPCMUpdates;
++    }
+ }
+ 
+ uint32_t PCM_GetOutputFrequency(const pcm_t& pcm)
