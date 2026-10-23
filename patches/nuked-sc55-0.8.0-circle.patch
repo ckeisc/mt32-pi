@@ -1,0 +1,23 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 637f3e2..625eb3e 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -44,11 +44,13 @@ else()
+ endif()
+ 
+ if(NOT WIN32)
+-    set(USE_RTMIDI TRUE)
+-endif()
+-
+-if(USE_RTMIDI)
+-    find_package(rtmidi MODULE REQUIRED)
++    # RtMidi is only needed by the standard frontend; do not require it.
++    # Cross/embedded builds that only build the backend library (e.g.
++    # mt32-pi) may not have it available. (Circle patch)
++    find_package(rtmidi MODULE)
++    if(RTMIDI_INCLUDE_DIR AND RTMIDI_LIBRARY AND NOT RTMIDI_INCLUDE_DIR MATCHES "NOTFOUND" AND NOT RTMIDI_LIBRARY MATCHES "NOTFOUND")
++        set(USE_RTMIDI TRUE)
++    endif()
+ endif()
+ 
+ # ASIO

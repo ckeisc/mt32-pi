@@ -114,7 +114,7 @@ void CMisterControl::ApplyConfig(const TMisterStatus& NewStatus, const TMisterSt
 	if (NewStatus.Synth != CurrentStatus.Synth)
 	{
 		Event.Type = TEventType::SwitchSynth;
-		Event.SwitchSynth.Synth = NewStatus.Synth == TMisterSynth::MT32 ? TSynth::MT32 : (NewStatus.Synth == TMisterSynth::EmuSC ? TSynth::EmuSC : TSynth::SoundFont);
+		Event.SwitchSynth.Synth = NewStatus.Synth == TMisterSynth::MT32 ? TSynth::MT32 : (NewStatus.Synth == TMisterSynth::EmuSC ? TSynth::EmuSC : (NewStatus.Synth == TMisterSynth::NukedSC55 ? TSynth::NukedSC55 : TSynth::SoundFont));
 		m_pEventQueue->Enqueue(Event);
 	}
 

@@ -99,4 +99,8 @@ EMUSCHOME=$(realpath external/emusc/libemusc)
 EMUSCBUILDDIR=build-emusc
 EMUSCLIB=$(EMUSCBUILDDIR)/src/libemusc.a
 
+NUKEDHOME=$(realpath external/nuked-sc55)
+NUKEDBUILDDIR=build-nuked
+NUKEDLIB=$(NUKEDBUILDDIR)/libnuked-sc55-backend.a
+
 INIHHOME=$(realpath external/inih)

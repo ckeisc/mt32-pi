@@ -120,7 +120,8 @@ CMT32Pi::CMT32Pi(CI2CMaster* pI2CMaster, CSPIMaster* pSPIMaster, CInterruptSyste
 	  m_pCurrentSynth(nullptr),
 	  m_pMT32Synth(nullptr),
 	  m_pSoundFontSynth(nullptr),
-	  m_pEmuSCSynth(nullptr)
+	  m_pEmuSCSynth(nullptr),
+	  m_pNukedSC55Synth(nullptr)
 {
 	s_pThis = this;
 }
@@ -279,6 +280,9 @@ bool CMT32Pi::Initialize(bool bSerialMIDIAvailable)
 	LCDLog(TLCDLogType::Startup, "Init EmuSC");
 	InitEmuSCSynth();
 
+	LCDLog(TLCDLogType::Startup, "Init Nuked");
+	InitNukedSC55Synth();
+
 	// Set initial synthesizer
 	if (m_pConfig->SystemDefaultSynth == CConfig::TSystemDefaultSynth::MT32)
 		m_pCurrentSynth = m_pMT32Synth;
@@ -286,6 +290,8 @@ bool CMT32Pi::Initialize(bool bSerialMIDIAvailable)
 		m_pCurrentSynth = m_pSoundFontSynth;
 	else if (m_pConfig->SystemDefaultSynth == CConfig::TSystemDefaultSynth::EmuSC)
 		m_pCurrentSynth = m_pEmuSCSynth;
+	else if (m_pConfig->SystemDefaultSynth == CConfig::TSystemDefaultSynth::NukedSC55)
+		m_pCurrentSynth = m_pNukedSC55Synth;
 
 	if (!m_pCurrentSynth)
 	{
@@ -298,6 +304,8 @@ bool CMT32Pi::Initialize(bool bSerialMIDIAvailable)
 			m_pCurrentSynth = m_pSoundFontSynth;
 		else if (m_pEmuSCSynth)
 			m_pCurrentSynth = m_pEmuSCSynth;
+		else if (m_pNukedSC55Synth)
+			m_pCurrentSynth = m_pNukedSC55Synth;
 		else
 		{
 			LOGPANIC("No synths available; ROMs/SoundFonts not found");
@@ -436,6 +444,24 @@ bool CMT32Pi::InitEmuSCSynth()
 	return true;
 }
 
+bool CMT32Pi::InitNukedSC55Synth()
+{
+	assert(m_pNukedSC55Synth == nullptr);
+
+	m_pNukedSC55Synth = new CNukedSC55Synth(m_pConfig->AudioSampleRate, m_pConfig->NukedGain, m_pConfig->NukedOversampling);
+	if (!m_pNukedSC55Synth->Initialize())
+	{
+		LOGWARN("Nuked-SC55 init failed; no complete SC-55 ROM set present?");
+		delete m_pNukedSC55Synth;
+		m_pNukedSC55Synth = nullptr;
+		return false;
+	}
+
+	m_pNukedSC55Synth->SetUserInterface(&m_UserInterface);
+
+	return true;
+}
+
 void CMT32Pi::MainTask()
 {
 	CScheduler* const pScheduler = CScheduler::Get();
@@ -562,6 +588,8 @@ void CMT32Pi::UITask()
 				Status.Synth = TMisterSynth::SoundFont;
 			else if (m_pCurrentSynth == m_pEmuSCSynth)
 				Status.Synth = TMisterSynth::EmuSC;
+			else if (m_pCurrentSynth == m_pNukedSC55Synth)
+				Status.Synth = TMisterSynth::NukedSC55;
 
 			if (m_pMT32Synth)
 				Status.MT32ROMSet = static_cast<u8>(m_pMT32Synth->GetROMSet());
@@ -836,6 +864,12 @@ void CMT32Pi::UpdateUSB(bool bStartup)
 					InitEmuSCSynth();
 				}
 
+				if (!m_pNukedSC55Synth)
+				{
+					LCDLog(TLCDLogType::Spinner, "Nuked ROM rescan");
+					InitNukedSC55Synth();
+				}
+
 				if (m_pSoundFontSynth)
 					LCDLog(TLCDLogType::Notice, "%d SoundFonts avail", m_pSoundFontSynth->GetSoundFontManager().GetSoundFontCount());
 			}
@@ -1079,6 +1113,8 @@ void CMT32Pi::ProcessEventQueue()
 					m_pSoundFontSynth->AllSoundOff();
 				if (m_pEmuSCSynth)
 					m_pEmuSCSynth->AllSoundOff();
+				if (m_pNukedSC55Synth)
+					m_pNukedSC55Synth->AllSoundOff();
 				break;
 
 			case TEventType::DisplayImage:
@@ -1112,13 +1148,26 @@ void CMT32Pi::ProcessButtonEvent(const TButtonEvent& Event)
 				SwitchSynth(TSynth::SoundFont);
 			else if (m_pEmuSCSynth)
 				SwitchSynth(TSynth::EmuSC);
+			else if (m_pNukedSC55Synth)
+				SwitchSynth(TSynth::NukedSC55);
 		}
 		else if (m_pCurrentSynth == m_pSoundFontSynth)
 		{
 			if (m_pEmuSCSynth)
 				SwitchSynth(TSynth::EmuSC);
+			else if (m_pNukedSC55Synth)
+				SwitchSynth(TSynth::NukedSC55);
 			else if (m_pMT32Synth)
 				SwitchSynth(TSynth::MT32);
+		}
+		else if (m_pCurrentSynth == m_pEmuSCSynth)
+		{
+			if (m_pNukedSC55Synth)
+				SwitchSynth(TSynth::NukedSC55);
+			else if (m_pMT32Synth)
+				SwitchSynth(TSynth::MT32);
+			else if (m_pSoundFontSynth)
+				SwitchSynth(TSynth::SoundFont);
 		}
 		else
 		{
@@ -1126,6 +1175,8 @@ void CMT32Pi::ProcessButtonEvent(const TButtonEvent& Event)
 				SwitchSynth(TSynth::MT32);
 			else if (m_pSoundFontSynth)
 				SwitchSynth(TSynth::SoundFont);
+			else if (m_pEmuSCSynth)
+				SwitchSynth(TSynth::EmuSC);
 		}
 	}
 	else if (Event.Button == TButton::Button2 && !Event.bRepeat)
@@ -1136,6 +1187,11 @@ void CMT32Pi::ProcessButtonEvent(const TButtonEvent& Event)
 		{
 			// No ROM-set switching for EmuSC yet; a single ROM set is supported
 			LCDLog(TLCDLogType::Notice, "%s", m_pEmuSCSynth->GetModelName());
+		}
+		else if (m_pCurrentSynth == m_pNukedSC55Synth)
+		{
+			// No ROM-set switching for Nuked-SC55 yet; a single ROM set is supported
+			LCDLog(TLCDLogType::Notice, "%s", m_pNukedSC55Synth->GetModelName());
 		}
 		else
 		{
@@ -1183,6 +1239,8 @@ void CMT32Pi::SwitchSynth(TSynth NewSynth)
 		pNewSynth = m_pSoundFontSynth;
 	else if (NewSynth == TSynth::EmuSC)
 		pNewSynth = m_pEmuSCSynth;
+	else if (NewSynth == TSynth::NukedSC55)
+		pNewSynth = m_pNukedSC55Synth;
 
 	if (pNewSynth == nullptr)
 	{
@@ -1198,7 +1256,7 @@ void CMT32Pi::SwitchSynth(TSynth NewSynth)
 
 	m_pCurrentSynth->AllSoundOff();
 	m_pCurrentSynth = pNewSynth;
-	const char* pMode = NewSynth == TSynth::MT32 ? "MT-32 mode" : (NewSynth == TSynth::EmuSC ? "EmuSC mode" : "SoundFont mode");
+	const char* pMode = NewSynth == TSynth::MT32 ? "MT-32 mode" : (NewSynth == TSynth::EmuSC ? "EmuSC mode" : (NewSynth == TSynth::NukedSC55 ? "Nuked-SC55 mode" : "SoundFont mode"));
 	LOGNOTE("Switching to %s", pMode);
 	LCDLog(TLCDLogType::Notice, pMode);
 }
@@ -1262,8 +1320,10 @@ void CMT32Pi::SetMasterVolume(s32 nVolume)
 		m_pSoundFontSynth->SetMasterVolume(m_nMasterVolume);
 	if (m_pEmuSCSynth)
 		m_pEmuSCSynth->SetMasterVolume(m_nMasterVolume);
+	if (m_pNukedSC55Synth)
+		m_pNukedSC55Synth->SetMasterVolume(m_nMasterVolume);
 
-	if (m_pCurrentSynth == m_pSoundFontSynth || m_pCurrentSynth == m_pEmuSCSynth)
+	if (m_pCurrentSynth == m_pSoundFontSynth || m_pCurrentSynth == m_pEmuSCSynth || m_pCurrentSynth == m_pNukedSC55Synth)
 		LCDLog(TLCDLogType::Notice, "Volume: %d", m_nMasterVolume);
 }
 

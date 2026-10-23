@@ -5,7 +5,7 @@
 include Config.mk
 
 .DEFAULT_GOAL=all
-.PHONY: submodules circle-stdlib mt32emu fluidsynth emusc all clean veryclean
+.PHONY: submodules circle-stdlib mt32emu fluidsynth emusc nuked all clean veryclean
 
 #
 # Functions to apply/reverse patches only if not completely applied/reversed already
@@ -59,6 +59,10 @@ endif
 
 # Improve I/O throughput
 	@echo "DEFINE += -DNO_BUSY_WAIT" >> $(CIRCLE_CONFIG)
+
+# The Nuked-SC55 backend pushes the kernel image past Circle's default
+# 2 MB KERNEL_MAX_SIZE, which would leave the kernel stack inside .rodata
+	@echo "DEFINE += -DKERNEL_MAX_SIZE=4194304" >> $(CIRCLE_CONFIG)
 
 # Enable PWM audio output on GPIO 12/13 for the Pi Zero 2 W
 	@echo "DEFINE += -DUSE_PWM_AUDIO_ON_ZERO" >> $(CIRCLE_CONFIG)
@@ -160,9 +164,30 @@ $(EMUSCBUILDDIR)/.done: $(CIRCLESTDLIBHOME)/.done
 	@touch $@
 
 #
+# Build Nuked-SC55
+#
+nuked: $(NUKEDBUILDDIR)/.done
+
+$(NUKEDBUILDDIR)/.done: $(CIRCLESTDLIBHOME)/.done
+	@${APPLY_PATCH} $(NUKEDHOME) patches/nuked-sc55-0.8.0-circle.patch
+
+	@CFLAGS="$(CFLAGS_EXTERNAL)" \
+	CXXFLAGS="$(CFLAGS_EXTERNAL)" \
+	cmake -B $(NUKEDBUILDDIR) \
+		 $(CMAKE_TOOLCHAIN_FLAGS) \
+		 -DCMAKE_CXX_FLAGS_RELEASE="-Ofast" \
+		 -DCMAKE_CXX_FLAGS="-include $(CURDIR)/include/nukedcirclecompat.h" \
+		 -DCMAKE_BUILD_TYPE=Release \
+		 -DBUILD_SHARED_LIBS=OFF \
+		 $(NUKEDHOME) \
+		 >/dev/null
+	@cmake --build $(NUKEDBUILDDIR) --target nuked-sc55-backend
+	@touch $@
+
+#
 # Build kernel itself
 #
-all: circle-stdlib mt32emu fluidsynth emusc
+all: circle-stdlib mt32emu fluidsynth emusc nuked
 	@$(MAKE) -f Kernel.mk $(KERNEL).img $(KERNEL).hex
 
 #
@@ -194,3 +219,7 @@ mrproper: clean
 # Clean libEmuSC
 	@${REVERSE_PATCH} $(EMUSCHOME)/.. patches/emusc-0.7.0-circle.patch
 	@$(RM) -r $(EMUSCBUILDDIR)
+
+# Clean Nuked-SC55
+	@${REVERSE_PATCH} $(NUKEDHOME) patches/nuked-sc55-0.8.0-circle.patch
+	@$(RM) -r $(NUKEDBUILDDIR)

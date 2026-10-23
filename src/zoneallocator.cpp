@@ -33,12 +33,14 @@
 LOGMODULE("zoneallocator");
 
 // Space left in the low heap for Circle/libc/C++ allocations outside the
-// zone. Upstream leaves 32 MB, which is not enough for the EmuSC synth:
-// libEmuSC decodes the entire wave ROM into a float sample cache (~21 MB)
-// through C++ new, on top of the kernel's own allocations. 96 MB covers it
-// with headroom while still leaving the zone ~850 MB on a 1 GB Pi
-// (~370 MB on a 512 MB Pi Zero 2 W) for SoundFonts.
-constexpr size_t MallocHeapSize = 96 * MEGABYTE;
+// zone. Upstream leaves 32 MB, which is not enough with the Sound Canvas
+// synths: libEmuSC decodes the entire wave ROM into a float sample cache
+// (~21 MB) through C++ new (~53 MB total for its init), and Nuked-SC55's
+// emulator needs ~37 MB more for its PCM/LCD/MCU state. 192 MB covers
+// both engines plus the kernel's own allocations with headroom, while
+// still leaving the zone ~740 MB on a 1 GB Pi (~230 MB on a 512 MB
+// Pi Zero 2 W) for SoundFonts.
+constexpr size_t MallocHeapSize = 192 * MEGABYTE;
 
 CZoneAllocator* CZoneAllocator::s_pThis = nullptr;
 
