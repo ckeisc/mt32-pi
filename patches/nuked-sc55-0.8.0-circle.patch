@@ -1,5 +1,5 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 637f3e2..625eb3e 100644
+index 637f3e2..ffbc162 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -44,11 +44,13 @@ else()
@@ -21,6 +21,14 @@ index 637f3e2..625eb3e 100644
  endif()
  
  # ASIO
+@@ -75,6 +77,7 @@ target_sources(nuked-sc55-backend
+     src/backend/mcu_opcodes.cpp
+     src/backend/mcu_timer.cpp
+     src/backend/mcu.cpp
++    src/backend/jit.cpp
+     src/backend/pcm.cpp
+     src/backend/rom_io.cpp
+     src/backend/rom.cpp
 diff --git a/src/backend/decoder2/cache.h b/src/backend/decoder2/cache.h
 index 6d49868..68e7617 100644
 --- a/src/backend/decoder2/cache.h
@@ -128,6 +136,220 @@ index 006ebd0..30550e4 100644
      // Loads roms from buffers referenced by `info`. If the slot for a rom in `info` has a non-empty `rom_data`, it
      // will be loaded even if the romset doesn't require it.
      //
+diff --git a/src/backend/jit.cpp b/src/backend/jit.cpp
+new file mode 100644
+index 0000000..2334a45
+--- /dev/null
++++ b/src/backend/jit.cpp
+@@ -0,0 +1,156 @@
++// H8 JIT dynamic recompiler -- engine skeleton. See jit.h.
++
++#include "jit.h"
++
++#include "config.h"
++
++#if NUKED_ENABLE_DECODER2
++
++#include "decoder2/dispatch.h"
++#include "mcu.h"
++
++#include <cstring>
++
++namespace
++{
++
++// ------------------------------------------------------------ arena
++// Reserved for emitted native code. Skeleton blocks carry no native
++// code yet; the reservation exists so the bare-metal link can prove
++// where the arena lands relative to _etext (Circle only maps pages
++// below _etext executable).
++alignas(4096) uint8_t s_arena[256 * 1024];
++
++// ------------------------------------------------------ block cache
++// Direct-mapped descriptor table, keyed by the 24-bit guest address
++// (cp << 16) | pc. Descriptors live outside the arena.
++struct Block
++{
++    uint32_t nKey = 0; // (guest addr << 1) | valid
++};
++
++constexpr uint32_t kBlockCount = 8192;
++Block s_blocks[kBlockCount];
++
++uint32_t BlockIndex(uint32_t nGuestAddr)
++{
++    // Fibonacci hash of the guest address.
++    return (nGuestAddr * 2654435769u >> 19) & (kBlockCount - 1);
++}
++
++// Pages (256-byte) of guest memory that currently hold at least one
++// block, indexed by (addr >> 8) over the 24-bit guest space. Writes
++// to a marked page invalidate that page's blocks; writes elsewhere
++// cost one test.
++uint8_t s_pageHasBlocks[65536 / 8];
++
++bool PageHasBlocks(uint32_t nPage)
++{
++    return (s_pageHasBlocks[nPage >> 3] >> (nPage & 7)) & 1;
++}
++
++void MarkPage(uint32_t nPage)
++{
++    s_pageHasBlocks[nPage >> 3] |= static_cast<uint8_t>(1u << (nPage & 7));
++}
++
++JITStats s_stats;
++
++void InvalidatePage(uint32_t nPage)
++{
++    for (uint32_t i = 0; i < kBlockCount; ++i)
++    {
++        if (s_blocks[i].nKey != 0 && (s_blocks[i].nKey >> 1) >> 8 == nPage)
++        {
++            s_blocks[i].nKey = 0;
++            ++s_stats.nInvalidations;
++        }
++    }
++    s_pageHasBlocks[nPage >> 3] &= static_cast<uint8_t>(~(1u << (nPage & 7)));
++}
++
++} // namespace
++
++void JIT_Execute(mcu_t& mcu)
++{
++    const uint32_t nGuestAddr = (static_cast<uint32_t>(mcu.cp) << 16) | mcu.pc;
++    Block& block              = s_blocks[BlockIndex(nGuestAddr)];
++    if (block.nKey == ((nGuestAddr << 1) | 1))
++    {
++        ++s_stats.nBlockHits;
++    }
++    else
++    {
++        block.nKey = (nGuestAddr << 1) | 1;
++        ++s_stats.nBlocksCreated;
++        MarkPage(nGuestAddr >> 8);
++    }
++
++    // Skeleton: delegate one instruction to the oracle.
++    decoder2::FetchDecodeExecuteNext(mcu);
++    ++s_stats.nFallbackSteps;
++}
++
++void JIT_Flush()
++{
++    memset(s_blocks, 0, sizeof(s_blocks));
++    memset(s_pageHasBlocks, 0, sizeof(s_pageHasBlocks));
++    ++s_stats.nFlushes;
++}
++
++void JIT_NotifyWrite(uint32_t address)
++{
++    // Only writable-and-executable guest regions can invalidate code:
++    // the SRAM window and the internal-RAM window of page 0. Writes
++    // to ROM space are dropped by the memory map itself.
++    const uint32_t nPage = (address >> 8) & 0xFFFF;
++    if (address < 0x10000 && PageHasBlocks(nPage))
++        InvalidatePage(nPage);
++}
++
++const JITStats& JIT_GetStats()
++{
++    return s_stats;
++}
++
++const uint8_t* JIT_ArenaBase()
++{
++    return s_arena;
++}
++
++uint32_t JIT_ArenaSize()
++{
++    return static_cast<uint32_t>(sizeof(s_arena));
++}
++
++#else // !NUKED_ENABLE_DECODER2
++
++void JIT_Execute(mcu_t&)
++{
++}
++
++void JIT_Flush()
++{
++}
++
++void JIT_NotifyWrite(uint32_t)
++{
++}
++
++const JITStats& JIT_GetStats()
++{
++    static const JITStats s_empty;
++    return s_empty;
++}
++
++const uint8_t* JIT_ArenaBase()
++{
++    return nullptr;
++}
++
++uint32_t JIT_ArenaSize()
++{
++    return 0;
++}
++
++#endif
+diff --git a/src/backend/jit.h b/src/backend/jit.h
+new file mode 100644
+index 0000000..9af2ce4
+--- /dev/null
++++ b/src/backend/jit.h
+@@ -0,0 +1,46 @@
++// H8 JIT dynamic recompiler -- engine skeleton.
++//
++// Third execution engine beside decoder2 and the legacy interpreter,
++// selected via MCU_SetH8Engine(H8Engine::JIT). Translation is
++// block-based, keyed by guest (cp, pc). This skeleton provides the
++// full plumbing -- block cache, code arena reservation, self-
++// modifying-code invalidation, flush on engine switch -- while its
++// blocks still delegate execution to decoder2 one instruction at a
++// time, so behavior is oracle-identical by construction. Native code
++// emission replaces the delegation form-by-form under the offline
++// differential suite (golden traces: boot / E1M1 / BELMO).
++
++#pragma once
++
++#include <cstdint>
++
++struct mcu_t;
++
++// Execute one guest instruction under the JIT engine (called from
++// MCU_ReadInstruction in place of the interpreter dispatch).
++void JIT_Execute(mcu_t& mcu);
++
++// Drop all translated blocks. Called on engine switches, guest
++// resets, and state restores (snapshots), where cached blocks may no
++// longer match guest memory.
++void JIT_Flush();
++
++// Notify the JIT of a guest memory write; blocks overlapping the
++// written page are invalidated (guest RAM is executable on this MCU).
++void JIT_NotifyWrite(uint32_t address);
++
++struct JITStats
++{
++    uint64_t nBlocksCreated  = 0;
++    uint64_t nBlockHits      = 0;
++    uint64_t nFallbackSteps  = 0;
++    uint64_t nInvalidations  = 0;
++    uint64_t nFlushes        = 0;
++};
++
++const JITStats& JIT_GetStats();
++
++// Base/size of the reserved native-code arena (diagnostics; on the
++// bare-metal target the arena must land in executable memory).
++const uint8_t* JIT_ArenaBase();
++uint32_t JIT_ArenaSize();
 diff --git a/src/backend/lcd.h b/src/backend/lcd.h
 index 5207950..d57dfd2 100644
 --- a/src/backend/lcd.h
@@ -147,10 +369,16 @@ index 5207950..d57dfd2 100644
  class LCD_Backend
  {
 diff --git a/src/backend/mcu.cpp b/src/backend/mcu.cpp
-index 41e6b9f..4b9eb96 100644
+index 41e6b9f..ceb6cc7 100644
 --- a/src/backend/mcu.cpp
 +++ b/src/backend/mcu.cpp
-@@ -25,6 +25,7 @@
+@@ -20,11 +20,13 @@
+ 
+ #include "decoder2/dispatch.h"
+ #include "diagnostics.h"
++#include "jit.h"
+ #include "lcd.h"
+ #include "mcu_opcodes.h"
  #include "mcu_timer.h"
  #include "pcm.h"
  #include "submcu.h"
@@ -158,7 +386,15 @@ index 41e6b9f..4b9eb96 100644
  
  void MCU_ErrorTrap(mcu_t& mcu)
  {
-@@ -784,14 +785,32 @@ void MCU_Write16(mcu_t& mcu, uint32_t address, uint16_t value)
+@@ -643,6 +645,7 @@ uint32_t MCU_Read32(mcu_t& mcu, uint32_t address)
+ 
+ void MCU_Write(mcu_t& mcu, uint32_t address, uint8_t value)
+ {
++    JIT_NotifyWrite(address);
+     uint8_t page = (address >> 16) & 0xf;
+     address &= 0xffff;
+     if (page == 0)
+@@ -784,14 +787,38 @@ void MCU_Write16(mcu_t& mcu, uint32_t address, uint16_t value)
      MCU_Write(mcu, address + 1, (uint8_t)(value & 0xff));
  }
  
@@ -169,7 +405,11 @@ index 41e6b9f..4b9eb96 100644
 +
 +void MCU_SetH8Engine(H8Engine engine)
 +{
-+    g_h8Engine = engine;
++    if (g_h8Engine != engine)
++    {
++        g_h8Engine = engine;
++        JIT_Flush();
++    }
 +}
 +
 +H8Engine MCU_GetH8Engine()
@@ -186,6 +426,8 @@ index 41e6b9f..4b9eb96 100644
 -    MCU_Operand_Table[operand](mcu, operand);
 +    if (g_h8Engine == H8Engine::Decoder2)
 +        decoder2::FetchDecodeExecuteNext(mcu);
++    else if (g_h8Engine == H8Engine::JIT)
++        JIT_Execute(mcu);
 +    else
  #endif
 +    {
@@ -195,7 +437,7 @@ index 41e6b9f..4b9eb96 100644
  
      if (mcu.sr & STATUS_T)
      {
-@@ -904,8 +923,13 @@ void MCU_Step(mcu_t& mcu)
+@@ -904,8 +931,13 @@ void MCU_Step(mcu_t& mcu)
          mcu.ex_ignore = 0;
  
      if (!mcu.sleep)

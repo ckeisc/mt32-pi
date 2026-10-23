@@ -257,7 +257,15 @@ CNukedSC55Synth::CNukedSC55Synth(unsigned nSampleRate, float nGain, bool bOversa
 
 const char* CNukedSC55Synth::H8EngineName(TH8Engine Engine)
 {
-	return Engine == TH8Engine::Legacy ? "legacy" : "decoder2";
+	switch (Engine)
+	{
+	case TH8Engine::Legacy:
+		return "legacy";
+	case TH8Engine::JIT:
+		return "jit";
+	default:
+		return "decoder2";
+	}
 }
 
 namespace
@@ -265,7 +273,15 @@ namespace
 
 H8Engine ToBackendEngine(CNukedSC55Synth::TH8Engine Engine)
 {
-	return Engine == CNukedSC55Synth::TH8Engine::Legacy ? H8Engine::Legacy : H8Engine::Decoder2;
+	switch (Engine)
+	{
+	case CNukedSC55Synth::TH8Engine::Legacy:
+		return H8Engine::Legacy;
+	case CNukedSC55Synth::TH8Engine::JIT:
+		return H8Engine::JIT;
+	default:
+		return H8Engine::Decoder2;
+	}
 }
 
 }
@@ -273,7 +289,9 @@ H8Engine ToBackendEngine(CNukedSC55Synth::TH8Engine Engine)
 const char* CNukedSC55Synth::CycleH8Engine()
 {
 	m_Lock.Acquire();
-	m_H8Engine = (m_H8Engine == TH8Engine::Decoder2) ? TH8Engine::Legacy : TH8Engine::Decoder2;
+	m_H8Engine = (m_H8Engine == TH8Engine::Decoder2) ? TH8Engine::Legacy
+	           : (m_H8Engine == TH8Engine::Legacy)   ? TH8Engine::JIT
+	                                                 : TH8Engine::Decoder2;
 	if (m_pEmulator)
 		m_pEmulator->SetH8Engine(ToBackendEngine(m_H8Engine));
 	m_Lock.Release();

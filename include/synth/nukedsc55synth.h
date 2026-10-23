@@ -40,7 +40,8 @@ class CNukedSC55Synth : public CSynthBase
 public:
 	#define ENUM_NUKEDH8ENGINE(ENUM) \
 		ENUM(Decoder2, decoder2)     \
-		ENUM(Legacy, legacy)
+		ENUM(Legacy, legacy)         \
+		ENUM(JIT, jit)
 
 	CONFIG_ENUM(TH8Engine, ENUM_NUKEDH8ENGINE);
 
