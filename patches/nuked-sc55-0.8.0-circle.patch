@@ -51,6 +51,44 @@ index 6d49868..68e7617 100644
  private:
      std::unique_ptr<ArrayType> m_cache;
  };
+diff --git a/src/backend/decoder2/disassemble_handlers.cpp b/src/backend/decoder2/disassemble_handlers.cpp
+index f2728ca..7592ab9 100644
+--- a/src/backend/decoder2/disassemble_handlers.cpp
++++ b/src/backend/decoder2/disassemble_handlers.cpp
+@@ -1042,18 +1042,29 @@ void Dis_NOP(DisassembleDecoder& decoder, uint8_t byte, DisassembledInstruction&
+ 
+ void Dis_NotImplemented(DisassembleDecoder& decoder, uint8_t byte, DisassembledInstruction& instr)
+ {
+-    (void)decoder;
+     (void)byte;
+     (void)instr;
+-    throw "Instruction not implemented";
++    // Report through the decoder's error channel instead of throwing:
++    // bare-metal targets without unwind tables (the mt32-pi kernel has
++    // no .eh_frame) cannot catch a throw, and one raised here hangs
++    // the machine. Disassemble() already returns false when an error
++    // is set, which is all callers need.
++    decoder.SetError({
++        .code     = DisassembleErrorCode::InvalidInstructionFormat,
++        .position = decoder.GetPosition(),
++        .message  = "Instruction not implemented",
++    });
+ }
+ 
+ void Dis_InvalidInstruction(DisassembleDecoder& decoder, uint8_t byte, DisassembledInstruction& instr)
+ {
+-    (void)decoder;
+     (void)byte;
+     (void)instr;
+-    throw "Instruction invalid";
++    decoder.SetError({
++        .code     = DisassembleErrorCode::InvalidInstructionFormat,
++        .position = decoder.GetPosition(),
++        .message  = "Instruction invalid",
++    });
+ }
+ 
+ void Dis_SCB_F(DisassembleDecoder& decoder, uint8_t byte, DisassembledInstruction& instr)
 diff --git a/src/backend/emu.cpp b/src/backend/emu.cpp
 index 976c02c..43cc683 100644
 --- a/src/backend/emu.cpp
@@ -138,10 +176,10 @@ index 006ebd0..30550e4 100644
      //
 diff --git a/src/backend/jit.cpp b/src/backend/jit.cpp
 new file mode 100644
-index 0000000..b6e91df
+index 0000000..e11bcd8
 --- /dev/null
 +++ b/src/backend/jit.cpp
-@@ -0,0 +1,921 @@
+@@ -0,0 +1,962 @@
 +// H8 JIT dynamic recompiler. See jit.h.
 +//
 +// One native AArch64 codelet per guest instruction. The translator
@@ -166,6 +204,7 @@ index 0000000..b6e91df
 +
 +#include <cstddef>
 +#include <cstdint>
++#include <cstdlib>
 +#include <cstring>
 +#include <span>
 +
@@ -183,7 +222,9 @@ index 0000000..b6e91df
 +// the bare-metal kernel (Circle maps < _etext RWX) and in hosted
 +// builds (folded into the executable segment; mprotect'ed writable
 +// once on Linux so the translator can emit into it).
-+__attribute__((section(".text.jit_arena"), aligned(4096), used)) uint8_t s_arena[1024 * 1024];
++// 512 KB: the full E1M1 translation used ~75 KB, and the arena counts
++// against the bare-metal kernel's size budget (see EnsureTables).
++__attribute__((section(".text.jit_arena"), aligned(4096), used)) uint8_t s_arena[512 * 1024];
 +
 +size_t s_arenaUsed = 0;
 +
@@ -209,7 +250,7 @@ index 0000000..b6e91df
 +constexpr uint32_t kBlockWays  = 4;
 +constexpr uint32_t kBlockSets  = 4096;
 +constexpr uint32_t kBlockCount = kBlockSets * kBlockWays;
-+Block              s_blocks[kBlockCount];
++Block*             s_blocks = nullptr; // heap, see EnsureTables
 +uint8_t            s_victim[kBlockSets]; // round-robin eviction way per set
 +
 +uint32_t BlockSet(uint32_t nGuestAddr)
@@ -223,7 +264,8 @@ index 0000000..b6e91df
 +// (and vice versa); a set bit means "execute through decoder2"
 +// and is only cleared by a full flush or a code-memory write to
 +// the address's page.
-+uint8_t s_fallbackBits[0x1000000 / 8];
++constexpr size_t kFallbackBytes = 0x1000000 / 8;
++uint8_t*         s_fallbackBits = nullptr; // heap, see EnsureTables
 +uint8_t s_pageHasFallback[65536 / 8];
 +
 +bool FallbackTest(uint32_t nGuestAddr)
@@ -248,8 +290,8 @@ index 0000000..b6e91df
 +// disassembly; no guest address is embedded in the emitted code), so
 +// one codelet serves every guest address with the same encoding.
 +constexpr uint32_t kDedupeCount = 16384;
-+uint32_t           s_dedupeHash[kDedupeCount];
-+uint32_t           s_dedupeOff[kDedupeCount];
++uint32_t*          s_dedupeHash = nullptr; // heap, see EnsureTables
++uint32_t*          s_dedupeOff  = nullptr; // heap, see EnsureTables
 +
 +// Pages (256-byte) of guest memory that currently hold at least one
 +// block, indexed by (addr >> 8) over the 24-bit guest space.
@@ -263,6 +305,28 @@ index 0000000..b6e91df
 +void MarkPage(uint32_t nPage)
 +{
 +    s_pageHasBlocks[nPage >> 3] |= static_cast<uint8_t>(1u << (nPage & 7));
++}
++
++// The block cache, fallback bitmap and dedupe table total ~2.4 MB.
++// They are heap-allocated on first JIT use, NOT BSS: as static arrays
++// they pushed the bare-metal kernel's _end past Circle's fixed memory
++// map (MEM_KERNEL_END = kernel base + KERNEL_MAX_SIZE), so the core
++// stacks and the L1 page tables landed inside live BSS and the first
++// full clear (JIT_Flush) zeroed them -- the v0.13.1-emusc.4 boot
++// hang. Decoder-only boots never allocate the tables at all.
++void EnsureTables()
++{
++    if (s_blocks)
++        return;
++    s_blocks       = static_cast<Block*>(calloc(kBlockCount, sizeof(Block)));
++    s_fallbackBits = static_cast<uint8_t*>(calloc(kFallbackBytes, 1));
++    s_dedupeHash   = static_cast<uint32_t*>(calloc(kDedupeCount, sizeof(uint32_t)));
++    s_dedupeOff    = static_cast<uint32_t*>(calloc(kDedupeCount, sizeof(uint32_t)));
++}
++
++bool TablesReady()
++{
++    return s_blocks && s_fallbackBits && s_dedupeHash && s_dedupeOff;
 +}
 +
 +JITStats s_stats;
@@ -294,10 +358,10 @@ index 0000000..b6e91df
 +// memory itself may have changed.
 +void ReclaimArena()
 +{
-+    memset(s_blocks, 0, sizeof(s_blocks));
++    memset(s_blocks, 0, kBlockCount * sizeof(Block));
 +    memset(s_pageHasBlocks, 0, sizeof(s_pageHasBlocks));
-+    memset(s_dedupeHash, 0, sizeof(s_dedupeHash));
-+    memset(s_dedupeOff, 0, sizeof(s_dedupeOff));
++    memset(s_dedupeHash, 0, kDedupeCount * sizeof(uint32_t));
++    memset(s_dedupeOff, 0, kDedupeCount * sizeof(uint32_t));
 +    s_arenaUsed = 0;
 +    ++s_stats.nReclaims;
 +}
@@ -943,6 +1007,14 @@ index 0000000..b6e91df
 +
 +void JIT_Execute(mcu_t& mcu)
 +{
++    EnsureTables();
++    if (!TablesReady())
++    {
++        // Allocation failed (out of memory): stay on the oracle.
++        decoder2::FetchDecodeExecuteNext(mcu);
++        return;
++    }
++
 +    const uint32_t nGuestAddr = (static_cast<uint32_t>(mcu.cp) << 16) | mcu.pc;
 +
 +    if (FallbackTest(nGuestAddr))
@@ -997,18 +1069,25 @@ index 0000000..b6e91df
 +
 +void JIT_Flush()
 +{
-+    memset(s_blocks, 0, sizeof(s_blocks));
++    EnsureTables();
++    if (TablesReady())
++    {
++        memset(s_blocks, 0, kBlockCount * sizeof(Block));
++        memset(s_fallbackBits, 0, kFallbackBytes);
++        memset(s_dedupeHash, 0, kDedupeCount * sizeof(uint32_t));
++        memset(s_dedupeOff, 0, kDedupeCount * sizeof(uint32_t));
++    }
 +    memset(s_pageHasBlocks, 0, sizeof(s_pageHasBlocks));
-+    memset(s_fallbackBits, 0, sizeof(s_fallbackBits));
 +    memset(s_pageHasFallback, 0, sizeof(s_pageHasFallback));
-+    memset(s_dedupeHash, 0, sizeof(s_dedupeHash));
-+    memset(s_dedupeOff, 0, sizeof(s_dedupeOff));
 +    s_arenaUsed = 0;
 +    ++s_stats.nFlushes;
 +}
 +
 +void JIT_NotifyWrite(uint32_t address)
 +{
++    if (!TablesReady())
++        return; // nothing translated yet, nothing to invalidate
++
 +    // Only writable-and-executable guest regions can invalidate code:
 +    // the SRAM window and the internal-RAM window of page 0. Writes
 +    // to ROM space are dropped by the memory map itself.
