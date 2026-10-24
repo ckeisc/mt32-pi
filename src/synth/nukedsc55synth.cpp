@@ -317,9 +317,15 @@ void CNukedSC55Synth::OnSample(s32 nLeft, s32 nRight)
 		m_nLastActiveFrame = m_nWrittenFrames;
 
 	// Normalize() in the backend maps full scale (2^29) to 1.0f
+	// The backend idles at the SC-55 DAC mid-scale bias (0x1000000),
+	// i.e. +0.03125 DC. A sigma-delta DAC can turn a constant DC input
+	// into an audible idle tone, so center the ring at zero. This matches
+	// a real SC-55, whose analog output is AC-coupled, and is sonically
+	// neutral for music (verified on hardware: the idle hum is gone).
 	constexpr float Scale = 1.0f / 536870912.0f;
-	m_RingBuffer[m_nWrittenFrames & (RingBufferFrames - 1)][0] = nLeft * Scale;
-	m_RingBuffer[m_nWrittenFrames & (RingBufferFrames - 1)][1] = nRight * Scale;
+	constexpr float DCBias = 16777216.0f / 536870912.0f;
+	m_RingBuffer[m_nWrittenFrames & (RingBufferFrames - 1)][0] = nLeft * Scale - DCBias;
+	m_RingBuffer[m_nWrittenFrames & (RingBufferFrames - 1)][1] = nRight * Scale - DCBias;
 	++m_nWrittenFrames;
 }
 
