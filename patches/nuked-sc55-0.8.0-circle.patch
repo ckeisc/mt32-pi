@@ -138,11 +138,21 @@ index 006ebd0..30550e4 100644
      //
 diff --git a/src/backend/jit.cpp b/src/backend/jit.cpp
 new file mode 100644
-index 0000000..2334a45
+index 0000000..b6e91df
 --- /dev/null
 +++ b/src/backend/jit.cpp
-@@ -0,0 +1,156 @@
-+// H8 JIT dynamic recompiler -- engine skeleton. See jit.h.
+@@ -0,0 +1,921 @@
++// H8 JIT dynamic recompiler. See jit.h.
++//
++// One native AArch64 codelet per guest instruction. The translator
++// consumes decoder2's disassembly of the instruction (never its own
++// decode) and mirrors the decoder2 handler semantics for the
++// implemented forms: register-direct and immediate operands of the
++// ALU/MOV family, unary register ops (CLR/EXTU/EXTS/shifts/NEG/NOT/
++// SWAP), and NOP. Everything else -- branches, memory operands,
++// control registers, multiply/divide -- stays on the decoder2 oracle
++// path. Guest flags are computed from first principles (widening
++// binop rules) to match decoder2's GenericBinop exactly.
 +
 +#include "jit.h"
 +
@@ -150,42 +160,99 @@ index 0000000..2334a45
 +
 +#if NUKED_ENABLE_DECODER2
 +
++#include "decoder2/disassemble.h"
 +#include "decoder2/dispatch.h"
 +#include "mcu.h"
 +
++#include <cstddef>
++#include <cstdint>
 +#include <cstring>
++#include <span>
++
++#if defined(__linux__)
++#include <sys/mman.h>
++#endif
 +
 +namespace
 +{
 +
++using CodeletFn = void (*)(mcu_t*);
++
 +// ------------------------------------------------------------ arena
-+// Reserved for emitted native code. Skeleton blocks carry no native
-+// code yet; the reservation exists so the bare-metal link can prove
-+// where the arena lands relative to _etext (Circle only maps pages
-+// below _etext executable).
-+alignas(4096) uint8_t s_arena[256 * 1024];
++// Emitted native code. Placed in .text so it is executable both in
++// the bare-metal kernel (Circle maps < _etext RWX) and in hosted
++// builds (folded into the executable segment; mprotect'ed writable
++// once on Linux so the translator can emit into it).
++__attribute__((section(".text.jit_arena"), aligned(4096), used)) uint8_t s_arena[1024 * 1024];
 +
-+// ------------------------------------------------------ block cache
-+// Direct-mapped descriptor table, keyed by the 24-bit guest address
-+// (cp << 16) | pc. Descriptors live outside the arena.
-+struct Block
++size_t s_arenaUsed = 0;
++
++void EnsureArenaWritable()
 +{
-+    uint32_t nKey = 0; // (guest addr << 1) | valid
-+};
-+
-+constexpr uint32_t kBlockCount = 8192;
-+Block s_blocks[kBlockCount];
-+
-+uint32_t BlockIndex(uint32_t nGuestAddr)
-+{
-+    // Fibonacci hash of the guest address.
-+    return (nGuestAddr * 2654435769u >> 19) & (kBlockCount - 1);
++#if defined(__linux__)
++    static bool s_done = false;
++    if (!s_done)
++    {
++        s_done = true;
++        mprotect(s_arena, sizeof(s_arena), PROT_READ | PROT_WRITE | PROT_EXEC);
++    }
++#endif
 +}
 +
++// ------------------------------------------------------ block cache
++struct Block
++{
++    uint32_t  nKey  = 0; // (guest addr << 1) | valid
++    CodeletFn pCode = nullptr;
++};
++
++constexpr uint32_t kBlockWays  = 4;
++constexpr uint32_t kBlockSets  = 4096;
++constexpr uint32_t kBlockCount = kBlockSets * kBlockWays;
++Block              s_blocks[kBlockCount];
++uint8_t            s_victim[kBlockSets]; // round-robin eviction way per set
++
++uint32_t BlockSet(uint32_t nGuestAddr)
++{
++    return (nGuestAddr * 2654435769u >> 20) & (kBlockSets - 1);
++}
++
++// Fallback bitmap: one bit per guest address (24-bit space) marking
++// forms the translator does not implement. Kept out of the block
++// cache so fallback knowledge is never evicted by native mappings
++// (and vice versa); a set bit means "execute through decoder2"
++// and is only cleared by a full flush or a code-memory write to
++// the address's page.
++uint8_t s_fallbackBits[0x1000000 / 8];
++uint8_t s_pageHasFallback[65536 / 8];
++
++bool FallbackTest(uint32_t nGuestAddr)
++{
++    return (s_fallbackBits[nGuestAddr >> 3] >> (nGuestAddr & 7)) & 1;
++}
++
++void FallbackSet(uint32_t nGuestAddr)
++{
++    s_fallbackBits[nGuestAddr >> 3] |= static_cast<uint8_t>(1u << (nGuestAddr & 7));
++    const uint32_t nPage = nGuestAddr >> 8;
++    s_pageHasFallback[nPage >> 3] |= static_cast<uint8_t>(1u << (nPage & 7));
++}
++
++bool PageHasFallback(uint32_t nPage)
++{
++    return (s_pageHasFallback[nPage >> 3] >> (nPage & 7)) & 1;
++}
++
++// Dedupe table: emitted-code hash -> arena offset + 1 (0 = empty).
++// Codelets are PC-independent (operands are baked from the
++// disassembly; no guest address is embedded in the emitted code), so
++// one codelet serves every guest address with the same encoding.
++constexpr uint32_t kDedupeCount = 16384;
++uint32_t           s_dedupeHash[kDedupeCount];
++uint32_t           s_dedupeOff[kDedupeCount];
++
 +// Pages (256-byte) of guest memory that currently hold at least one
-+// block, indexed by (addr >> 8) over the 24-bit guest space. Writes
-+// to a marked page invalidate that page's blocks; writes elsewhere
-+// cost one test.
++// block, indexed by (addr >> 8) over the 24-bit guest space.
 +uint8_t s_pageHasBlocks[65536 / 8];
 +
 +bool PageHasBlocks(uint32_t nPage)
@@ -206,11 +273,670 @@ index 0000000..2334a45
 +    {
 +        if (s_blocks[i].nKey != 0 && (s_blocks[i].nKey >> 1) >> 8 == nPage)
 +        {
-+            s_blocks[i].nKey = 0;
++            s_blocks[i].nKey  = 0;
++            s_blocks[i].pCode = nullptr;
 +            ++s_stats.nInvalidations;
 +        }
 +    }
 +    s_pageHasBlocks[nPage >> 3] &= static_cast<uint8_t>(~(1u << (nPage & 7)));
++    if (PageHasFallback(nPage))
++    {
++        memset(&s_fallbackBits[nPage << 5], 0, 32); // 256 addresses = 32 bytes
++        s_pageHasFallback[nPage >> 3] &= static_cast<uint8_t>(~(1u << (nPage & 7)));
++    }
++}
++
++// Arena reuse, called from Translate when the arena fills. Blocks
++// hold native mappings only, so all of them die with the arena
++// contents and the dedupe table resets. Fallback knowledge lives in
++// its own bitmap and is unaffected. JIT_Flush() keeps full-clear
++// semantics for engine switches and state restores, where guest
++// memory itself may have changed.
++void ReclaimArena()
++{
++    memset(s_blocks, 0, sizeof(s_blocks));
++    memset(s_pageHasBlocks, 0, sizeof(s_pageHasBlocks));
++    memset(s_dedupeHash, 0, sizeof(s_dedupeHash));
++    memset(s_dedupeOff, 0, sizeof(s_dedupeOff));
++    s_arenaUsed = 0;
++    ++s_stats.nReclaims;
++}
++
++// ------------------------------------------------- mcu field layout
++constexpr size_t kOffR  = offsetof(mcu_t, r);
++constexpr size_t kOffPC = offsetof(mcu_t, pc);
++constexpr size_t kOffSR = offsetof(mcu_t, sr);
++static_assert(kOffR + 16 <= 8192 && kOffPC <= 8192 && kOffSR <= 8192,
++              "mcu fields must be reachable with LDRH/STRH immediate offsets");
++
++// Guest status-register flag bits (mcu.h STATUS_*).
++constexpr uint32_t kFlagC = 0x01;
++constexpr uint32_t kFlagZ = 0x04;
++
++// ------------------------------------------------------------ emitter
++// Minimal AArch64 emitter. Codelets receive mcu_t* in x0 and use
++// only caller-saved W registers: W1 = dst value, W2 = src value,
++// W3 = result (store convention), W4 = sr, W5 = flag nibble,
++// W6/W7 = scratch.
++enum
++{
++    W1 = 1,
++    W2 = 2,
++    W3 = 3,
++    W4 = 4,
++    W5 = 5,
++    W6 = 6,
++    W7 = 7
++};
++
++struct Emitter
++{
++    uint32_t* p        = nullptr;
++    uint32_t* pEnd     = nullptr;
++    bool      bOverflow = false;
++
++    void w(uint32_t x)
++    {
++        if (p < pEnd)
++            *p++ = x;
++        else
++            bOverflow = true;
++    }
++    void ret() { w(0xD65F03C0); }
++    void movz(int rd, uint32_t imm16) { w(0x52800000 | (imm16 << 5) | static_cast<uint32_t>(rd)); }
++    void ldrh(int rt, size_t off) { w(0x79400000 | (static_cast<uint32_t>(off / 2) << 10) | static_cast<uint32_t>(rt)); }
++    void strh(int rt, size_t off) { w(0x79000000 | (static_cast<uint32_t>(off / 2) << 10) | static_cast<uint32_t>(rt)); }
++    void addImm(int rd, int rn, uint32_t imm12) { w(0x11000000 | (imm12 << 10) | (static_cast<uint32_t>(rn) << 5) | static_cast<uint32_t>(rd)); }
++    void addReg(int rd, int rn, int rm) { w(0x0B000000 | (static_cast<uint32_t>(rm) << 16) | (static_cast<uint32_t>(rn) << 5) | static_cast<uint32_t>(rd)); }
++    void subReg(int rd, int rn, int rm) { w(0x4B000000 | (static_cast<uint32_t>(rm) << 16) | (static_cast<uint32_t>(rn) << 5) | static_cast<uint32_t>(rd)); }
++    void andReg(int rd, int rn, int rm) { w(0x0A000000 | (static_cast<uint32_t>(rm) << 16) | (static_cast<uint32_t>(rn) << 5) | static_cast<uint32_t>(rd)); }
++    void orrReg(int rd, int rn, int rm) { w(0x2A000000 | (static_cast<uint32_t>(rm) << 16) | (static_cast<uint32_t>(rn) << 5) | static_cast<uint32_t>(rd)); }
++    void eorReg(int rd, int rn, int rm) { w(0x4A000000 | (static_cast<uint32_t>(rm) << 16) | (static_cast<uint32_t>(rn) << 5) | static_cast<uint32_t>(rd)); }
++    void mvn(int rd, int rm) { w(0x2A2003E0 | (static_cast<uint32_t>(rm) << 16) | static_cast<uint32_t>(rd)); }
++    void lsl(int rd, int rn, int s) { w(0x53000000 | (static_cast<uint32_t>((32 - s) & 31) << 16) | (static_cast<uint32_t>(31 - s) << 10) | (static_cast<uint32_t>(rn) << 5) | static_cast<uint32_t>(rd)); }
++    void lsr(int rd, int rn, int s) { w(0x53000000 | (static_cast<uint32_t>(s) << 16) | (31u << 10) | (static_cast<uint32_t>(rn) << 5) | static_cast<uint32_t>(rd)); }
++    void asr(int rd, int rn, int s) { w(0x13000000 | (static_cast<uint32_t>(s) << 16) | (31u << 10) | (static_cast<uint32_t>(rn) << 5) | static_cast<uint32_t>(rd)); }
++    void sxtb(int rd, int rn) { w(0x13001C00 | (static_cast<uint32_t>(rn) << 5) | static_cast<uint32_t>(rd)); }
++    void sxth(int rd, int rn) { w(0x13003C00 | (static_cast<uint32_t>(rn) << 5) | static_cast<uint32_t>(rd)); }
++    void ubfx(int rd, int rn, int lsb, int width) { w(0x53000000 | (static_cast<uint32_t>(lsb) << 16) | (static_cast<uint32_t>(lsb + width - 1) << 10) | (static_cast<uint32_t>(rn) << 5) | static_cast<uint32_t>(rd)); }
++    void cmpImm(int rn, uint32_t imm12) { w(0x71000000 | (imm12 << 10) | (static_cast<uint32_t>(rn) << 5) | 31u); }
++    void cmpReg(int rn, int rm) { w(0x6B000000 | (static_cast<uint32_t>(rm) << 16) | (static_cast<uint32_t>(rn) << 5) | 31u); }
++    // cond: 0 = EQ, 3 = CC (unsigned borrow). CSINC stores the
++    // inverted condition, and AArch64 condition inversion flips only
++    // the low bit (EQ<->NE, CC<->CS).
++    void cset(int rd, int cond) { w(0x1A9F07E0 | (static_cast<uint32_t>(cond ^ 1) << 12) | static_cast<uint32_t>(rd)); }
++};
++
++// -------------------------------------------------- guest state access
++size_t RegOff(int nReg)
++{
++    return kOffR + 2 * static_cast<size_t>(nReg);
++}
++
++// Load guest register (size-masked) into wOut.
++void LoadGuestReg(Emitter& e, int wOut, int nReg, bool bByte)
++{
++    e.ldrh(wOut, RegOff(nReg));
++    if (bByte)
++        e.ubfx(wOut, wOut, 0, 8);
++}
++
++// Store W3 into guest register, preserving the high byte for byte ops
++// (decoder2's StoreToReg semantics).
++void StoreGuestReg(Emitter& e, int nReg, bool bByte)
++{
++    if (!bByte)
++    {
++        e.strh(W3, RegOff(nReg));
++        return;
++    }
++    e.ldrh(W7, RegOff(nReg));
++    e.movz(W6, 0xFF00);
++    e.andReg(W7, W7, W6);
++    e.ubfx(W6, W3, 0, 8);
++    e.orrReg(W7, W7, W6);
++    e.strh(W7, RegOff(nReg));
++}
++
++void AdvancePC(Emitter& e, int nSize)
++{
++    e.ldrh(W7, kOffPC);
++    e.addImm(W7, W7, static_cast<uint32_t>(nSize));
++    e.strh(W7, kOffPC);
++}
++
++// -------------------------------------------- guest flag construction
++// W3 must hold the (possibly wide) result; W5 receives the flag
++// nibble (N=bit3, Z=bit2, V=bit1, C=bit0). See FlagsAdd/FlagsSub for
++// the operand registers they expect.
++
++// N and Z from W3 (already masked to the op size).
++void FlagsNZ(Emitter& e, int nSignShift)
++{
++    e.lsr(W5, W3, nSignShift);
++    e.movz(W6, 1);
++    e.andReg(W5, W5, W6);
++    e.lsl(W5, W5, 3);
++    e.cmpImm(W3, 0);
++    e.cset(W6, 0); // EQ
++    e.lsl(W6, W6, 2);
++    e.orrReg(W5, W5, W6);
++}
++
++// Merge W5 into the guest sr, preserving every bit outside keepMask's
++// complement (0xFFF0 = replace N/Z/V/C, 0xFFF1 = keep C, replace N/Z/V).
++void ApplyFlags(Emitter& e, uint32_t nKeepMask)
++{
++    e.ldrh(W4, kOffSR);
++    e.movz(W6, nKeepMask);
++    e.andReg(W4, W4, W6);
++    e.orrReg(W4, W4, W5);
++    e.strh(W4, kOffSR);
++}
++
++// Full add flags: W1 = a, W2 = b (for ADDX: b already includes the
++// carry-in), W3 = wide sum. C from the wide sum's bit nSizeBits, then
++// W3 is truncated to the op size for N/Z/V and the store. The C bit
++// is staged in W7 because FlagsNZ uses W6 as scratch. With bStickyZ
++// (ADDX), Z = Z-in && (result == 0) — the H8 multi-precision chain
++// rule (decoder2: old_Z && result.zero); the caller preserves Z-in
++// in W4, which neither FlagsNZ nor this function writes.
++void FlagsAdd(Emitter& e, int nSizeBits, bool bStickyZ = false)
++{
++    e.lsr(W7, W3, nSizeBits);
++    e.movz(W6, 1);
++    e.andReg(W7, W7, W6); // C at bit0, in W7
++    if (nSizeBits < 32)
++        e.ubfx(W3, W3, 0, nSizeBits);
++    FlagsNZ(e, nSizeBits - 1);
++    e.orrReg(W5, W5, W7);
++    if (bStickyZ)
++    {
++        e.lsl(W6, W4, 2);    // Z-in at the Z bit position
++        e.movz(W7, 0xB);     // keep N, V, C
++        e.orrReg(W6, W6, W7);
++        e.andReg(W5, W5, W6);
++    }
++    // V = ((a ^ res) & (b ^ res)) sign bit
++    e.eorReg(W6, W1, W3);
++    e.eorReg(W7, W2, W3);
++    e.andReg(W6, W6, W7);
++    e.lsr(W6, W6, nSizeBits - 1);
++    e.movz(W7, 1);
++    e.andReg(W6, W6, W7);
++    e.lsl(W6, W6, 1);
++    e.orrReg(W5, W5, W6);
++    ApplyFlags(e, 0xFFF0);
++}
++
++// Full subtract flags: W1 = a, W2 = b, W3 = a - b (32-bit wrap).
++// C is the borrow (a < b unsigned), from a host compare of the
++// size-masked operands; W3 is truncated before N/Z/V.
++void FlagsSub(Emitter& e, int nSizeBits)
++{
++    e.cmpReg(W1, W2);
++    e.cset(W7, 3); // CC = borrow, staged in W7 (FlagsNZ uses W6)
++    if (nSizeBits < 32)
++        e.ubfx(W3, W3, 0, nSizeBits);
++    FlagsNZ(e, nSizeBits - 1);
++    e.orrReg(W5, W5, W7);
++    // V = ((a ^ b) & (a ^ res)) sign bit
++    e.eorReg(W6, W1, W2);
++    e.eorReg(W7, W1, W3);
++    e.andReg(W6, W6, W7);
++    e.lsr(W6, W6, nSizeBits - 1);
++    e.movz(W7, 1);
++    e.andReg(W6, W6, W7);
++    e.lsl(W6, W6, 1);
++    e.orrReg(W5, W5, W6);
++    ApplyFlags(e, 0xFFF0);
++}
++
++// -------------------------------------------------------- codelet gen
++struct SrcOp
++{
++    bool     bImm = false;
++    uint16_t nImm = 0;
++    int      nReg = 0;
++};
++
++bool ResolveSize(const decoder2::DisassembledInstruction& di, bool& bByte)
++{
++    using namespace decoder2;
++    if (di.op_size == OptionalSize::Byte)
++    {
++        bByte = true;
++        return true;
++    }
++    if (di.op_size == OptionalSize::Word)
++    {
++        bByte = false;
++        return true;
++    }
++    // Unsized: the E formats are byte-immediate, the I formats word.
++    if (di.format == InstructionFormat::E)
++    {
++        bByte = true;
++        return true;
++    }
++    if (di.format == InstructionFormat::I)
++    {
++        bByte = false;
++        return true;
++    }
++    if (di.instr == InstructionType::SWAP)
++    {
++        bByte = false; // SWAP operates on the full word
++        return true;
++    }
++    return false;
++}
++
++// Source operand of a two-operand general/E/I instruction.
++bool ResolveSrc(const decoder2::DisassembledInstruction& di, SrcOp& src)
++{
++    using namespace decoder2;
++    // Only the E/I formats carry a true immediate in op[0]. The L
++    // format also reports loc=imm, but there the value is an
++    // absolute address (a memory operand), not a literal.
++    if (di.op[0].location == OperandLocation::imm &&
++        (di.format == InstructionFormat::E || di.format == InstructionFormat::I))
++    {
++        src.bImm = true;
++        src.nImm = di.op[0].imm;
++        return true;
++    }
++    if (di.is_general && di.mode == AddressMode::Rn)
++    {
++        src.bImm = false;
++        src.nReg = di.ea_reg;
++        return true;
++    }
++    if (di.is_general && (di.mode == AddressMode::imm8 || di.mode == AddressMode::imm16))
++    {
++        src.bImm = true;
++        src.nImm = di.ea_imm;
++        return true;
++    }
++    return false;
++}
++
++void LoadSrc(Emitter& e, const SrcOp& src, bool bByte)
++{
++    if (src.bImm)
++        e.movz(W3, src.nImm);
++    else
++        LoadGuestReg(e, W3, src.nReg, bByte);
++}
++
++// Emit one codelet for the decoded instruction. Returns false when
++// the form is not implemented (caller keeps the block on fallback).
++bool EmitCodelet(const decoder2::DisassembledInstruction& di, Emitter& e)
++{
++    using namespace decoder2;
++
++    if (di.is_branch)
++        return false;
++
++    const InstructionType instr = di.instr;
++
++    if (instr == InstructionType::NOP)
++    {
++        AdvancePC(e, di.instr_size);
++        e.ret();
++        return true;
++    }
++
++    bool bByte = false;
++    if (!ResolveSize(di, bByte))
++        return false;
++    const int nSizeBits  = bByte ? 8 : 16;
++    const int nSignShift = nSizeBits - 1;
++
++    // ---- unary register ops (operand in ea_reg, Mode_Rn) ----
++    if (instr == InstructionType::CLR || instr == InstructionType::EXTU || instr == InstructionType::EXTS ||
++        instr == InstructionType::SHLL || instr == InstructionType::SHLR || instr == InstructionType::SHAL ||
++        instr == InstructionType::SHAR || instr == InstructionType::NEG || instr == InstructionType::NOT ||
++        instr == InstructionType::SWAP)
++    {
++        if (!di.is_general || di.mode != AddressMode::Rn)
++            return false;
++        const int nReg = di.ea_reg;
++
++        switch (instr)
++        {
++        case InstructionType::CLR:
++            e.movz(W3, 0);
++            StoreGuestReg(e, nReg, bByte);
++            e.movz(W5, kFlagZ);
++            ApplyFlags(e, 0xFFF0);
++            break;
++
++        case InstructionType::EXTU:
++            e.ldrh(W3, RegOff(nReg));
++            e.ubfx(W3, W3, 0, 8);
++            e.strh(W3, RegOff(nReg));
++            e.cmpImm(W3, 0);
++            e.cset(W5, 0);
++            e.lsl(W5, W5, 2);
++            ApplyFlags(e, 0xFFF0);
++            break;
++
++        case InstructionType::EXTS:
++            e.ldrh(W3, RegOff(nReg));
++            e.sxtb(W3, W3);
++            e.strh(W3, RegOff(nReg));
++            FlagsNZ(e, 15);
++            ApplyFlags(e, 0xFFF0);
++            break;
++
++        case InstructionType::SHLL:
++        case InstructionType::SHAL:
++            LoadGuestReg(e, W2, nReg, bByte);
++            e.lsl(W3, W2, 1);
++            e.ubfx(W3, W3, 0, nSizeBits);
++            FlagsNZ(e, nSignShift);
++            e.lsr(W6, W2, nSignShift); // C = old sign bit
++            e.movz(W7, 1);
++            e.andReg(W6, W6, W7);
++            e.orrReg(W5, W5, W6);
++            if (instr == InstructionType::SHAL)
++            {
++                e.eorReg(W6, W3, W2); // V = new sign != old sign
++                e.lsr(W6, W6, nSignShift);
++                e.movz(W7, 1);
++                e.andReg(W6, W6, W7);
++                e.lsl(W6, W6, 1);
++                e.orrReg(W5, W5, W6);
++            }
++            ApplyFlags(e, 0xFFF0);
++            StoreGuestReg(e, nReg, bByte);
++            break;
++
++        case InstructionType::SHLR:
++            LoadGuestReg(e, W2, nReg, bByte);
++            e.lsr(W3, W2, 1);
++            e.cmpImm(W3, 0);
++            e.cset(W5, 0);
++            e.lsl(W5, W5, 2); // Z; N = 0
++            e.movz(W6, 1);
++            e.andReg(W6, W2, W6); // C = old bit0
++            e.orrReg(W5, W5, W6);
++            ApplyFlags(e, 0xFFF0);
++            StoreGuestReg(e, nReg, bByte);
++            break;
++
++        case InstructionType::SHAR:
++            LoadGuestReg(e, W2, nReg, bByte);
++            if (bByte)
++                e.sxtb(W7, W2);
++            else
++                e.sxth(W7, W2);
++            e.asr(W3, W7, 1);
++            e.ubfx(W3, W3, 0, nSizeBits);
++            FlagsNZ(e, nSignShift);
++            e.movz(W6, 1);
++            e.andReg(W6, W2, W6); // C = old bit0
++            e.orrReg(W5, W5, W6);
++            ApplyFlags(e, 0xFFF0);
++            StoreGuestReg(e, nReg, bByte);
++            break;
++
++        case InstructionType::NEG:
++            LoadGuestReg(e, W2, nReg, bByte);
++            e.movz(W1, 0);
++            e.subReg(W3, W1, W2);
++            FlagsSub(e, nSizeBits); // expects W1 = a, W2 = b
++            StoreGuestReg(e, nReg, bByte);
++            break;
++
++        case InstructionType::NOT:
++            LoadGuestReg(e, W2, nReg, bByte);
++            e.mvn(W3, W2);
++            e.ubfx(W3, W3, 0, nSizeBits);
++            FlagsNZ(e, nSignShift);
++            ApplyFlags(e, 0xFFF1); // V = 0, C preserved
++            StoreGuestReg(e, nReg, bByte);
++            break;
++
++        case InstructionType::SWAP:
++            e.ldrh(W2, RegOff(nReg));
++            e.lsr(W3, W2, 8);
++            e.ubfx(W6, W2, 0, 8);
++            e.lsl(W6, W6, 8);
++            e.orrReg(W3, W3, W6);
++            e.strh(W3, RegOff(nReg));
++            FlagsNZ(e, 15);
++            ApplyFlags(e, 0xFFF1); // V = 0, C preserved
++            break;
++
++        default:
++            return false;
++        }
++
++        AdvancePC(e, di.instr_size);
++        e.ret();
++        return true;
++    }
++
++    // ---- two-operand ops: src -> dst register ----
++    if (instr == InstructionType::MOV || instr == InstructionType::ADD || instr == InstructionType::ADDX ||
++        instr == InstructionType::SUB || instr == InstructionType::CMP || instr == InstructionType::AND ||
++        instr == InstructionType::OR || instr == InstructionType::XOR)
++    {
++        SrcOp src;
++        if (!ResolveSrc(di, src))
++            return false;
++        if (di.op[1].location != OperandLocation::R)
++            return false;
++        // The G-form word op with an imm8 source sign-extends the
++        // immediate in decoder2's arithmetic handlers; not yet
++        // mirrored here.
++        if (src.bImm && !bByte && di.is_general && di.mode == AddressMode::imm8 && instr != InstructionType::MOV)
++            return false;
++        const int nDst = di.op[1].reg;
++
++        if (instr == InstructionType::MOV)
++        {
++            LoadSrc(e, src, bByte); // -> W3
++            FlagsNZ(e, nSignShift);
++            ApplyFlags(e, 0xFFF1); // N/Z set, V = 0, C preserved
++            StoreGuestReg(e, nDst, bByte);
++            AdvancePC(e, di.instr_size);
++            e.ret();
++            return true;
++        }
++
++        LoadGuestReg(e, W1, nDst, bByte); // a = dst value
++        if (src.bImm)
++            e.movz(W2, src.nImm);
++        else
++            LoadGuestReg(e, W2, src.nReg, bByte); // b = src value
++
++        switch (instr)
++        {
++        case InstructionType::ADD:
++            e.addReg(W3, W1, W2);
++            FlagsAdd(e, nSizeBits);
++            StoreGuestReg(e, nDst, bByte);
++            break;
++
++        case InstructionType::ADDX:
++            e.ldrh(W4, kOffSR);
++            e.ubfx(W6, W4, 0, 1);   // carry-in
++            e.addReg(W2, W2, W6);   // b += carry-in (exact for flags)
++            e.ubfx(W4, W4, 2, 1);   // Z-in, kept in W4 for FlagsAdd
++            e.addReg(W3, W1, W2);
++            FlagsAdd(e, nSizeBits, true);
++            StoreGuestReg(e, nDst, bByte);
++            break;
++
++        case InstructionType::SUB:
++            e.subReg(W3, W1, W2);
++            FlagsSub(e, nSizeBits);
++            StoreGuestReg(e, nDst, bByte);
++            break;
++
++        case InstructionType::CMP:
++            e.subReg(W3, W1, W2);
++            FlagsSub(e, nSizeBits);
++            break;
++
++        case InstructionType::AND:
++            e.andReg(W3, W1, W2);
++            FlagsNZ(e, nSignShift);
++            ApplyFlags(e, 0xFFF1); // V = 0, C preserved (decoder2 leaves C)
++            StoreGuestReg(e, nDst, bByte);
++            break;
++
++        case InstructionType::OR:
++            e.orrReg(W3, W1, W2);
++            FlagsNZ(e, nSignShift);
++            ApplyFlags(e, 0xFFF1); // V = 0, C preserved
++            StoreGuestReg(e, nDst, bByte);
++            break;
++
++        case InstructionType::XOR:
++            e.eorReg(W3, W1, W2);
++            FlagsNZ(e, nSignShift);
++            ApplyFlags(e, 0xFFF1); // V = 0, C preserved
++            StoreGuestReg(e, nDst, bByte);
++            break;
++
++        default:
++            return false;
++        }
++
++        AdvancePC(e, di.instr_size);
++        e.ret();
++        return true;
++    }
++
++    return false;
++}
++
++// ---------------------------------------------------------- translate
++bool Translate(mcu_t& mcu, uint32_t nGuestAddr, Block& block)
++{
++#if !defined(__aarch64__)
++    // The emitter targets AArch64 only. On other hosts (the fast x86
++    // harness build) the JIT stays on the oracle path instead of
++    // publishing foreign-architecture code.
++    (void)mcu;
++    (void)nGuestAddr;
++    (void)block;
++    ++s_stats.nTranslateFails;
++    return false;
++#else
++    EnsureArenaWritable();
++
++    // Publishing stamps the caller's block slot. It happens only on
++    // success, so a failed translation never evicts the slot's
++    // previous occupant.
++    auto Publish = [&](CodeletFn pFn) {
++        block.nKey  = (nGuestAddr << 1) | 1;
++        block.pCode = pFn;
++        MarkPage(nGuestAddr >> 8);
++        ++s_stats.nBlocksCreated;
++    };
++
++    // Fetch the instruction bytes through the guest memory map (the
++    // same reads the interpreter's fetch performs), staying inside
++    // the current 64 KiB page.
++    uint8_t       bytes[16];
++    const int32_t nAvail = 0x10000 - mcu.pc;
++    const size_t  nFetch = nAvail < 16 ? static_cast<size_t>(nAvail) : 16;
++    for (size_t i = 0; i < nFetch; ++i)
++        bytes[i] = MCU_Read(mcu, nGuestAddr + static_cast<uint32_t>(i));
++
++    decoder2::DisassembledInstruction di;
++    bool                              bOk = false;
++    try
++    {
++        bOk = decoder2::Disassemble(std::span<const uint8_t>(bytes, nFetch), 0, di);
++    }
++    catch (...)
++    {
++        bOk = false; // disassembler rejects some oracle-gap forms
++    }
++    if (!bOk || di.instr == decoder2::InstructionType::Unknown || di.instr_size == 0 ||
++        di.instr_size > nFetch)
++    {
++        ++s_stats.nTranslateFails;
++        return false;
++    }
++
++    uint32_t scratch[128];
++    Emitter  e{scratch, scratch + 128};
++    if (!EmitCodelet(di, e) || e.bOverflow)
++    {
++        ++s_stats.nTranslateFails;
++        return false;
++    }
++    const size_t nBytes = static_cast<size_t>(e.p - scratch) * sizeof(uint32_t);
++
++    // Dedupe probe: an identical codelet already in the arena is
++    // shared instead of re-emitted (verified by memcmp, so a hash
++    // collision only costs the compare).
++    const size_t nWords = static_cast<size_t>(e.p - scratch);
++    uint32_t     nHash  = 2166136261u;
++    for (size_t i = 0; i < nWords; ++i)
++    {
++        nHash ^= scratch[i];
++        nHash *= 16777619u;
++    }
++    uint32_t nSlot   = nHash & (kDedupeCount - 1);
++    bool     bInsert = false;
++    for (uint32_t nProbe = 0; nProbe < kDedupeCount; ++nProbe)
++    {
++        if (s_dedupeOff[nSlot] == 0)
++        {
++            bInsert = true; // empty slot: insertion point
++            break;
++        }
++        if (s_dedupeHash[nSlot] == nHash &&
++            memcmp(s_arena + (s_dedupeOff[nSlot] - 1), scratch, nBytes) == 0)
++        {
++            Publish(reinterpret_cast<CodeletFn>(s_arena + (s_dedupeOff[nSlot] - 1)));
++            ++s_stats.nDedupeHits;
++            return true;
++        }
++        nSlot = (nSlot + 1) & (kDedupeCount - 1);
++    }
++
++    if (s_arenaUsed + nBytes > sizeof(s_arena))
++    {
++        // Reclaim the arena (fallback block entries survive; see
++        // ReclaimArena). The reclaim resets the dedupe table, so the
++        // probe result is void: insert into the fresh table.
++        ReclaimArena();
++        if (nBytes > sizeof(s_arena))
++        {
++            ++s_stats.nTranslateFails;
++            return false;
++        }
++        nSlot   = nHash & (kDedupeCount - 1);
++        bInsert = true;
++    }
++
++    uint8_t* pDest = s_arena + s_arenaUsed;
++    memcpy(pDest, scratch, nBytes);
++    __builtin___clear_cache(reinterpret_cast<char*>(pDest), reinterpret_cast<char*>(pDest + nBytes));
++    s_arenaUsed += nBytes;
++    if (s_arenaUsed > s_stats.nArenaBytesUsed)
++        s_stats.nArenaBytesUsed = s_arenaUsed;
++
++    if (bInsert)
++    {
++        while (s_dedupeOff[nSlot] != 0)
++            nSlot = (nSlot + 1) & (kDedupeCount - 1);
++        s_dedupeHash[nSlot] = nHash;
++        s_dedupeOff[nSlot]  = static_cast<uint32_t>(pDest - s_arena) + 1;
++    }
++    Publish(reinterpret_cast<CodeletFn>(pDest));
++    ++s_stats.nCodelets;
++    return true;
++#endif
 +}
 +
 +} // namespace
@@ -218,27 +944,66 @@ index 0000000..2334a45
 +void JIT_Execute(mcu_t& mcu)
 +{
 +    const uint32_t nGuestAddr = (static_cast<uint32_t>(mcu.cp) << 16) | mcu.pc;
-+    Block& block              = s_blocks[BlockIndex(nGuestAddr)];
-+    if (block.nKey == ((nGuestAddr << 1) | 1))
++
++    if (FallbackTest(nGuestAddr))
 +    {
 +        ++s_stats.nBlockHits;
-+    }
-+    else
-+    {
-+        block.nKey = (nGuestAddr << 1) | 1;
-+        ++s_stats.nBlocksCreated;
-+        MarkPage(nGuestAddr >> 8);
++        ++s_stats.nFallbackSteps;
++        decoder2::FetchDecodeExecuteNext(mcu);
++        return;
 +    }
 +
-+    // Skeleton: delegate one instruction to the oracle.
-+    decoder2::FetchDecodeExecuteNext(mcu);
++    const uint32_t nKey  = (nGuestAddr << 1) | 1;
++    const uint32_t nSet  = BlockSet(nGuestAddr);
++    Block*         pWays = &s_blocks[nSet * kBlockWays];
++
++    for (uint32_t nWay = 0; nWay < kBlockWays; ++nWay)
++    {
++        Block& block = pWays[nWay];
++        if (block.nKey == nKey)
++        {
++            ++s_stats.nBlockHits;
++            block.pCode(&mcu);
++            ++s_stats.nNativeSteps;
++            return;
++        }
++    }
++
++    // Miss: hand Translate a victim slot (an invalid way, else the
++    // set's round-robin way). Translate stamps it only on success,
++    // so a failed translation leaves the set untouched and is
++    // remembered in the fallback bitmap instead.
++    Block* pVictim = nullptr;
++    for (uint32_t nWay = 0; nWay < kBlockWays && !pVictim; ++nWay)
++        if (pWays[nWay].nKey == 0)
++            pVictim = &pWays[nWay];
++    if (!pVictim)
++    {
++        pVictim          = &pWays[s_victim[nSet]];
++        s_victim[nSet]   = static_cast<uint8_t>((s_victim[nSet] + 1) & (kBlockWays - 1));
++    }
++
++    if (Translate(mcu, nGuestAddr, *pVictim))
++    {
++        pVictim->pCode(&mcu);
++        ++s_stats.nNativeSteps;
++        return;
++    }
++
++    FallbackSet(nGuestAddr);
 +    ++s_stats.nFallbackSteps;
++    decoder2::FetchDecodeExecuteNext(mcu);
 +}
 +
 +void JIT_Flush()
 +{
 +    memset(s_blocks, 0, sizeof(s_blocks));
 +    memset(s_pageHasBlocks, 0, sizeof(s_pageHasBlocks));
++    memset(s_fallbackBits, 0, sizeof(s_fallbackBits));
++    memset(s_pageHasFallback, 0, sizeof(s_pageHasFallback));
++    memset(s_dedupeHash, 0, sizeof(s_dedupeHash));
++    memset(s_dedupeOff, 0, sizeof(s_dedupeOff));
++    s_arenaUsed = 0;
 +    ++s_stats.nFlushes;
 +}
 +
@@ -248,7 +1013,7 @@ index 0000000..2334a45
 +    // the SRAM window and the internal-RAM window of page 0. Writes
 +    // to ROM space are dropped by the memory map itself.
 +    const uint32_t nPage = (address >> 8) & 0xFFFF;
-+    if (address < 0x10000 && PageHasBlocks(nPage))
++    if (address < 0x10000 && (PageHasBlocks(nPage) || PageHasFallback(nPage)))
 +        InvalidatePage(nPage);
 +}
 +
@@ -262,9 +1027,9 @@ index 0000000..2334a45
 +    return s_arena;
 +}
 +
-+uint32_t JIT_ArenaSize()
++size_t JIT_ArenaSize()
 +{
-+    return static_cast<uint32_t>(sizeof(s_arena));
++    return sizeof(s_arena);
 +}
 +
 +#else // !NUKED_ENABLE_DECODER2
@@ -292,7 +1057,7 @@ index 0000000..2334a45
 +    return nullptr;
 +}
 +
-+uint32_t JIT_ArenaSize()
++size_t JIT_ArenaSize()
 +{
 +    return 0;
 +}
@@ -300,24 +1065,34 @@ index 0000000..2334a45
 +#endif
 diff --git a/src/backend/jit.h b/src/backend/jit.h
 new file mode 100644
-index 0000000..9af2ce4
+index 0000000..4e61358
 --- /dev/null
 +++ b/src/backend/jit.h
-@@ -0,0 +1,46 @@
-+// H8 JIT dynamic recompiler -- engine skeleton.
+@@ -0,0 +1,61 @@
++// H8 JIT dynamic recompiler.
 +//
 +// Third execution engine beside decoder2 and the legacy interpreter,
-+// selected via MCU_SetH8Engine(H8Engine::JIT). Translation is
-+// block-based, keyed by guest (cp, pc). This skeleton provides the
-+// full plumbing -- block cache, code arena reservation, self-
-+// modifying-code invalidation, flush on engine switch -- while its
-+// blocks still delegate execution to decoder2 one instruction at a
-+// time, so behavior is oracle-identical by construction. Native code
-+// emission replaces the delegation form-by-form under the offline
-+// differential suite (golden traces: boot / E1M1 / BELMO).
++// selected via MCU_SetH8Engine(H8Engine::JIT). Translation is per
++// guest instruction (one native codelet per instruction), so the
++// step/peripheral interleaving matches the interpreters exactly.
++// Translation input is decoder2's own disassembler; any form the
++// translator does not implement executes through decoder2 (the
++// oracle). Codelets are cached by guest address and invalidated when
++// guest code memory is written.
++//
++// The code arena lives in section .text.jit_arena: Circle's linker
++// script folds it into .text (below _etext, which Circle maps
++// readable/writable/executable), and hosted builds fold it into the
++// executable segment (made writable once via mprotect on Linux).
++// Code must never execute from the malloc heap, which Circle maps
++// execute-never.
++//
++// Part of the mt32-pi Circle patch set for Nuked-SC55 (GPLv2+,
++// matching upstream).
 +
 +#pragma once
 +
++#include <cstddef>
 +#include <cstdint>
 +
 +struct mcu_t;
@@ -337,19 +1112,24 @@ index 0000000..9af2ce4
 +
 +struct JITStats
 +{
-+    uint64_t nBlocksCreated  = 0;
-+    uint64_t nBlockHits      = 0;
-+    uint64_t nFallbackSteps  = 0;
-+    uint64_t nInvalidations  = 0;
-+    uint64_t nFlushes        = 0;
++    uint64_t nBlocksCreated  = 0; // native cache entries created (fallback lives in a bitmap)
++    uint64_t nBlockHits      = 0; // executions served from the cache
++    uint64_t nNativeSteps    = 0; // guest instructions executed as native code
++    uint64_t nCodelets       = 0; // native codelets emitted
++    uint64_t nFallbackSteps  = 0; // guest instructions delegated to decoder2
++    uint64_t nTranslateFails = 0; // forms left as fallback (unimplemented/unknown)
++    uint64_t nDedupeHits     = 0; // translations served by an identical existing codelet
++    uint64_t nInvalidations  = 0; // cache entries dropped by code-memory writes
++    uint64_t nFlushes        = 0; // full cache flushes (engine switch, state restore)
++    uint64_t nReclaims       = 0; // arena reuses (fallback entries survive these)
++    uint64_t nArenaBytesUsed = 0; // high-water mark of emitted code
 +};
 +
 +const JITStats& JIT_GetStats();
 +
-+// Base/size of the reserved native-code arena (diagnostics; on the
-+// bare-metal target the arena must land in executable memory).
++// Base/size of the reserved native-code arena (diagnostics).
 +const uint8_t* JIT_ArenaBase();
-+uint32_t JIT_ArenaSize();
++size_t         JIT_ArenaSize();
 diff --git a/src/backend/lcd.h b/src/backend/lcd.h
 index 5207950..d57dfd2 100644
 --- a/src/backend/lcd.h
