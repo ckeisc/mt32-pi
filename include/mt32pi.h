@@ -61,6 +61,7 @@
 #include "ringbuffer.h"
 #include "synth/emuscsynth.h"
 #include "synth/mt32romset.h"
+#include "synth/nukedsc55synth.h"
 #include "synth/mt32synth.h"
 #include "synth/soundfontsynth.h"
 #include "synth/synth.h"
@@ -114,6 +115,7 @@ private:
 	bool InitMT32Synth();
 	bool InitSoundFontSynth();
 	bool InitEmuSCSynth();
+	bool InitNukedSC55Synth();
 
 	// Tasks for specific CPU cores
 	void MainTask();
@@ -215,6 +217,7 @@ private:
 	CMT32Synth* m_pMT32Synth;
 	CSoundFontSynth* m_pSoundFontSynth;
 	CEmuSCSynth* m_pEmuSCSynth;
+	CNukedSC55Synth* m_pNukedSC55Synth;
 
 	// MIDI receive buffer
 	CRingBuffer<u8, MIDIRxBufferSize> m_MIDIRxBuffer;

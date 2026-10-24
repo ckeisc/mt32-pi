@@ -28,6 +28,7 @@ enum class TSynth
 	MT32,
 	SoundFont,
 	EmuSC,
+	NukedSC55,
 };
 
 #endif

@@ -18,3 +18,7 @@
 	path = external/emusc
 	url = https://github.com/skjelten/emusc.git
 	ignore = dirty
+[submodule "external/nuked-sc55"]
+	path = external/nuked-sc55
+	url = https://github.com/jcmoyer/Nuked-SC55.git
+	ignore = dirty

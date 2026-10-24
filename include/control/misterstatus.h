@@ -33,6 +33,7 @@ enum class TMisterSynth : u8
 	MT32      = 0xA1,
 	SoundFont = 0xA2,
 	EmuSC     = 0xA3,
+	NukedSC55 = 0xA4,
 	Unknown   = 0xFF,
 };
 

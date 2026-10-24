@@ -26,9 +26,11 @@
 #include <vector>
 
 #include <circle/logger.h>
+#include <circle/memory.h>
 #include <fatfs/ff.h>
 
 #include "config.h"
+#include "diaglog.h"
 #include "lcd/ui.h"
 #include "synth/emuscsynth.h"
 #include "utility.h"
@@ -255,6 +257,10 @@ bool CEmuSCSynth::Initialize()
 
 	LOGNOTE("libEmuSC %s initialized: %s control ROM v%s, wave ROM v%s",
 	        EmuSC::Synth::version().c_str(), m_ModelName, m_ROMVersion, m_pWaveROM->version().c_str());
+
+	CDiagLog::Get().LogLine("init synth=emusc model=%s version=%s heap_free_low_kb=%u",
+	                        m_ModelName, m_ROMVersion,
+	                        static_cast<unsigned>(CMemorySystem::Get()->GetHeapFreeSpace(HEAP_LOW) / 1024));
 
 	// Apply any master volume set before initialization completed
 	SetMasterVolume(m_nVolume);

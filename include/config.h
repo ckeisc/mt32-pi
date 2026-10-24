@@ -29,6 +29,7 @@
 #include "control/rotaryencoder.h"
 #include "lcd/drivers/ssd1306.h"
 #include "synth/emuscsynth.h"
+#include "synth/nukedsc55synth.h"
 #include "synth/mt32romset.h"
 #include "synth/mt32synth.h"
 #include "utility.h"
@@ -39,7 +40,8 @@ public:
 	#define ENUM_SYSTEMDEFAULTSYNTH(ENUM) \
 		ENUM(MT32, mt32)                  \
 		ENUM(SoundFont, soundfont)        \
-		ENUM(EmuSC, emusc)
+		ENUM(EmuSC, emusc)                \
+		ENUM(NukedSC55, nuked)
 
 	#define ENUM_AUDIOOUTPUTDEVICE(ENUM) \
 		ENUM(PWM, pwm)                   \
@@ -57,6 +59,7 @@ public:
 	using TMT32EmuMIDIChannels     = CMT32Synth::TMIDIChannels;
 	using TMT32EmuROMSet           = TMT32ROMSet;
 	using TEmuSCSoundMap           = CEmuSCSynth::TSoundMap;
+	using TNukedH8Engine           = CNukedSC55Synth::TH8Engine;
 
 	using TLCDRotation             = CSSD1306::TLCDRotation;
 	using TLCDMirror               = CSSD1306::TLCDMirror;
@@ -100,6 +103,7 @@ public:
 	static bool ParseOption(const char* pString, TMT32EmuMIDIChannels* pOut);
 	static bool ParseOption(const char* pString, TMT32EmuROMSet* pOut);
 	static bool ParseOption(const char* pString, TEmuSCSoundMap* pOut);
+	static bool ParseOption(const char* pString, TNukedH8Engine* pOut);
 	static bool ParseOption(const char* pString, TLCDType* pOut);
 	static bool ParseOption(const char* pString, TControlScheme* pOut);
 	static bool ParseOption(const char* pString, TEncoderType* pOut);
