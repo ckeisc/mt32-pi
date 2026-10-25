@@ -1368,11 +1368,16 @@ index 0000000..9ea3a05
 +NukedProfileClockFn NukedProfileClock();
 +NukedProfileData& NukedProfile();
 diff --git a/src/backend/pcm.cpp b/src/backend/pcm.cpp
-index b8a4e27..0c0a8cd 100644
+index b8a4e27..ef28b0b 100644
 --- a/src/backend/pcm.cpp
 +++ b/src/backend/pcm.cpp
-@@ -23,10 +23,15 @@
+@@ -21,12 +21,20 @@
+  *
+  */
  #include "pcm.h"
++#if defined(__aarch64__)
++#include <arm_neon.h>
++#endif
  #include "mcu.h"
  #include "mcu_interrupt.h"
 +#include "nuked_profile.h"
@@ -1388,7 +1393,224 @@ index b8a4e27..0c0a8cd 100644
  {
      int bank;
      if (pcm.config_reg_3d & 0x20)
-@@ -573,6 +578,11 @@ void PCM_GetConfig(PCM_Config& config, uint8_t config_byte)
+@@ -474,6 +482,216 @@ inline void calc_tv(pcm_t& pcm, int e, int adjust, uint16_t *levelcur, int activ
+     }
+ }
+ 
++#if defined(__aarch64__)
++// Vector calc_tv across 4 voices for one fixed envelope index e.
++// Bit-identical to scalar calc_tv by construction: every gated update uses
++// a select (vbsl), never a zero-substituted add; all shifts are arithmetic
++// (NEON SSHL with negative counts), matching GCC's codegen for the scalar
++// signed shifts. tv_counter and nfs are uniform across lanes (tick
++// invariants); e is uniform per call. active_mask lanes are all-ones for
++// an active voice, zero otherwise.
++static inline void calc_tv_vec4(pcm_t& pcm, int e,
++                                int32x4_t adjust, int32x4_t levelcur_in,
++                                uint32x4_t active_mask,
++                                int32x4_t* levelcur_out, int32x4_t* volmul_out)
++{
++    const int32x4_t zero = vdupq_n_s32(0);
++    const int32x4_t one = vdupq_n_s32(1);
++    const uint32x4_t allones = vdupq_n_u32(0xFFFFFFFF);
++    int32x4_t lc = vandq_s32(levelcur_in, vdupq_n_s32(0x7fff));
++    int32x4_t speed = vandq_s32(adjust, vdupq_n_s32(0xff));
++    int32x4_t target = vandq_s32(vshrq_n_s32(adjust, 8), vdupq_n_s32(0xff));
++
++    // Masks (all-ones = true) and 0/1 versions of the w-conditions.
++    uint32x4_t w1m = vceqzq_u32(vreinterpretq_u32_s32(vandq_s32(speed, vdupq_n_s32(0xf0))));
++    uint32x4_t w2m = vorrq_u32(w1m, vmvnq_u32(vceqzq_u32(vreinterpretq_u32_s32(vandq_s32(speed, vdupq_n_s32(0x10))))));
++    uint32x4_t s80m = vceqzq_u32(vreinterpretq_u32_s32(vandq_s32(speed, vdupq_n_s32(0x80))));
++    uint32x4_t s40m = vceqzq_u32(vreinterpretq_u32_s32(vandq_s32(speed, vdupq_n_s32(0x40))));
++    uint32x4_t s20m = vceqzq_u32(vreinterpretq_u32_s32(vandq_s32(speed, vdupq_n_s32(0x20))));
++    uint32x4_t w3m = vdupq_n_u32(0);
++    if (pcm.nfs)
++        w3m = vorrq_u32(s80m, vandq_u32(s40m, vorrq_u32(vmvnq_u32(w2m), s20m)));
++    int32x4_t w2_01 = vandq_s32(vreinterpretq_s32_u32(w2m), one);
++    int32x4_t w3_01 = vandq_s32(vreinterpretq_s32_u32(w3m), one);
++    int32x4_t type = vorrq_s32(w2_01, vshlq_n_s32(w3_01, 3));
++    type = vorrq_s32(type, vandq_s32(vreinterpretq_s32_u32(vmvnq_u32(s20m)), vdupq_n_s32(2)));
++    type = vorrq_s32(type, vandq_s32(vreinterpretq_s32_u32(vorrq_u32(s80m, s40m)), vdupq_n_s32(4)));
++
++    uint32x4_t t4m = vmvnq_u32(vceqzq_u32(vreinterpretq_u32_s32(vandq_s32(type, vdupq_n_s32(4)))));
++    uint32x4_t t8m = vmvnq_u32(vceqzq_u32(vreinterpretq_u32_s32(vandq_s32(type, vdupq_n_s32(8)))));
++    int32x4_t type3 = vandq_s32(type, vdupq_n_s32(3));
++    uint32x4_t c0m = vceqzq_u32(vreinterpretq_u32_s32(type3));
++    uint32x4_t c1m = vceqzq_u32(vreinterpretq_u32_s32(vsubq_s32(type3, one)));
++    uint32x4_t c2m = vceqzq_u32(vreinterpretq_u32_s32(vsubq_s32(type3, vdupq_n_s32(2))));
++    // c3 is the fallthrough; no mask needed (select chain default).
++
++    // addlow candidates: tv_counter is uniform, so each is a scalar.
++    const int tvc = pcm.tv_counter;
++    const int addlow4 = ((tvc & 8) ? 1 : 0) | ((tvc & 4) ? 2 : 0) | ((tvc & 2) ? 4 : 0) | ((tvc & 1) ? 8 : 0);
++    const int addlow0 = ((tvc & 0x20) ? 1 : 0) | ((tvc & 0x10) ? 2 : 0) | ((tvc & 8) ? 4 : 0) | ((tvc & 4) ? 8 : 0);
++    const int addlow1 = ((tvc & 0x80) ? 1 : 0) | ((tvc & 0x40) ? 2 : 0) | ((tvc & 0x20) ? 4 : 0) | ((tvc & 0x10) ? 8 : 0);
++    const int addlow2 = ((tvc & 0x200) ? 1 : 0) | ((tvc & 0x100) ? 2 : 0) | ((tvc & 0x80) ? 4 : 0) | ((tvc & 0x40) ? 8 : 0);
++    const int addlow3 = ((tvc & 0x800) ? 1 : 0) | ((tvc & 0x400) ? 2 : 0) | ((tvc & 0x200) ? 4 : 0) | ((tvc & 0x100) ? 8 : 0);
++    int32x4_t addlow = vbslq_s32(t4m, vdupq_n_s32(addlow4),
++                         vbslq_s32(c0m, vdupq_n_s32(addlow0),
++                         vbslq_s32(c1m, vdupq_n_s32(addlow1),
++                         vbslq_s32(c2m, vdupq_n_s32(addlow2), vdupq_n_s32(addlow3)))));
++
++    // write = !active | (type&4) | case condition (scalar per case).
++    const int cond0 = ((tvc & 3) == 0) ? 1 : 0;
++    const int cond1 = ((tvc & 15) == 0) ? 1 : 0;
++    const int cond2 = ((tvc & 63) == 0) ? 1 : 0;
++    const int cond3 = ((tvc & 127) == 0) ? 1 : 0;
++    int32x4_t write01 = vandq_s32(vreinterpretq_s32_u32(vceqzq_u32(active_mask)), one);
++    write01 = vorrq_s32(write01, vandq_s32(vreinterpretq_s32_u32(t4m), one));
++    write01 = vorrq_s32(write01, vbslq_s32(t4m, zero,
++                            vbslq_s32(c0m, vdupq_n_s32(cond0),
++                            vbslq_s32(c1m, vdupq_n_s32(cond1),
++                            vbslq_s32(c2m, vdupq_n_s32(cond2), vdupq_n_s32(cond3))))));
++    uint32x4_t wmask = pcm.nfs ? vreinterpretq_u32_s32(vnegq_s32(write01)) : vdupq_n_u32(0);
++
++    int32x4_t lc4 = vshlq_n_s32(lc, 4);
++    int32x4_t sub = (e != 2) ? lc4 : vbslq_s32(active_mask, lc4, zero);
++    int32x4_t tgt11 = vshlq_n_s32(target, 11);
++
++    // Branch A: (type & 8) == 0.
++    int32x4_t shiftA = vandq_s32(vsubq_s32(vdupq_n_s32(10), vandq_s32(speed, vdupq_n_s32(15))), vdupq_n_s32(15));
++    int32x4_t sum1A = vsubq_s32(tgt11, sub);
++    int32x4_t shiftedA = vsubq_s32(vshlq_s32(sum1A, vnegq_s32(shiftA)), sum1A);
++    int32x4_t sum2A = vaddq_s32(vaddq_s32(tgt11, addlow), shiftedA);
++    int32x4_t lcA = vbslq_s32(wmask, vandq_s32(vshrq_n_s32(sum2A, 4), vdupq_n_s32(0x7fff)), lc);
++    int32x4_t volA = vandq_s32(vshrq_n_s32(sum2A, 4), vdupq_n_s32(0x7ffe));
++
++    // Branch B: (type & 8) != 0.
++    int32x4_t shiftB = vandq_s32(vsubq_s32(vdupq_n_s32(10), vorrq_s32(vandq_s32(vshrq_n_s32(speed, 4), vdupq_n_s32(14)), w2_01)), vdupq_n_s32(15));
++    int32x4_t sum1B = vsubq_s32(tgt11, sub);
++    uint32x4_t negm = vmvnq_u32(vceqzq_u32(vreinterpretq_u32_s32(vandq_s32(sum1B, vdupq_n_s32(0x80000)))));
++    int32x4_t preshift = vshlq_n_s32(vandq_s32(speed, vdupq_n_s32(15)), 9);
++    preshift = vorrq_s32(preshift, vbslq_s32(vmvnq_u32(w1m), vdupq_n_s32(0x2000), zero));
++    preshift = veorq_s32(preshift, vbslq_s32(negm, vdupq_n_s32(-64), zero));
++    int32x4_t shiftedB = vshlq_s32(preshift, vnegq_s32(shiftB));
++    int32x4_t addterm = (e != 2) ? vorrq_s32(lc4, addlow) : vbslq_s32(active_mask, vorrq_s32(lc4, addlow), zero);
++    int32x4_t sum2B = vaddq_s32(shiftedB, addterm);
++    int32x4_t sum2_lB = vshrq_n_s32(sum2B, 4);
++    int32x4_t sum3B = vsubq_s32(tgt11, vshlq_n_s32(sum2_lB, 4));
++    uint32x4_t neg2m = vmvnq_u32(vceqzq_u32(vreinterpretq_u32_s32(vandq_s32(sum3B, vdupq_n_s32(0x80000)))));
++    uint32x4_t xnorm = vmvnq_u32(veorq_u32(neg2m, negm));
++    int32x4_t lcB = vbslq_s32(wmask, vbslq_s32(xnorm, vandq_s32(sum2_lB, vdupq_n_s32(0x7fff)), vshlq_n_s32(target, 7)), lc);
++    int32x4_t volB;
++    if (e == 0)
++        volB = vandq_s32(sum2_lB, vdupq_n_s32(0x7ffe));
++    else if (e == 1)
++        volB = vbslq_s32(xnorm, vandq_s32(sum2_lB, vdupq_n_s32(0x7ffe)), vshlq_n_s32(target, 7));
++    else
++        volB = zero;
++
++    *levelcur_out = vbslq_s32(t8m, lcB, lcA);
++    *volmul_out = vbslq_s32(t8m, volB, volA);
++    (void)allones;
++}
++#endif // __aarch64__
++
++#if defined(__aarch64__)
++static inline int32x4_t neon_sx20(int32x4_t x) { return vshrq_n_s32(vshlq_n_s32(x, 12), 12); }
++static inline int32x4_t neon_sx8(int32x4_t x) { return vshrq_n_s32(vshlq_n_s32(x, 24), 24); }
++static inline int32x4_t neon_multi(int32x4_t a, int32x4_t b) { return vmulq_s32(neon_sx20(a), b); }
++static inline int32x4_t neon_addclip20(int32x4_t a, int32x4_t b, int32x4_t cin)
++{
++    return vaddq_s32(vaddq_s32(neon_sx20(a), neon_sx20(b)), cin);
++}
++
++// Vector interpolation for 4 voices. nibmask lanes hold bits cmp2=1,
++// cmp3=2, cmp4=4. lut is interp_lut (int [3][128]).
++static inline int32x4_t neon_interp_vec4(int32x4_t samp0, int32x4_t samp1, int32x4_t samp2,
++                                         int32x4_t ratio, int32x4_t nibmask,
++                                         int32x4_t oldnib, int32x4_t newnib,
++                                         int32x4_t test_in, const int (*lut)[128])
++{
++    const int32x4_t one = vdupq_n_s32(1);
++    int r[4], nm[4];
++    vst1q_s32(r, ratio);
++    vst1q_s32(nm, nibmask);
++    int32x4_t test = test_in;
++    int32x4_t samps[3] = { samp0, samp1, samp2 };
++    const int bits[3] = { 1, 2, 4 };
++    for (int k = 0; k < 3; k++)
++    {
++        int lk[4] = { lut[k][r[0]], lut[k][r[1]], lut[k][r[2]], lut[k][r[3]] };
++        int32x4_t L = vld1q_s32(lk);
++        int32x4_t step = vshrq_n_s32(neon_multi(vshlq_n_s32(L, 6), samps[k]), 8);
++        uint32x4_t cm = vmvnq_u32(vceqzq_u32(vreinterpretq_u32_s32(vandq_s32(nibmask, vdupq_n_s32(bits[k])))));
++        int32x4_t sel = vbslq_s32(cm, oldnib, newnib);
++        int32x4_t shift = vandq_s32(vsubq_s32(vdupq_n_s32(10), sel), vdupq_n_s32(15));
++        step = vshlq_s32(vshlq_n_s32(step, 1), vnegq_s32(shift));
++        test = neon_addclip20(test, vshrq_n_s32(step, 1), vandq_s32(step, one));
++    }
++    (void)nm;
++    return test;
++}
++
++static inline void neon_filter_mk1_vec4(int32x4_t test, int32x4_t reg1, int32x4_t reg3,
++                                        int32x4_t filt, int32x4_t reg26,
++                                        int32x4_t* v1out, int32x4_t* v5out, int32x4_t* v3out)
++{
++    const int32x4_t one = vdupq_n_s32(1);
++    int32x4_t fhi = neon_sx8(vshrq_n_s32(filt, 8));
++    int32x4_t fmid = vandq_s32(vshrq_n_s32(filt, 1), vdupq_n_s32(127));
++    int32x4_t m1 = neon_multi(reg1, fhi);
++    int32x4_t m2 = neon_multi(reg1, fmid);
++    int32x4_t m3 = neon_multi(reg1, reg26);
++    int32x4_t v2 = neon_addclip20(reg3, vshrq_n_s32(m1, 6), vandq_s32(vshrq_n_s32(m1, 5), one));
++    int32x4_t v1 = neon_addclip20(v2, vshrq_n_s32(m2, 13), vandq_s32(vshrq_n_s32(m2, 12), one));
++    int32x4_t sub = neon_addclip20(v1, vshrq_n_s32(m3, 6), vandq_s32(vshrq_n_s32(m3, 5), one));
++    int32x4_t v3 = neon_addclip20(test, veorq_s32(sub, vdupq_n_s32(0xfffff)), one);
++    int32x4_t m4 = neon_multi(v3, fhi);
++    int32x4_t m5 = neon_multi(v3, fmid);
++    int32x4_t v4 = neon_addclip20(reg1, vshrq_n_s32(m4, 6), vandq_s32(vshrq_n_s32(m4, 5), one));
++    int32x4_t v5 = neon_addclip20(v4, vshrq_n_s32(m5, 13), vandq_s32(vshrq_n_s32(m5, 12), one));
++    *v1out = v1; *v5out = v5; *v3out = v3;
++}
++
++static inline void neon_filter_jv_vec4(int32x4_t test, int32x4_t reg1, int32x4_t reg3,
++                                       int32x4_t filt, int32x4_t reg26,
++                                       int32x4_t* v1out, int32x4_t* v5out, int32x4_t* v3out)
++{
++    const int32x4_t one = vdupq_n_s32(1);
++    int32x4_t fhi = neon_sx8(vshrq_n_s32(filt, 8));
++    int32x4_t fmid = vandq_s32(vshrq_n_s32(filt, 1), vdupq_n_s32(127));
++    int32x4_t m1 = vmulq_s32(reg1, fhi);
++    int32x4_t m2 = vmulq_s32(reg1, fmid);
++    int32x4_t m3 = vmulq_s32(reg1, reg26);
++    int32x4_t v2 = vaddq_s32(vaddq_s32(reg3, vshrq_n_s32(m1, 6)), vandq_s32(vshrq_n_s32(m1, 5), one));
++    int32x4_t v1 = vaddq_s32(vaddq_s32(v2, vshrq_n_s32(m2, 13)), vandq_s32(vshrq_n_s32(m2, 12), one));
++    int32x4_t sub = vaddq_s32(vaddq_s32(v1, vshrq_n_s32(m3, 6)), vandq_s32(vshrq_n_s32(m3, 5), one));
++    int32x4_t tests = vshrq_n_s32(vshlq_n_s32(test, 12), 12);
++    int32x4_t v3 = vsubq_s32(tests, sub);
++    int32x4_t m4 = vmulq_s32(v3, fhi);
++    int32x4_t m5 = vmulq_s32(v3, fmid);
++    int32x4_t v4 = vaddq_s32(vaddq_s32(reg1, vshrq_n_s32(m4, 6)), vandq_s32(vshrq_n_s32(m4, 5), one));
++    int32x4_t v5 = vaddq_s32(vaddq_s32(v4, vshrq_n_s32(m5, 13)), vandq_s32(vshrq_n_s32(m5, 12), one));
++    *v1out = v1; *v5out = v5; *v3out = v3;
++}
++static inline void neon_scaling_vec4(int32x4_t sample_in, int32x4_t volmul1, int32x4_t volmul2,
++                                     int32x4_t pan_in, int32x4_t rc_in,
++                                     int32x4_t* sampl_out, int32x4_t* sampr_out,
++                                     int32x4_t* rc0_out, int32x4_t* rc1_out)
++{
++    const int32x4_t one = vdupq_n_s32(1);
++    int32x4_t mv1 = neon_multi(sample_in, neon_sx8(vshrq_n_s32(volmul1, 8)));
++    int32x4_t mv2 = neon_multi(sample_in, vandq_s32(vshrq_n_s32(volmul1, 1), vdupq_n_s32(127)));
++    int32x4_t s2 = neon_addclip20(vshrq_n_s32(mv1, 6), vshrq_n_s32(mv2, 13),
++                                  vandq_s32(vorrq_s32(vshrq_n_s32(mv2, 12), vshrq_n_s32(mv1, 5)), one));
++    int32x4_t mv3 = neon_multi(s2, neon_sx8(vshrq_n_s32(volmul2, 8)));
++    int32x4_t mv4 = neon_multi(s2, vandq_s32(vshrq_n_s32(volmul2, 1), vdupq_n_s32(127)));
++    int32x4_t s3 = neon_addclip20(vshrq_n_s32(mv3, 6), vshrq_n_s32(mv4, 13),
++                                  vandq_s32(vorrq_s32(vshrq_n_s32(mv4, 12), vshrq_n_s32(mv3, 5)), one));
++    *sampl_out = neon_multi(s3, neon_sx8(vandq_s32(vshrq_n_s32(pan_in, 8), vdupq_n_s32(255))));
++    *sampr_out = neon_multi(s3, neon_sx8(vandq_s32(pan_in, vdupq_n_s32(255))));
++    *rc0_out = vshrq_n_s32(neon_multi(s3, neon_sx8(vandq_s32(vshrq_n_s32(rc_in, 8), vdupq_n_s32(255)))), 5);
++    *rc1_out = vshrq_n_s32(neon_multi(s3, neon_sx8(vandq_s32(rc_in, vdupq_n_s32(255)))), 5);
++}
++#endif // __aarch64__
++
+ inline int eram_unpack(pcm_t& pcm, uint32_t addr, int type = 0)
+ {
+     addr &= 0x3fff;
+@@ -573,6 +791,11 @@ void PCM_GetConfig(PCM_Config& config, uint8_t config_byte)
  
  void PCM_Update(pcm_t& pcm, uint64_t cycles)
  {
@@ -1400,7 +1622,486 @@ index b8a4e27..0c0a8cd 100644
      while (pcm.cycles < cycles)
      {
          const uint32_t voice_active = pcm.voice_mask & pcm.voice_mask_pending;
-@@ -1560,6 +1570,12 @@ void PCM_Update(pcm_t& pcm, uint64_t cycles)
+@@ -1088,6 +1311,23 @@ void PCM_Update(pcm_t& pcm, uint64_t cycles)
+         pcm.rcsum[0] = 0;
+         pcm.rcsum[1] = 0;
+ 
++        int tmp_v3[32];
++        int tmp_samp0[32];
++        int tmp_samp1[32];
++        int tmp_samp2[32];
++        int tmp_samp3[32];
++        int tmp_nibcmp[32];
++        int tmp_ratio[32];
++        int tmp_testbase[32];
++        int tmp_sampl[32];
++        int tmp_sampr[32];
++        int tmp_rc0[32];
++        int tmp_rc1[32];
++        bool tmp_active[32];
++        bool tmp_usenew[32];
++        int tmp_newnibble[32];
++        int tmp_volmul1[32];
++        int tmp_volmul2[32];
+         for (int slot = 0; slot < pcm.config.reg_slots; slot++)
+         {
+             uint32_t *ram1 = pcm.ram1[slot];
+@@ -1331,27 +1571,184 @@ void PCM_Update(pcm_t& pcm, uint64_t cycles)
+             if (sub_phase_of >= 4)
+                 reference = addclip20(reference, shifted >> 1, shifted & 1);
+ 
++            int testbase = (int)ram1[5];
++            ram1[5] = (uint32_t)reference;
++
++            if (active && (ram2[6] & 1) != 0 && (ram2[8] & 0x4000) == 0 && !pcm.irq_assert && irq_flag)
++            {
++                //fprintf(stderr, "irq voice %i\n", slot);
++                if (pcm.nfs)
++                    ram2[8] |= 0x4000;
++                pcm.irq_assert = true;
++                pcm.irq_channel = (uint8_t)slot;
++                if (pcm.mcu->is_jv880)
++                    MCU_GA_SetGAInt(*pcm.mcu, 5, 1);
++                else
++                    MCU_Interrupt_SetRequest(*pcm.mcu, INTERRUPT_SOURCE_IRQ0, 1);
++            }
++
++            tmp_active[slot] = active;
++            tmp_usenew[slot] = usenew;
++            tmp_newnibble[slot] = newnibble;
++            tmp_samp0[slot] = samp0;
++            tmp_samp1[slot] = samp1;
++            tmp_samp2[slot] = samp2;
++            tmp_samp3[slot] = samp3;
++            tmp_nibcmp[slot] = (nibble_cmp2 ? 1 : 0) | (nibble_cmp3 ? 2 : 0) | (nibble_cmp4 ? 4 : 0);
++            tmp_ratio[slot] = interp_ratio;
++            tmp_testbase[slot] = testbase;
++        }
++
++#if defined(__aarch64__)
++        // Stage 2a: vector interp/filter, groups of 4.
++        for (int base = 0; base < pcm.config.reg_slots; base += 4)
++        {
++            int glanes = pcm.config.reg_slots - base;
++            if (glanes > 4) glanes = 4;
++            int32x4_t s0, s1, s2, rat, nbm, oldn, newn, tbase, rg1, rg3, flt, r26;
++            if (glanes == 4)
++            {
++                s0 = vld1q_s32(&tmp_samp0[base]);
++                s1 = vld1q_s32(&tmp_samp1[base]);
++                s2 = vld1q_s32(&tmp_samp2[base]);
++                rat = vld1q_s32(&tmp_ratio[base]);
++                nbm = vld1q_s32(&tmp_nibcmp[base]);
++                newn = vld1q_s32(&tmp_newnibble[base]);
++                tbase = vld1q_s32(&tmp_testbase[base]);
++                rg1 = vdupq_n_s32(0);
++                rg1 = vsetq_lane_s32((int)pcm.ram1[base + 0][1], rg1, 0);
++                rg1 = vsetq_lane_s32((int)pcm.ram1[base + 1][1], rg1, 1);
++                rg1 = vsetq_lane_s32((int)pcm.ram1[base + 2][1], rg1, 2);
++                rg1 = vsetq_lane_s32((int)pcm.ram1[base + 3][1], rg1, 3);
++                rg3 = vdupq_n_s32(0);
++                rg3 = vsetq_lane_s32((int)pcm.ram1[base + 0][3], rg3, 0);
++                rg3 = vsetq_lane_s32((int)pcm.ram1[base + 1][3], rg3, 1);
++                rg3 = vsetq_lane_s32((int)pcm.ram1[base + 2][3], rg3, 2);
++                rg3 = vsetq_lane_s32((int)pcm.ram1[base + 3][3], rg3, 3);
++                flt = vdupq_n_s32(0);
++                flt = vsetq_lane_s32((int)pcm.ram2[base + 0][11], flt, 0);
++                flt = vsetq_lane_s32((int)pcm.ram2[base + 1][11], flt, 1);
++                flt = vsetq_lane_s32((int)pcm.ram2[base + 2][11], flt, 2);
++                flt = vsetq_lane_s32((int)pcm.ram2[base + 3][11], flt, 3);
++                r26 = vdupq_n_s32(0);
++                r26 = vsetq_lane_s32((int)((pcm.ram2[base + 0][6] >> 8) & 127), r26, 0);
++                r26 = vsetq_lane_s32((int)((pcm.ram2[base + 1][6] >> 8) & 127), r26, 1);
++                r26 = vsetq_lane_s32((int)((pcm.ram2[base + 2][6] >> 8) & 127), r26, 2);
++                r26 = vsetq_lane_s32((int)((pcm.ram2[base + 3][6] >> 8) & 127), r26, 3);
++                oldn = vdupq_n_s32(0);
++                oldn = vsetq_lane_s32((int)((pcm.ram2[base + 0][7] >> 12) & 15), oldn, 0);
++                oldn = vsetq_lane_s32((int)((pcm.ram2[base + 1][7] >> 12) & 15), oldn, 1);
++                oldn = vsetq_lane_s32((int)((pcm.ram2[base + 2][7] >> 12) & 15), oldn, 2);
++                oldn = vsetq_lane_s32((int)((pcm.ram2[base + 3][7] >> 12) & 15), oldn, 3);
++            }
++            else
++            {
++                int sidx[4];
++                for (int i = 0; i < 4; i++) sidx[i] = (i < glanes) ? base + i : base;
++                s0 = vdupq_n_s32(0);
++                s1 = vdupq_n_s32(0);
++                s2 = vdupq_n_s32(0);
++                rat = vdupq_n_s32(0);
++                nbm = vdupq_n_s32(0);
++                newn = vdupq_n_s32(0);
++                tbase = vdupq_n_s32(0);
++                rg1 = vdupq_n_s32(0);
++                rg3 = vdupq_n_s32(0);
++                flt = vdupq_n_s32(0);
++                r26 = vdupq_n_s32(0);
++                oldn = vdupq_n_s32(0);
++                s0 = vsetq_lane_s32(tmp_samp0[sidx[0]], s0, 0);
++                s1 = vsetq_lane_s32(tmp_samp1[sidx[0]], s1, 0);
++                s2 = vsetq_lane_s32(tmp_samp2[sidx[0]], s2, 0);
++                rat = vsetq_lane_s32(tmp_ratio[sidx[0]], rat, 0);
++                nbm = vsetq_lane_s32(tmp_nibcmp[sidx[0]], nbm, 0);
++                newn = vsetq_lane_s32(tmp_newnibble[sidx[0]], newn, 0);
++                tbase = vsetq_lane_s32(tmp_testbase[sidx[0]], tbase, 0);
++                rg1 = vsetq_lane_s32((int)pcm.ram1[sidx[0]][1], rg1, 0);
++                rg3 = vsetq_lane_s32((int)pcm.ram1[sidx[0]][3], rg3, 0);
++                flt = vsetq_lane_s32((int)pcm.ram2[sidx[0]][11], flt, 0);
++                r26 = vsetq_lane_s32((int)((pcm.ram2[sidx[0]][6] >> 8) & 127), r26, 0);
++                oldn = vsetq_lane_s32((int)((pcm.ram2[sidx[0]][7] >> 12) & 15), oldn, 0);
++                s0 = vsetq_lane_s32(tmp_samp0[sidx[1]], s0, 1);
++                s1 = vsetq_lane_s32(tmp_samp1[sidx[1]], s1, 1);
++                s2 = vsetq_lane_s32(tmp_samp2[sidx[1]], s2, 1);
++                rat = vsetq_lane_s32(tmp_ratio[sidx[1]], rat, 1);
++                nbm = vsetq_lane_s32(tmp_nibcmp[sidx[1]], nbm, 1);
++                newn = vsetq_lane_s32(tmp_newnibble[sidx[1]], newn, 1);
++                tbase = vsetq_lane_s32(tmp_testbase[sidx[1]], tbase, 1);
++                rg1 = vsetq_lane_s32((int)pcm.ram1[sidx[1]][1], rg1, 1);
++                rg3 = vsetq_lane_s32((int)pcm.ram1[sidx[1]][3], rg3, 1);
++                flt = vsetq_lane_s32((int)pcm.ram2[sidx[1]][11], flt, 1);
++                r26 = vsetq_lane_s32((int)((pcm.ram2[sidx[1]][6] >> 8) & 127), r26, 1);
++                oldn = vsetq_lane_s32((int)((pcm.ram2[sidx[1]][7] >> 12) & 15), oldn, 1);
++                s0 = vsetq_lane_s32(tmp_samp0[sidx[2]], s0, 2);
++                s1 = vsetq_lane_s32(tmp_samp1[sidx[2]], s1, 2);
++                s2 = vsetq_lane_s32(tmp_samp2[sidx[2]], s2, 2);
++                rat = vsetq_lane_s32(tmp_ratio[sidx[2]], rat, 2);
++                nbm = vsetq_lane_s32(tmp_nibcmp[sidx[2]], nbm, 2);
++                newn = vsetq_lane_s32(tmp_newnibble[sidx[2]], newn, 2);
++                tbase = vsetq_lane_s32(tmp_testbase[sidx[2]], tbase, 2);
++                rg1 = vsetq_lane_s32((int)pcm.ram1[sidx[2]][1], rg1, 2);
++                rg3 = vsetq_lane_s32((int)pcm.ram1[sidx[2]][3], rg3, 2);
++                flt = vsetq_lane_s32((int)pcm.ram2[sidx[2]][11], flt, 2);
++                r26 = vsetq_lane_s32((int)((pcm.ram2[sidx[2]][6] >> 8) & 127), r26, 2);
++                oldn = vsetq_lane_s32((int)((pcm.ram2[sidx[2]][7] >> 12) & 15), oldn, 2);
++                s0 = vsetq_lane_s32(tmp_samp0[sidx[3]], s0, 3);
++                s1 = vsetq_lane_s32(tmp_samp1[sidx[3]], s1, 3);
++                s2 = vsetq_lane_s32(tmp_samp2[sidx[3]], s2, 3);
++                rat = vsetq_lane_s32(tmp_ratio[sidx[3]], rat, 3);
++                nbm = vsetq_lane_s32(tmp_nibcmp[sidx[3]], nbm, 3);
++                newn = vsetq_lane_s32(tmp_newnibble[sidx[3]], newn, 3);
++                tbase = vsetq_lane_s32(tmp_testbase[sidx[3]], tbase, 3);
++                rg1 = vsetq_lane_s32((int)pcm.ram1[sidx[3]][1], rg1, 3);
++                rg3 = vsetq_lane_s32((int)pcm.ram1[sidx[3]][3], rg3, 3);
++                flt = vsetq_lane_s32((int)pcm.ram2[sidx[3]][11], flt, 3);
++                r26 = vsetq_lane_s32((int)((pcm.ram2[sidx[3]][6] >> 8) & 127), r26, 3);
++                oldn = vsetq_lane_s32((int)((pcm.ram2[sidx[3]][7] >> 12) & 15), oldn, 3);
++            }
++            int32x4_t test = neon_interp_vec4(s0, s1, s2, rat, nbm, oldn, newn, tbase, interp_lut);
++            int32x4_t v1, v5, v3;
++            if (pcm.mcu->is_mk1)
++                neon_filter_mk1_vec4(test, rg1, rg3, flt, r26, &v1, &v5, &v3);
++            else
++                neon_filter_jv_vec4(test, rg1, rg3, flt, r26, &v1, &v5, &v3);
++            vst1q_s32(&tmp_v3[base], v3);
++            int32_t v1a[4], v5a[4];
++            vst1q_s32(v1a, v1);
++            vst1q_s32(v5a, v5);
++            for (int i = 0; i < glanes; i++)
++            {
++                pcm.ram1[base + i][3] = (uint32_t)v1a[i];
++                pcm.ram1[base + i][1] = (uint32_t)v5a[i];
++            }
++        }
++#else
++        // Scalar fallback: original interp/filter code, adapted to temps.
++        for (int slot = 0; slot < pcm.config.reg_slots; slot++)
++        {
++            uint32_t *ram1 = pcm.ram1[slot];
++            uint16_t *ram2 = pcm.ram2[slot];
+             // interpolation
+ 
+-            int test = (int)ram1[5];
++            int test = tmp_testbase[slot];
+ 
+-            int step0 = multi(interp_lut[0][interp_ratio] << 6, (int8_t)samp0) >> 8;
+-            select_nibble = nibble_cmp2 ? old_nibble : newnibble;
++            int step0 = multi(interp_lut[0][tmp_ratio[slot]] << 6, (int8_t)tmp_samp0[slot]) >> 8;
++            select_nibble = ((tmp_nibcmp[slot] & 1) != 0) ? ((ram2[7] >> 12) & 15) : tmp_newnibble[slot];
+             shift = (10 - select_nibble) & 15;
+             step0 =  (step0 << 1) >> shift;
+ 
+             test = addclip20(test, step0 >> 1, step0 & 1);
+ 
+ 
+-            int step1 = multi(interp_lut[1][interp_ratio] << 6, (int8_t)samp1) >> 8;
+-            select_nibble = nibble_cmp3 ? old_nibble : newnibble;
++            int step1 = multi(interp_lut[1][tmp_ratio[slot]] << 6, (int8_t)tmp_samp1[slot]) >> 8;
++            select_nibble = ((tmp_nibcmp[slot] & 2) != 0) ? ((ram2[7] >> 12) & 15) : tmp_newnibble[slot];
+             shift = (10 - select_nibble) & 15;
+             step1 = (step1 << 1) >> shift;
+ 
+             test = addclip20(test, step1 >> 1, step1 & 1);
+ 
+-            int step2 = multi(interp_lut[2][interp_ratio] << 6, (int8_t)samp2) >> 8;
+-            select_nibble = nibble_cmp4 ? old_nibble : newnibble;
++            int step2 = multi(interp_lut[2][tmp_ratio[slot]] << 6, (int8_t)tmp_samp2[slot]) >> 8;
++            select_nibble = ((tmp_nibcmp[slot] & 4) != 0) ? ((ram2[7] >> 12) & 15) : tmp_newnibble[slot];
+             shift = (10 - select_nibble) & 15;
+             step2 = (step2 << 1) >> shift;
+ 
+@@ -1362,7 +1759,6 @@ void PCM_Update(pcm_t& pcm, uint64_t cycles)
+             test = addclip20(test, step2 >> 1, step2 & 1);
+ 
+             int filter = ram2[11];
+-            int v3;
+ 
+             if (pcm.mcu->is_mk1)
+             {
+@@ -1376,10 +1772,10 @@ void PCM_Update(pcm_t& pcm, uint64_t cycles)
+ 
+                 ram1[3] = (uint32_t)v1;
+ 
+-                v3 = addclip20(test, subvar ^ 0xfffff, 1); // 12
++                tmp_v3[slot] = addclip20(test, subvar ^ 0xfffff, 1); // 12
+ 
+-                int mult4 = multi(v3, (int8_t)(filter >> 8));
+-                int mult5 = multi(v3, (int8_t)((filter >> 1) & 127));
++                int mult4 = multi(tmp_v3[slot], (int8_t)(filter >> 8));
++                int mult5 = multi(tmp_v3[slot], (int8_t)((filter >> 1) & 127));
+                 int v4 = addclip20(reg1, mult4 >> 6, (mult4 >> 5) & 1); // 14
+                 int v5 = addclip20(v4, mult5 >> 13, (mult5 >> 12) & 1); // 15
+ 
+@@ -1402,10 +1798,10 @@ void PCM_Update(pcm_t& pcm, uint64_t cycles)
+                 tests <<= 12;
+                 tests >>= 12;
+ 
+-                v3 = tests - subvar; // 12
++                tmp_v3[slot] = tests - subvar; // 12
+ 
+-                int mult4 = v3 * (int8_t)(filter >> 8);
+-                int mult5 = v3 * (int8_t)((filter >> 1) & 127);
++                int mult4 = tmp_v3[slot] * (int8_t)(filter >> 8);
++                int mult5 = tmp_v3[slot] * (int8_t)((filter >> 1) & 127);
+                 int v4 = reg1 + (mult4 >> 6) + ((mult4 >> 5) & 1); // 14
+                 int v5 = v4 + (mult5 >> 13) + ((mult5 >> 12) & 1); // 15
+ 
+@@ -1413,32 +1809,169 @@ void PCM_Update(pcm_t& pcm, uint64_t cycles)
+             }
+ 
+ 
+-            ram1[5] = (uint32_t)reference;
+ 
+-            if (active && (ram2[6] & 1) != 0 && (ram2[8] & 0x4000) == 0 && !pcm.irq_assert && irq_flag)
++        }
++#endif
++
++#if defined(__aarch64__)
++        // Stage 1: vector calc_tv across voices, groups of 4.
++        for (int base = 0; base + 4 <= pcm.config.reg_slots; base += 4)
++        {
++            for (int e = 0; e < 3; e++)
+             {
+-                //fprintf(stderr, "irq voice %i\n", slot);
+-                if (pcm.nfs)
+-                    ram2[8] |= 0x4000;
+-                pcm.irq_assert = true;
+-                pcm.irq_channel = (uint8_t)slot;
+-                if (pcm.mcu->is_jv880)
+-                    MCU_GA_SetGAInt(*pcm.mcu, 5, 1);
+-                else
+-                    MCU_Interrupt_SetRequest(*pcm.mcu, INTERRUPT_SOURCE_IRQ0, 1);
++                int32x4_t adjust = { (int)pcm.ram2[base + 0][3 + e], (int)pcm.ram2[base + 1][3 + e],
++                                     (int)pcm.ram2[base + 2][3 + e], (int)pcm.ram2[base + 3][3 + e] };
++                int32x4_t lc = { (int)pcm.ram2[base + 0][9 + e], (int)pcm.ram2[base + 1][9 + e],
++                                 (int)pcm.ram2[base + 2][9 + e], (int)pcm.ram2[base + 3][9 + e] };
++                uint32x4_t act = { tmp_active[base + 0] ? 0xFFFFFFFFu : 0u, tmp_active[base + 1] ? 0xFFFFFFFFu : 0u,
++                                   tmp_active[base + 2] ? 0xFFFFFFFFu : 0u, tmp_active[base + 3] ? 0xFFFFFFFFu : 0u };
++                int32x4_t lc_out, vol_out;
++                calc_tv_vec4(pcm, e, adjust, lc, act, &lc_out, &vol_out);
++                int32_t lc_arr[4], vol_arr[4];
++                vst1q_s32(lc_arr, lc_out);
++                vst1q_s32(vol_arr, vol_out);
++                for (int i = 0; i < 4; i++)
++                {
++                    pcm.ram2[base + i][9 + e] = (uint16_t)lc_arr[i];
++                    if (e == 0) tmp_volmul1[base + i] = vol_arr[i];
++                    if (e == 1) tmp_volmul2[base + i] = vol_arr[i];
++                }
+             }
+-
+-            int volmul1 = 0;
+-            int volmul2 = 0;
+-
+-            calc_tv(pcm, 0, ram2[3], &ram2[9], active, &volmul1);
+-            calc_tv(pcm, 1, ram2[4], &ram2[10], active, &volmul2);
+-            calc_tv(pcm, 2, ram2[5], &ram2[11], active, NULL);
+-
+-            // if (volmul1 && volmul2)
+-            //     volmul1 += 0;
+-
+-            int sample = (ram2[6] & 2) == 0 ? (int)ram1[3] : v3;
++        }
++        for (int slot = pcm.config.reg_slots & ~3; slot < pcm.config.reg_slots; slot++)
++        {
++            calc_tv(pcm, 0, pcm.ram2[slot][3], &pcm.ram2[slot][9], tmp_active[slot], &tmp_volmul1[slot]);
++            calc_tv(pcm, 1, pcm.ram2[slot][4], &pcm.ram2[slot][10], tmp_active[slot], &tmp_volmul2[slot]);
++            calc_tv(pcm, 2, pcm.ram2[slot][5], &pcm.ram2[slot][11], tmp_active[slot], NULL);
++        }
++#else
++        for (int slot = 0; slot < pcm.config.reg_slots; slot++)
++        {
++            calc_tv(pcm, 0, pcm.ram2[slot][3], &pcm.ram2[slot][9], tmp_active[slot], &tmp_volmul1[slot]);
++            calc_tv(pcm, 1, pcm.ram2[slot][4], &pcm.ram2[slot][10], tmp_active[slot], &tmp_volmul2[slot]);
++            calc_tv(pcm, 2, pcm.ram2[slot][5], &pcm.ram2[slot][11], tmp_active[slot], NULL);
++        }
++#endif
++#if defined(__aarch64__)
++        // Stage 2b: vector scaling, groups of 4.
++        for (int base = 0; base < pcm.config.reg_slots; base += 4)
++        {
++            int glanes = pcm.config.reg_slots - base;
++            if (glanes > 4) glanes = 4;
++            int32x4_t r6, rg3, v3v, vm1, vm2, act;
++            if (glanes == 4)
++            {
++                v3v = vld1q_s32(&tmp_v3[base]);
++                vm1 = vld1q_s32(&tmp_volmul1[base]);
++                vm2 = vld1q_s32(&tmp_volmul2[base]);
++                r6 = vdupq_n_s32(0);
++                r6 = vsetq_lane_s32((int)pcm.ram2[base + 0][6], r6, 0);
++                r6 = vsetq_lane_s32((int)pcm.ram2[base + 1][6], r6, 1);
++                r6 = vsetq_lane_s32((int)pcm.ram2[base + 2][6], r6, 2);
++                r6 = vsetq_lane_s32((int)pcm.ram2[base + 3][6], r6, 3);
++                rg3 = vdupq_n_s32(0);
++                rg3 = vsetq_lane_s32((int)pcm.ram1[base + 0][3], rg3, 0);
++                rg3 = vsetq_lane_s32((int)pcm.ram1[base + 1][3], rg3, 1);
++                rg3 = vsetq_lane_s32((int)pcm.ram1[base + 2][3], rg3, 2);
++                rg3 = vsetq_lane_s32((int)pcm.ram1[base + 3][3], rg3, 3);
++                act = vdupq_n_s32(0);
++                act = vsetq_lane_s32(tmp_active[base + 0] ? 1 : 0, act, 0);
++                act = vsetq_lane_s32(tmp_active[base + 1] ? 1 : 0, act, 1);
++                act = vsetq_lane_s32(tmp_active[base + 2] ? 1 : 0, act, 2);
++                act = vsetq_lane_s32(tmp_active[base + 3] ? 1 : 0, act, 3);
++            }
++            else
++            {
++                int sidx[4];
++                for (int i = 0; i < 4; i++) sidx[i] = (i < glanes) ? base + i : base;
++                v3v = vdupq_n_s32(0);
++                vm1 = vdupq_n_s32(0);
++                vm2 = vdupq_n_s32(0);
++                r6 = vdupq_n_s32(0);
++                rg3 = vdupq_n_s32(0);
++                act = vdupq_n_s32(0);
++                v3v = vsetq_lane_s32(tmp_v3[sidx[0]], v3v, 0);
++                vm1 = vsetq_lane_s32(tmp_volmul1[sidx[0]], vm1, 0);
++                vm2 = vsetq_lane_s32(tmp_volmul2[sidx[0]], vm2, 0);
++                r6 = vsetq_lane_s32((int)pcm.ram2[sidx[0]][6], r6, 0);
++                rg3 = vsetq_lane_s32((int)pcm.ram1[sidx[0]][3], rg3, 0);
++                act = vsetq_lane_s32(tmp_active[sidx[0]] ? 1 : 0, act, 0);
++                v3v = vsetq_lane_s32(tmp_v3[sidx[1]], v3v, 1);
++                vm1 = vsetq_lane_s32(tmp_volmul1[sidx[1]], vm1, 1);
++                vm2 = vsetq_lane_s32(tmp_volmul2[sidx[1]], vm2, 1);
++                r6 = vsetq_lane_s32((int)pcm.ram2[sidx[1]][6], r6, 1);
++                rg3 = vsetq_lane_s32((int)pcm.ram1[sidx[1]][3], rg3, 1);
++                act = vsetq_lane_s32(tmp_active[sidx[1]] ? 1 : 0, act, 1);
++                v3v = vsetq_lane_s32(tmp_v3[sidx[2]], v3v, 2);
++                vm1 = vsetq_lane_s32(tmp_volmul1[sidx[2]], vm1, 2);
++                vm2 = vsetq_lane_s32(tmp_volmul2[sidx[2]], vm2, 2);
++                r6 = vsetq_lane_s32((int)pcm.ram2[sidx[2]][6], r6, 2);
++                rg3 = vsetq_lane_s32((int)pcm.ram1[sidx[2]][3], rg3, 2);
++                act = vsetq_lane_s32(tmp_active[sidx[2]] ? 1 : 0, act, 2);
++                v3v = vsetq_lane_s32(tmp_v3[sidx[3]], v3v, 3);
++                vm1 = vsetq_lane_s32(tmp_volmul1[sidx[3]], vm1, 3);
++                vm2 = vsetq_lane_s32(tmp_volmul2[sidx[3]], vm2, 3);
++                r6 = vsetq_lane_s32((int)pcm.ram2[sidx[3]][6], r6, 3);
++                rg3 = vsetq_lane_s32((int)pcm.ram1[sidx[3]][3], rg3, 3);
++                act = vsetq_lane_s32(tmp_active[sidx[3]] ? 1 : 0, act, 3);
++            }
++            uint32x4_t usev3 = vtstq_u32(vreinterpretq_u32_s32(r6), vdupq_n_u32(2));
++            int32x4_t sample = vbslq_s32(usev3, v3v, rg3);
++            uint32x4_t amask = vceqq_s32(act, vdupq_n_s32(1));
++            int32x4_t pan = vdupq_n_s32(0);
++            int32x4_t rc = vdupq_n_s32(0);
++            if (glanes == 4)
++            {
++                pan = vsetq_lane_s32((int)pcm.ram2[base + 0][1], pan, 0);
++                pan = vsetq_lane_s32((int)pcm.ram2[base + 1][1], pan, 1);
++                pan = vsetq_lane_s32((int)pcm.ram2[base + 2][1], pan, 2);
++                pan = vsetq_lane_s32((int)pcm.ram2[base + 3][1], pan, 3);
++                rc = vsetq_lane_s32((int)pcm.ram2[base + 0][2], rc, 0);
++                rc = vsetq_lane_s32((int)pcm.ram2[base + 1][2], rc, 1);
++                rc = vsetq_lane_s32((int)pcm.ram2[base + 2][2], rc, 2);
++                rc = vsetq_lane_s32((int)pcm.ram2[base + 3][2], rc, 3);
++            }
++            else
++            {
++                int sidx[4];
++                for (int i = 0; i < 4; i++) sidx[i] = (i < glanes) ? base + i : base;
++                pan = vsetq_lane_s32((int)pcm.ram2[sidx[0]][1], pan, 0);
++                pan = vsetq_lane_s32((int)pcm.ram2[sidx[1]][1], pan, 1);
++                pan = vsetq_lane_s32((int)pcm.ram2[sidx[2]][1], pan, 2);
++                pan = vsetq_lane_s32((int)pcm.ram2[sidx[3]][1], pan, 3);
++                rc = vsetq_lane_s32((int)pcm.ram2[sidx[0]][2], rc, 0);
++                rc = vsetq_lane_s32((int)pcm.ram2[sidx[1]][2], rc, 1);
++                rc = vsetq_lane_s32((int)pcm.ram2[sidx[2]][2], rc, 2);
++                rc = vsetq_lane_s32((int)pcm.ram2[sidx[3]][2], rc, 3);
++            }
++            pan = vbslq_s32(amask, pan, vdupq_n_s32(0));
++            rc = vbslq_s32(amask, rc, vdupq_n_s32(0));
++            int32x4_t sampl, sampr, rc0, rc1;
++            neon_scaling_vec4(sample, vm1, vm2, pan, rc, &sampl, &sampr, &rc0, &rc1);
++            vst1q_s32(&tmp_sampl[base], sampl);
++            vst1q_s32(&tmp_sampr[base], sampr);
++            vst1q_s32(&tmp_rc0[base], rc0);
++            vst1q_s32(&tmp_rc1[base], rc1);
++        }
++#endif
++        for (int slot = 0; slot < pcm.config.reg_slots; slot++)
++        {
++            uint32_t *ram1 = pcm.ram1[slot];
++            uint16_t *ram2 = pcm.ram2[slot];
++            const bool okey = (ram2[7] & 0x20) != 0;
++            const bool key = (voice_active >> slot) & 1;
++            const bool kon = key && !okey;
++            int old_nibble = (ram2[7] >> 12) & 15;
++            int volmul1 = tmp_volmul1[slot];
++            int volmul2 = tmp_volmul2[slot];
++
++#if defined(__aarch64__)
++            int sampl = tmp_sampl[slot];
++            int sampr = tmp_sampr[slot];
++            int rc0 = tmp_rc0[slot];
++            int rc1 = tmp_rc1[slot];
++#else
++            int sample = (ram2[6] & 2) == 0 ? (int)ram1[3] : tmp_v3[slot];
+             //sample = test;
+ 
+             int multiv1 = multi(sample, (int8_t)(volmul1 >> 8));
+@@ -1451,14 +1984,15 @@ void PCM_Update(pcm_t& pcm, uint64_t cycles)
+ 
+             int sample3 = addclip20(multiv3 >> 6, multiv4 >> 13, ((multiv4 >> 12) | (multiv3 >> 5)) & 1);
+ 
+-            int pan = active ? ram2[1] : 0;
+-            int rc = active ? ram2[2] : 0;
++            int pan = tmp_active[slot] ? ram2[1] : 0;
++            int rc = tmp_active[slot] ? ram2[2] : 0;
+ 
+             int sampl = multi(sample3, (int8_t)((pan >> 8) & 255));
+             int sampr = multi(sample3, (int8_t)((pan >> 0) & 255));
+ 
+             int rc0 = multi(sample3, (int8_t)((rc >> 8) & 255)) >> 5; // reverb
+             int rc1 = multi(sample3, (int8_t)((rc >> 0) & 255)) >> 5; // chorus
++#endif
+             
+             // mix reverb/chorus?
+             int slot2 = (slot == pcm.config.reg_slots - 1) ? 31 : slot + 1;
+@@ -1528,13 +2062,13 @@ void PCM_Update(pcm_t& pcm, uint64_t cycles)
+             if (key && pcm.nfs)
+             {
+                 ram2[7] &= ~0xf020;
+-                ram2[7] |= (uint16_t)(((usenew || kon) ? newnibble : old_nibble) << 12);
++                ram2[7] |= (uint16_t)(((tmp_usenew[slot] || kon) ? tmp_newnibble[slot] : old_nibble) << 12);
+ 
+                 // update key
+                 ram2[7] |= (uint16_t)(key << 5);
+             }
+ 
+-            if (!active)
++            if (!tmp_active[slot])
+             {
+                 if (pcm.nfs)
+                 {
+@@ -1560,6 +2094,12 @@ void PCM_Update(pcm_t& pcm, uint64_t cycles)
  
          pcm.cycles += pcm.mcu->is_jv880 ? (new_cycles * 25) / 29 : new_cycles;
      }
