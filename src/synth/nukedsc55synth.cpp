@@ -247,7 +247,7 @@ const char* FriendlyModelName(Romset Romset)
 
 } // namespace
 
-CNukedSC55Synth::CNukedSC55Synth(unsigned nSampleRate, float nGain, bool bOversampling, TH8Engine H8Engine, bool bSplit)
+CNukedSC55Synth::CNukedSC55Synth(unsigned nSampleRate, float nGain, bool bOversampling, TH8Engine H8Engine)
 	: CSynthBase(nSampleRate),
 	  m_pSplitState(nullptr),
 	  m_bSplitActive(false),
@@ -259,7 +259,6 @@ CNukedSC55Synth::CNukedSC55Synth(unsigned nSampleRate, float nGain, bool bOversa
 	  m_nGain(nGain),
 	  m_bOversampling(bOversampling),
 	  m_H8Engine(H8Engine),
-	  m_bSplit(bSplit),
 	  m_nVolume(100),
 	  m_nNativeRate(0),
 	  m_dResampleRatio(1.0),
@@ -477,9 +476,8 @@ void CNukedSC55Synth::LogSplitState(const char* pTag)
 	const bool bIdle = m_bPCMIdle;
 	const bool bStateSet = m_pSplitState != nullptr;
 	const char* pGlobal = !bStateSet ? "n/a" : (g_splitT == m_pSplitState ? "match" : "mismatch");
-	CDiagLog::Get().LogLine("splitstate tag=%s cfg=%s active=%s wedged=%s state=%s gsplit=%s pcmidle=%s model=%s ring=%llu drops=%llu",
+	CDiagLog::Get().LogLine("splitstate tag=%s active=%s wedged=%s state=%s gsplit=%s pcmidle=%s model=%s ring=%llu drops=%llu",
 	                        pTag,
-	                        m_bSplit ? "on" : "off",
 	                        bActive ? "on" : "off",
 	                        m_bSplitWedged ? "yes" : "no",
 	                        bStateSet ? "set" : "null",
@@ -672,7 +670,7 @@ bool CNukedSC55Synth::Initialize()
 	// the priming frames stay queued for a continuous boot.
 	// PostSystemReset queued the GS reset bytes into the UART ring,
 	// which the MCU consumes in step order once split stepping starts.
-	m_bSplitEligible = m_bSplit && pDefinition->romset == Romset::MK1;
+	m_bSplitEligible = pDefinition->romset == Romset::MK1;
 	if (m_bSplitEligible)
 		InitSplitState(false);
 
@@ -683,9 +681,9 @@ bool CNukedSC55Synth::Initialize()
 	LOGNOTE("Nuked-SC55 initialized: romset %s (%s v%s), native rate %u Hz, oversampling %s",
 	        pDefinition->name, m_ModelName, m_ROMVersion, m_nNativeRate, m_bOversampling ? "on" : "off");
 
-	CDiagLog::Get().LogLine("init synth=nuked romset=%s rate=%u oversampling=%s h8_engine=%s split=%s heap_free_low_kb=%u prime_insn=%llu prime_emu_us=%llu prime_pcm_us=%llu",
+	CDiagLog::Get().LogLine("init synth=nuked romset=%s rate=%u oversampling=%s h8_engine=%s sync=%s heap_free_low_kb=%u prime_insn=%llu prime_emu_us=%llu prime_pcm_us=%llu",
 	                        pDefinition->name, m_nNativeRate, m_bOversampling ? "on" : "off", H8EngineName(m_H8Engine),
-	                        m_bSplitActive ? "on" : "off",
+	                        m_bSplitActive ? "trim" : "single",
 	                        static_cast<unsigned>(CMemorySystem::Get()->GetHeapFreeSpace(HEAP_LOW) / 1024),
 	                        static_cast<unsigned long long>(NukedProfile().nInstructions),
 	                        static_cast<unsigned long long>(NukedProfile().nTotalUs),
