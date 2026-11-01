@@ -20,6 +20,8 @@
 // mt32-pi. If not, see <http://www.gnu.org/licenses/>.
 //
 
+#include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <span>
 #include <string>
@@ -29,6 +31,8 @@
 #include <circle/cputhrottle.h>
 #include <circle/logger.h>
 #include <circle/memory.h>
+#include <circle/sched/scheduler.h>
+#include <circle/synchronize.h>
 #include <circle/timer.h>
 #include <fatfs/ff.h>
 
@@ -48,11 +52,20 @@
 #include "nuked_profile.h"
 #include "pcm.h"
 #include "rom.h"
+#include "split_thread_circle.h"
 #include "rom_io.h"
 #include "sha256.h"
 #include "standard_romsets.h"
 
 LOGMODULE("nukedsc55");
+
+// Dual-core split state (see split_thread_circle.h): owned by the
+// synth instance (m_pSplitState), published here while the split is
+// active so the backend's dispatch and hooks can reach it. Null
+// whenever the split is inactive (single-threaded path, or before
+// activation / after teardown) -- the backend then calls PCM_Read /
+// PCM_Write directly.
+ThreadSplitStateCircle* g_splitT = nullptr;
 
 // Sound Canvas ROM sets live in their own directory alongside the MT-32
 // "roms" and "soundfonts" directories (shared with the EmuSC engine; the
@@ -234,22 +247,36 @@ const char* FriendlyModelName(Romset Romset)
 
 } // namespace
 
-CNukedSC55Synth::CNukedSC55Synth(unsigned nSampleRate, float nGain, bool bOversampling, TH8Engine H8Engine)
+CNukedSC55Synth::CNukedSC55Synth(unsigned nSampleRate, float nGain, bool bOversampling, TH8Engine H8Engine, bool bSplit)
 	: CSynthBase(nSampleRate),
+	  m_pSplitState(nullptr),
+	  m_bSplitActive(false),
+	  m_bPCMIdle(true),
+	  m_bSplitWedged(false),
+	  m_bSplitEligible(false),
 	  m_pEmulator(nullptr),
 	  m_pRomsetInfo(nullptr),
 	  m_nGain(nGain),
 	  m_bOversampling(bOversampling),
 	  m_H8Engine(H8Engine),
+	  m_bSplit(bSplit),
 	  m_nVolume(100),
 	  m_nNativeRate(0),
 	  m_dResampleRatio(1.0),
-	  m_dReadPosition(0.0),
+	  m_dReadFrac(0.0),
 	  m_nWrittenFrames(0),
 	  m_nLastActiveFrame(0),
+	  m_SampleA{},
+	  m_SampleB{},
+	  m_bWindowValid(false),
+	  m_SampleRing{},
+	  m_nSampleRingFill(0),
+	  m_nSampleRingDrops(0),
 	  m_Stats{},
 	  m_StatsLock(TASK_LEVEL),
-	  m_RingBuffer{},
+	  m_nHeldNotes(0),
+	  m_bSustain(false),
+	  m_bSustainedNotes(false),
 	  m_ModelName{},
 	  m_ROMVersion{}
 {
@@ -302,6 +329,15 @@ const char* CNukedSC55Synth::CycleH8Engine()
 
 CNukedSC55Synth::~CNukedSC55Synth()
 {
+	// Park the PCM task before destroying anything it touches. (In
+	// practice synths are never deleted mid-session; this covers the
+	// init-failure path, where the split is not active yet and this
+	// is a no-op.)
+	StopSplitPCM();
+
+	if (m_pSplitState)
+		delete m_pSplitState;
+
 	if (m_pEmulator)
 		delete m_pEmulator;
 
@@ -322,11 +358,214 @@ void CNukedSC55Synth::OnSample(s32 nLeft, s32 nRight)
 	// into an audible idle tone, so center the ring at zero. This matches
 	// a real SC-55, whose analog output is AC-coupled, and is sonically
 	// neutral for music (verified on hardware: the idle hum is gone).
+	// Normalization happens here (at production time), exactly as
+	// before, so the resampler in RenderFrames() sees the same float
+	// values it always did; only the ring changed (CRingBuffer
+	// instead of the masked array, so the callback is safe from any
+	// core, with or without m_Lock).
 	constexpr float Scale = 1.0f / 536870912.0f;
 	constexpr float DCBias = 16777216.0f / 536870912.0f;
-	m_RingBuffer[m_nWrittenFrames & (RingBufferFrames - 1)][0] = nLeft * Scale - DCBias;
-	m_RingBuffer[m_nWrittenFrames & (RingBufferFrames - 1)][1] = nRight * Scale - DCBias;
-	++m_nWrittenFrames;
+	const TSplitSample Frame{ nLeft * Scale - DCBias, nRight * Scale - DCBias };
+	// Fill and drop counters are maintained with atomic add/sub:
+	// core 3 enqueues here while core 2 dequeues in RenderFrames,
+	// and a plain volatile read-modify-write on either side could
+	// lose an update (harmless for the loop bound -- see the header
+	// -- but needless noise in the diag). The ring itself provides
+	// the data ordering; these counters are only a loop bound.
+	if (m_SampleRing.Enqueue(Frame))
+		__atomic_add_fetch(&m_nSampleRingFill, static_cast<size_t>(1), __ATOMIC_RELAXED);
+	else
+		m_nSampleRingDrops = m_nSampleRingDrops + 1;
+	m_nWrittenFrames = m_nWrittenFrames + 1;
+}
+
+bool CNukedSC55Synth::StopSplitPCM()
+{
+	if (!m_bSplitActive)
+		return true;
+
+	// Park the PCM task: it finishes its current batch (bounded:
+	// at most 128 ticks, a few ms), then sees the flag, acks idle,
+	// and yields until reactivated. The MCU thread is not stepping
+	// here (the caller holds m_Lock, as RenderFrames does), so once
+	// the PCM task has parked, nothing touches the backend anymore.
+	m_bSplitActive = false;
+	SplitDMB();
+	// Bounded wait (5 s of wall clock): a parked task acks within
+	// milliseconds, so a timeout means core 3 is wedged inside a
+	// batch. On timeout the split is marked wedged and g_splitT is
+	// deliberately NOT cleared: resetting or reactivating under a
+	// possibly-live core 3 would corrupt the backend under it (the
+	// standalone test kernel showed exactly this failure mode).
+	// The only recovery from a wedge is a reboot.
+	const u64 nDeadlineUs = CTimer::Get()->GetClockTicks() + 5000000ULL;
+	while (!m_bPCMIdle)
+	{
+		SplitDMB();
+		if (CTimer::Get()->GetClockTicks() >= nDeadlineUs)
+		{
+			m_bSplitWedged = true;
+			CDiagLog::Get().LogLine("splitpark_timeout ticks=%llu pcmidle=no raw_lock=%u",
+			                        static_cast<unsigned long long>(m_pSplitState ? m_pSplitState->ticks : 0),
+			                        m_pSplitState ? m_pSplitState->raw_lock : 0);
+			return false;
+		}
+		CScheduler::Get()->Yield();
+	}
+	SplitDMB();
+	g_splitT = nullptr;
+	SplitDMB();
+	return true;
+}
+
+void CNukedSC55Synth::InitSplitState(bool bClearRing)
+{
+	// Caller guarantees: PCM task parked (or never started) and the
+	// MCU thread not stepping (m_Lock held, or pre-activation).
+	// Refuse after a park-timeout wedge: the old core-3 batch may
+	// still be live, and publishing fresh state under it would
+	// corrupt the backend.
+	if (m_bSplitWedged)
+	{
+		CDiagLog::Get().LogLine("splitstate refuse wedged");
+		return;
+	}
+	if (!m_pSplitState)
+		m_pSplitState = new ThreadSplitStateCircle;
+
+	m_pSplitState->InitFromPCM(m_pEmulator->GetPCM(), m_pEmulator->GetMCU());
+
+	if (bClearRing)
+	{
+		// Fresh audio after a reset: the queued frames belong to the
+		// pre-reset boot and must not play after the reboot.
+		TSplitSample Dummy;
+		while (m_SampleRing.Dequeue(Dummy))
+		{
+		}
+		m_nSampleRingFill = 0;
+		m_bWindowValid = false;
+		m_dReadFrac = 0.0;
+	}
+	// Activation (bClearRing false) keeps the priming frames: the
+	// first RenderFrames() drains the boot silence continuously.
+
+	// Publish order: initialized state, then g_splitT, then the
+	// active flag, each separated by a barrier, so the PCM task can
+	// never observe the flag before the state it gates on.
+	SplitDMB();
+	g_splitT = m_pSplitState;
+	SplitDMB();
+	m_bSplitActive = true;
+	SplitDMB();
+}
+
+void CNukedSC55Synth::SplitActivate()
+{
+	// Called on switch-to-Nuked, under m_Lock (see SwitchSynth):
+	// no RenderFrames call can be in flight across the transition.
+	m_Lock.Acquire();
+	if (m_bSplitEligible && !m_bSplitActive && !m_bSplitWedged && m_pEmulator)
+		InitSplitState(true);
+	m_Lock.Release();
+}
+
+void CNukedSC55Synth::SplitDeactivate()
+{
+	// Called on switch-from-Nuked, under m_Lock: park core 3 so it
+	// stops consuming cycles and filling the ring while another
+	// synth plays. A timeout leaves the split wedged (and live);
+	// nothing further is done with it.
+	m_Lock.Acquire();
+	if (m_bSplitActive)
+		StopSplitPCM();
+	m_Lock.Release();
+}
+
+void CNukedSC55Synth::LogSplitState(const char* pTag)
+{
+	if (!CDiagLog::Get().IsEnabled())
+		return;
+	SplitDMB();
+	const bool bActive = m_bSplitActive;
+	const bool bIdle = m_bPCMIdle;
+	const bool bStateSet = m_pSplitState != nullptr;
+	const char* pGlobal = !bStateSet ? "n/a" : (g_splitT == m_pSplitState ? "match" : "mismatch");
+	CDiagLog::Get().LogLine("splitstate tag=%s cfg=%s active=%s wedged=%s state=%s gsplit=%s pcmidle=%s model=%s ring=%llu drops=%llu",
+	                        pTag,
+	                        m_bSplit ? "on" : "off",
+	                        bActive ? "on" : "off",
+	                        m_bSplitWedged ? "yes" : "no",
+	                        bStateSet ? "set" : "null",
+	                        pGlobal,
+	                        bIdle ? "yes" : "no",
+	                        m_ModelName,
+	                        static_cast<unsigned long long>(m_nSampleRingFill),
+	                        static_cast<unsigned long long>(m_nSampleRingDrops));
+}
+
+
+void CNukedSC55Synth::PCMTaskIteration()
+{
+	if (!m_bSplitActive || !m_pEmulator || !m_pSplitState)
+	{
+		// Parked: ack the stop handshake (if one is waiting) and idle.
+		// This branch always returns, so a stale idle ack (written
+		// just before a reactivation) can never be followed by work
+		// without a fresh gate read first: the next call re-checks
+		// m_bSplitActive, and a stop that already set it false parks
+		// the task again instead of letting it render. Conversely,
+		// m_bPCMIdle is false throughout any work batch (set below),
+		// so a stop waiter can never observe true mid-batch.
+		m_bPCMIdle = true;
+		SplitDMB();
+		CScheduler::Get()->Yield();
+		return;
+	}
+
+	ThreadSplitStateCircle& S = *m_pSplitState;
+	pcm_t& PCM = m_pEmulator->GetPCM();
+
+	// Trim batch chase: core 2 RELEASE-publishes cycles_pub every
+	// 8 steps; core 3 renders at most 128 ticks, capped at
+	// published-800 (a tick is at most 800 cycles, so no tick ever
+	// ends past published -- every register write the tick reads
+	// was already published). pcm.cycles is core-3-owned (only
+	// PCM_Update advances it), so reading it unlocked is safe.
+	const uint64_t nPublished = __atomic_load_n(&S.cycles_pub, __ATOMIC_ACQUIRE);
+	const uint64_t nTick = static_cast<uint64_t>(PCM.config.reg_slots + 1) * 25ULL;
+	if (nPublished <= PCM.cycles + ThreadSplitStateCircle::MaxTickCycles)
+	{
+		// Idle: back off 64 yield hints, then yield to the scheduler
+		// (the fork has tasks; the minimal kernel spun here).
+		S.core3_phase = 1;
+		for (unsigned i = 0; i < 64; ++i)
+			SplitPause();
+		CScheduler::Get()->Yield();
+		return;
+	}
+
+	m_bPCMIdle = false;
+	S.core3_phase = 2;
+	const u64 nWorkStartUs = CTimer::Get()->GetClockTicks();
+
+	const uint64_t nBatchEnd = std::min(PCM.cycles + ThreadSplitStateCircle::MaxBatchTicks * nTick,
+	                                    nPublished - ThreadSplitStateCircle::MaxTickCycles);
+	S.core3_phase = 3;
+	S.RawAcquire();
+	PCM_Update(PCM, nBatchEnd);
+	S.core3_phase = 4;
+	S.RawRelease();
+
+	// Publish the render position (the diag line reads this) and
+	// the peak lag for the diag line.
+	SplitDMB();
+	S.pcm_rendered = PCM.cycles;
+	const uint64_t nFreshPublished = __atomic_load_n(&S.cycles_pub, __ATOMIC_ACQUIRE);
+	const int64_t nLag = static_cast<int64_t>(nFreshPublished - PCM.cycles);
+	if (nLag > static_cast<int64_t>(S.max_pcm_lag))
+		S.max_pcm_lag = static_cast<uint64_t>(nLag);
+	S.pcm_task_us = S.pcm_task_us + CTimer::Get()->GetClockTicks() - nWorkStartUs;
 }
 
 bool CNukedSC55Synth::Initialize()
@@ -440,6 +679,17 @@ bool CNukedSC55Synth::Initialize()
 
 	m_pEmulator->PostSystemReset(EMU_SystemReset::GS_RESET);
 
+	// Dual-core split activation (MK1 romsets only -- JV880/MK2 keep
+	// the single-threaded path regardless of the config flag, and the
+	// backend dispatch bypasses them too). Priming above ran
+	// single-threaded, so the split state starts from the live pcm_t;
+	// the priming frames stay queued for a continuous boot.
+	// PostSystemReset queued the GS reset bytes into the UART ring,
+	// which the MCU consumes in step order once split stepping starts.
+	m_bSplitEligible = m_bSplit && pDefinition->romset == Romset::MK1;
+	if (m_bSplitEligible)
+		InitSplitState(false);
+
 	strncpy(m_ModelName, FriendlyModelName(pDefinition->romset), sizeof(m_ModelName) - 1);
 	const char* pVersion = strstr(pDefinition->name, "-v");
 	strncpy(m_ROMVersion, pVersion ? pVersion + 2 : pDefinition->name, sizeof(m_ROMVersion) - 1);
@@ -447,12 +697,15 @@ bool CNukedSC55Synth::Initialize()
 	LOGNOTE("Nuked-SC55 initialized: romset %s (%s v%s), native rate %u Hz, oversampling %s",
 	        pDefinition->name, m_ModelName, m_ROMVersion, m_nNativeRate, m_bOversampling ? "on" : "off");
 
-	CDiagLog::Get().LogLine("init synth=nuked romset=%s rate=%u oversampling=%s h8_engine=%s heap_free_low_kb=%u prime_insn=%llu prime_emu_us=%llu prime_pcm_us=%llu",
+	CDiagLog::Get().LogLine("init synth=nuked romset=%s rate=%u oversampling=%s h8_engine=%s split=%s heap_free_low_kb=%u prime_insn=%llu prime_emu_us=%llu prime_pcm_us=%llu",
 	                        pDefinition->name, m_nNativeRate, m_bOversampling ? "on" : "off", H8EngineName(m_H8Engine),
+	                        m_bSplitActive ? "on" : "off",
 	                        static_cast<unsigned>(CMemorySystem::Get()->GetHeapFreeSpace(HEAP_LOW) / 1024),
 	                        static_cast<unsigned long long>(NukedProfile().nInstructions),
 	                        static_cast<unsigned long long>(NukedProfile().nTotalUs),
 	                        static_cast<unsigned long long>(NukedProfile().nPCMUs));
+
+	LogSplitState("init");
 
 	// Baseline for the periodic flush: don't charge priming to the
 	// first render interval.
@@ -477,10 +730,66 @@ void CNukedSC55Synth::HandleMIDIShortMessage(u32 nMessage)
 	if (nStatus == 0xFF)
 	{
 		m_Lock.Acquire();
-		m_pEmulator->Reset();
-		m_pEmulator->PostSystemReset(EMU_SystemReset::GS_RESET);
+		// Split path: park the PCM task first (it may be mid-render
+		// on core 3, outside m_Lock), then reset, then reactivate
+		// from the fresh pcm_t with a cleared sample ring. The MCU
+		// thread cannot be stepping here: RenderFrames needs the
+		// same m_Lock this handler holds. A park timeout leaves the
+		// split wedged: the reset is skipped entirely (resetting
+		// under a possibly-live core 3 would corrupt the backend)
+		// and the synth keeps running on its old state.
+		const bool bWasSplit = m_bSplitActive;
+		bool bParked = true;
+		if (bWasSplit)
+			bParked = StopSplitPCM();
+		if (bParked)
+		{
+			if (bWasSplit)
+				m_pEmulator->ResetForRestart();
+			else
+				m_pEmulator->Reset();
+			m_pEmulator->PostSystemReset(EMU_SystemReset::GS_RESET);
+			if (bWasSplit)
+				InitSplitState(true);
+		}
+		m_nHeldNotes = 0;
+		m_bSustain = false;
+		m_bSustainedNotes = false;
 		m_Lock.Release();
+		// Split-state reset log: after the lock
+		// is released, so the diag write never nests under
+		// m_Lock.
+		LogSplitState("reset");
 		return;
+	}
+
+	// Sounding-note tracking for power management (core 0 only):
+	// a note held, or held by the sustain pedal, keeps IsActive()
+	// true through quiet passages, so the clock cannot drop to
+	// power-save mid-performance. Note-off for a note that was
+	// sustained releases the sustain hold only when the pedal is
+	// already up; pedal-up releases all sustained notes at once.
+	if (nStatus < 0xF0)
+	{
+		const u8 nType = nStatus & 0xF0;
+		if (nType == 0x90 && nData2 > 0)
+			++m_nHeldNotes;
+		else if (nType == 0x80 || (nType == 0x90 && nData2 == 0))
+		{
+			if (m_bSustain && m_nHeldNotes > 0)
+			{
+				--m_nHeldNotes;
+				m_bSustainedNotes = true;
+			}
+			else if (m_nHeldNotes > 0)
+				--m_nHeldNotes;
+		}
+		else if (nType == 0xB0 && nData1 == 64)
+		{
+			m_bSustain = nData2 >= 64;
+			if (!m_bSustain)
+				m_bSustainedNotes = false;
+		}
 	}
 
 	// Post exactly the bytes the message carries; the emulated UART
@@ -522,7 +831,12 @@ bool CNukedSC55Synth::IsActive()
 	if (!m_pEmulator || m_nNativeRate == 0)
 		return false;
 
-	return (m_nWrittenFrames - m_nLastActiveFrame) < (m_nNativeRate / 2);
+	// Audible output within the last 0.5 s, or a note held / held
+	// by the sustain pedal (a quiet passage or a held note must not
+	// let the clock drop to power-save mid-performance; see the
+	// tracking in HandleMIDIShortMessage).
+	return (m_nWrittenFrames - m_nLastActiveFrame) < (m_nNativeRate / 2)
+	    || m_nHeldNotes > 0 || m_bSustainedNotes;
 }
 
 void CNukedSC55Synth::AllSoundOff()
@@ -541,6 +855,12 @@ void CNukedSC55Synth::AllSoundOff()
 		}
 		m_Lock.Release();
 	}
+
+	// Sounding-note tracking (see IsActive): an All Sound Off
+	// clears every held/sustained note.
+	m_nHeldNotes = 0;
+	m_bSustain = false;
+	m_bSustainedNotes = false;
 
 	// Reset MIDI monitor
 	CSynthBase::AllSoundOff();
@@ -570,39 +890,150 @@ size_t CNukedSC55Synth::RenderFrames(float* pOutBuffer, size_t nFrames)
 
 	m_Lock.Acquire();
 
-	// Step the emulator until enough native-rate frames are available
-	const double dNeeded = static_cast<double>(static_cast<u64>(m_dReadPosition)) + nFrames * m_dResampleRatio + 2.0;
+	// Frames the streaming resampler below will need for this call:
+	// the position advance, plus the interpolation endpoint, the
+	// entry slide, and rounding. A couple of spare frames just stay
+	// queued for the next call.
+	const size_t nNeed = static_cast<size_t>(m_dReadFrac + static_cast<double>(nFrames) * m_dResampleRatio) + 3;
 	u64 nSteps           = 0;
 	const u64 nStepBudget = static_cast<u64>(nFrames * m_dResampleRatio + 2.0) * StepsPerFrameBudget;
-	while (static_cast<double>(m_nWrittenFrames) < dNeeded && nSteps < nStepBudget)
+
+	if (m_bSplitActive && m_pSplitState)
 	{
-		m_pEmulator->Step();
-		++nSteps;
+		// Split path (core 2, trim): step only the MCU + peripherals;
+		// the PCM ticks run on core 3 and produce frames into the
+		// ring. Core 2 NEVER waits on core 3 -- no tick rule, no
+		// lookahead bound (those were the old RPC design's
+		// back-pressure, and the standalone proof showed they are
+		// not needed: the ring fill and the step budget bound the
+		// loop, and budget exhaustion with a short ring IS the
+		// starvation the diag measures). The exactness trade-off
+		// is stated plainly: IRQ timing becomes approximate,
+		// bounded by core-3 lag (typically tiny at 1 GHz), and
+		// sub-millisecond IRQ jitter is inaudible; the standalone
+		// hardware runs sound correct on this loop.
+		mcu_t& MCU = m_pEmulator->GetMCU();
+		ThreadSplitStateCircle& S = *m_pSplitState;
+		const u64 nMCUStartUs = bDiag ? CTimer::Get()->GetClockTicks() : 0;
+		unsigned nRingCheckdown = 1;	// first check immediate
+		unsigned nPublishCountdown = 0;	// publish every 8 steps
+		while (m_nSampleRingFill < nNeed && nSteps < nStepBudget)
+		{
+			// Ring check every 16 steps (countdown 1 = immediate
+			// first check): break once the ring holds enough
+			// frames for this call. Overstepping by at most 16
+			// steps (~1 frame at ~62.5 steps/frame) is negligible
+			// against the 16384-frame ring.
+			if (--nRingCheckdown == 0)
+			{
+				nRingCheckdown = 16;
+				if (m_nSampleRingFill >= nNeed)
+					break;
+			}
+			// Fold a pending voice-end IRQ0 request into
+			// interrupt_pending (core 3 sets the flag; this is
+			// one ACQUIRE byte load when no IRQ is pending).
+			SplitFoldIrq0(S, MCU);
+			m_pEmulator->StepMCU();
+			m_pEmulator->StepPeripherals();
+			++nSteps;
+			// Publish every 8 steps (RELEASE store): core 3 only
+			// renders ticks ending at most published-800, and a
+			// tick is at most 800 cycles, so every register write
+			// the tick reads was already published (see the
+			// header's safety proof). A final flush at loop exit
+			// covers a mid-interval break.
+			if (++nPublishCountdown >= 8)
+			{
+				nPublishCountdown = 0;
+				__atomic_store_n(&S.cycles_pub, MCU.cycles, __ATOMIC_RELEASE);
+				S.publishes = S.publishes + 1;
+			}
+		}
+		if (nPublishCountdown != 0)
+		{
+			__atomic_store_n(&S.cycles_pub, MCU.cycles, __ATOMIC_RELEASE);
+			S.publishes = S.publishes + 1;
+		}
+		if (bDiag)
+			m_nMCUUs += CTimer::Get()->GetClockTicks() - nMCUStartUs;
+	}
+	else
+	{
+		// Single-threaded path (split off, or a non-MK1 romset):
+		// exactly the old stepping, now feeding the same ring and
+		// streaming resampler as the split path.
+		while (m_nSampleRingFill < nNeed && nSteps < nStepBudget)
+		{
+			m_pEmulator->Step();
+			++nSteps;
+		}
 	}
 
-	for (size_t i = 0; i < nFrames; ++i)
+	// Streaming resampler: the window (m_SampleA, m_SampleB) brackets
+	// the next output position (m_dReadFrac relative to A). The lerp
+	// and the scale are the old resampler's, on the same normalized
+	// float values, so a full ring produces identical output. The
+	// only behavioral difference is the underrun path: instead of
+	// resyncing to the newest frame (skipping stale ring contents),
+	// the drain model plays the queued frames in order and emits
+	// silence once the ring empties -- it cannot fall behind, so
+	// there is nothing stale to skip.
+	auto DequeueOne = [&](TSplitSample& Out) -> bool
 	{
-		const u64 nIndex = static_cast<u64>(m_dReadPosition);
-		if (nIndex + 1 >= m_nWrittenFrames)
+		if (m_SampleRing.Dequeue(Out))
 		{
-			// Underrun (emulator too slow, or still booting): emit
-			// silence and resync to the newest frame rather than
-			// replaying stale ring contents.
-			pOutBuffer[i * 2]     = 0.0f;
-			pOutBuffer[i * 2 + 1] = 0.0f;
-			m_dReadPosition       = static_cast<double>(m_nWrittenFrames);
-			++nUnderrunFrames;
-			continue;
+			__atomic_sub_fetch(&m_nSampleRingFill, static_cast<size_t>(1), __ATOMIC_RELAXED);
+			return true;
 		}
+		return false;
+	};
 
-		const float nFrac = static_cast<float>(m_dReadPosition - static_cast<double>(nIndex));
-		const float* pA   = m_RingBuffer[nIndex & (RingBufferFrames - 1)];
-		const float* pB   = m_RingBuffer[(nIndex + 1) & (RingBufferFrames - 1)];
+	size_t nDone = 0;
+	for (; nDone < nFrames; ++nDone)
+	{
+		if (!m_bWindowValid)
+		{
+			TSplitSample A, B;
+			if (!DequeueOne(A) || !DequeueOne(B))
+				break;
+			m_SampleA = A;
+			m_SampleB = B;
+			m_bWindowValid = true;
+		}
+		bool bStarved = false;
+		while (m_dReadFrac >= 1.0)
+		{
+			m_SampleA = m_SampleB;
+			if (!DequeueOne(m_SampleB))
+			{
+				bStarved = true;
+				break;
+			}
+			m_dReadFrac -= 1.0;
+		}
+		if (bStarved)
+			break;
 
-		pOutBuffer[i * 2]     = (pA[0] + (pB[0] - pA[0]) * nFrac) * nScale;
-		pOutBuffer[i * 2 + 1] = (pA[1] + (pB[1] - pA[1]) * nFrac) * nScale;
+		const float nFrac = static_cast<float>(m_dReadFrac);
+		pOutBuffer[nDone * 2]     = (m_SampleA.nLeft + (m_SampleB.nLeft - m_SampleA.nLeft) * nFrac) * nScale;
+		pOutBuffer[nDone * 2 + 1] = (m_SampleA.nRight + (m_SampleB.nRight - m_SampleA.nRight) * nFrac) * nScale;
 
-		m_dReadPosition += m_dResampleRatio;
+		m_dReadFrac += m_dResampleRatio;
+	}
+	if (nDone < nFrames)
+	{
+		// Underrun (emulator too slow, or still booting): silence for
+		// the rest of the call; the next call re-primes from whatever
+		// the ring holds then.
+		for (size_t j = nDone; j < nFrames; ++j)
+		{
+			pOutBuffer[j * 2]     = 0.0f;
+			pOutBuffer[j * 2 + 1] = 0.0f;
+		}
+		nUnderrunFrames += nFrames - nDone;
+		m_dReadFrac = 0.0;
+		m_bWindowValid = false;
 	}
 
 	if (bDiag)
@@ -663,10 +1094,49 @@ void CNukedSC55Synth::ReportStatus() const
 
 void CNukedSC55Synth::UpdateLCD(CLCD& LCD, unsigned int nTicks)
 {
-	const u8 nBarHeight = LCD.Height();
+	// Debug-kernel heartbeat row: reserve the bottom text row for
+	// a liveness line (bars shrink by one row), mirroring the MT32
+	// synth's bars-plus-status layout. Graphical: rows are 8px, so
+	// the bottom row is Height()/8 - 1 and bars lose 8px;
+	// character: rows are cells, so the bottom row is Height() - 1
+	// and bars lose one row.
+	u8 nStatusRow, nBarHeight;
+	if (LCD.GetType() == CLCD::TType::Character)
+	{
+		nStatusRow = LCD.Height() - 1;
+		nBarHeight = LCD.Height() - 1;
+	}
+	else
+	{
+		nStatusRow = LCD.Height() / 8 - 1;
+		nBarHeight = LCD.Height() - 8;
+	}
 	float ChannelLevels[16], PeakLevels[16];
 	m_MIDIMonitor.GetChannelLevels(nTicks, ChannelLevels, PeakLevels, 1 << 9);
 	CUserInterface::DrawChannelLevels(LCD, nBarHeight, ChannelLevels, PeakLevels, 16, true);
+
+	// Core-2/core-3 aliveness (debug kernel): lock-free,
+	// SD-free counters -- core-3 native frames written
+	// (m_nWrittenFrames, volatile, updated by OnSample)
+	// and core-2 RenderFrames calls (m_Stats.nCalls, read
+	// under the brief stats lock). No diag lock is taken
+	// here, so this line keeps ticking even if the diag
+	// flush wedges in f_sync. The toggling char (2 Hz,
+	// from the µs tick clock) proves UITask itself runs:
+	// a ticking char with frozen W/R means UITask is alive
+	// and the render path is stuck, while a frozen char
+	// means UITask itself is stuck. Drawn and pushed
+	// BEFORE the diag flush below.
+	m_StatsLock.Acquire();
+	const u64 nRenderCalls = m_Stats.nCalls;
+	m_StatsLock.Release();
+	char HeartbeatBuffer[32];
+	snprintf(HeartbeatBuffer, sizeof(HeartbeatBuffer), "%c W%llu R%llu",
+	         ((nTicks / 500000) & 1) ? '*' : '-',
+	         static_cast<unsigned long long>(m_nWrittenFrames),
+	         static_cast<unsigned long long>(nRenderCalls));
+	LCD.Print(HeartbeatBuffer, 0, nStatusRow, true, false);
+	LCD.Flip();
 
 	// Flush accumulated render timing statistics to the diagnostic log
 	CDiagLog& DiagLog = CDiagLog::Get();
@@ -694,26 +1164,72 @@ void CNukedSC55Synth::UpdateLCD(CLCD& LCD, unsigned int nTicks)
 			                static_cast<unsigned long long>(Stats.nUnderrunFrames),
 			                pThrottle ? pThrottle->GetTemperature() : 0);
 
-			// Backend phase split for the same window: emulator wall
-			// share of one core, MCU+peripherals vs PCM share of the
-			// emulator's time, and the H8 instruction rate.
-			const NukedProfileData& Profile = NukedProfile();
-			const u64 nTotalDelta          = Profile.nTotalUs - m_nLastProfileTotalUs;
-			const u64 nPCMDelta            = Profile.nPCMUs - m_nLastProfilePCMUs;
-			const u64 nInsnDelta           = Profile.nInstructions - m_nLastProfileInsn;
-			m_nLastProfileTotalUs          = Profile.nTotalUs;
-			m_nLastProfilePCMUs            = Profile.nPCMUs;
-			m_nLastProfileInsn             = Profile.nInstructions;
-
 			const u64 nWindowUs = nNowUs - Stats.nWindowStartUs;
-			if (nTotalDelta > 0 && nWindowUs > 0)
+
+			if (m_bSplitActive && m_pSplitState)
 			{
-				DiagLog.LogLine("profile synth=nuked engine=%s emu_pct=%llu mcu_pct=%llu pcm_pct=%llu insn_per_sec=%llu",
-				                H8EngineName(m_H8Engine),
-				                static_cast<unsigned long long>(nTotalDelta * 100 / nWindowUs),
-				                static_cast<unsigned long long>((nTotalDelta - nPCMDelta) * 100 / nTotalDelta),
-				                static_cast<unsigned long long>(nPCMDelta * 100 / nTotalDelta),
-				                static_cast<unsigned long long>(nInsnDelta * 1000000ULL / nWindowUs));
+				// Split diag for the same window: window deltas for
+				// the trim counters, peaks since activation as-is.
+				// The core-2 MCU time is the stepping time
+				// accumulated in RenderFrames; the core-3 PCM time
+				// is the PCM task's work time. (The single-threaded
+				// profile line is meaningless across cores -- PCM
+				// time on core 3 can exceed emulator time on core
+				// 2 -- so it is replaced, not supplemented, while
+				// the split is active.)
+				ThreadSplitStateCircle& S = *m_pSplitState;
+				const u64 nLockWaits      = S.lock_waits - m_nLastSplitLockWaits;
+				const u64 nLockContended  = S.lock_contended - m_nLastSplitLockContended;
+				const u64 nLockWaitUs     = S.lock_wait_us - m_nLastSplitLockWaitUs;
+				const u64 nPublishes      = S.publishes - m_nLastSplitPublishes;
+				const u64 nTicks          = S.ticks - m_nLastSplitTicks;
+				const u64 nIrq0Folded     = S.irq0_folded - m_nLastSplitIrq0Folded;
+				const u64 nPCMUs          = S.pcm_task_us - m_nLastSplitPCMUs;
+				const u64 nMCUUs          = m_nMCUUs;
+				DiagLog.LogLine("split synth=nuked lock_waits=%llu lock_contended=%llu lock_wait_us=%llu publishes=%llu ticks=%llu irq0_folded=%llu lock_stall=%u mcu_core2_pct=%llu pcm_core3_pct=%llu max_lag=%llu phase=%u ring_drops=%llu",
+				                static_cast<unsigned long long>(nLockWaits),
+				                static_cast<unsigned long long>(nLockContended),
+				                static_cast<unsigned long long>(nLockWaitUs),
+				                static_cast<unsigned long long>(nPublishes),
+				                static_cast<unsigned long long>(nTicks),
+				                static_cast<unsigned long long>(nIrq0Folded),
+				                S.lock_stall,
+				                static_cast<unsigned long long>(nWindowUs > 0 ? nMCUUs * 100 / nWindowUs : 0),
+				                static_cast<unsigned long long>(nWindowUs > 0 ? nPCMUs * 100 / nWindowUs : 0),
+				                static_cast<unsigned long long>(S.max_pcm_lag),
+				                S.core3_phase,
+				                static_cast<unsigned long long>(m_nSampleRingDrops));
+				m_nLastSplitLockWaits = S.lock_waits;
+				m_nLastSplitLockContended = S.lock_contended;
+				m_nLastSplitLockWaitUs = S.lock_wait_us;
+				m_nLastSplitPublishes = S.publishes;
+				m_nLastSplitTicks = S.ticks;
+				m_nLastSplitIrq0Folded = S.irq0_folded;
+				m_nLastSplitPCMUs = S.pcm_task_us;
+				m_nMCUUs = 0;
+			}
+			else
+			{
+				// Backend phase split for the same window: emulator wall
+				// share of one core, MCU+peripherals vs PCM share of the
+				// emulator's time, and the H8 instruction rate.
+				const NukedProfileData& Profile = NukedProfile();
+				const u64 nTotalDelta          = Profile.nTotalUs - m_nLastProfileTotalUs;
+				const u64 nPCMDelta            = Profile.nPCMUs - m_nLastProfilePCMUs;
+				const u64 nInsnDelta           = Profile.nInstructions - m_nLastProfileInsn;
+				m_nLastProfileTotalUs          = Profile.nTotalUs;
+				m_nLastProfilePCMUs            = Profile.nPCMUs;
+				m_nLastProfileInsn             = Profile.nInstructions;
+
+				if (nTotalDelta > 0 && nWindowUs > 0)
+				{
+					DiagLog.LogLine("profile synth=nuked engine=%s emu_pct=%llu mcu_pct=%llu pcm_pct=%llu insn_per_sec=%llu",
+					                H8EngineName(m_H8Engine),
+					                static_cast<unsigned long long>(nTotalDelta * 100 / nWindowUs),
+					                static_cast<unsigned long long>((nTotalDelta - nPCMDelta) * 100 / nTotalDelta),
+					                static_cast<unsigned long long>(nPCMDelta * 100 / nTotalDelta),
+					                static_cast<unsigned long long>(nInsnDelta * 1000000ULL / nWindowUs));
+				}
 			}
 		}
 	}

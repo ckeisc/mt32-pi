@@ -25,6 +25,7 @@
 #include <circle/sound/hdmisoundbasedevice.h>
 #include <circle/sound/i2ssoundbasedevice.h>
 #include <circle/sound/pwmsoundbasedevice.h>
+#include <circle/sched/scheduler.h>
 
 #include <cstdarg>
 
@@ -111,6 +112,7 @@ CMT32Pi::CMT32Pi(CI2CMaster* pI2CMaster, CSPIMaster* pSPIMaster, CInterruptSyste
 
 	  m_bRunning(true),
 	  m_bUITaskDone(false),
+	  m_nThrottleUpdateTicks(0),
 	  m_bLEDOn(false),
 	  m_nLEDOnTime(0),
 
@@ -325,6 +327,14 @@ bool CMT32Pi::Initialize(bool bSerialMIDIAvailable)
 	else if (m_bSerialMIDIEnabled)
 		LOGNOTE("Using serial MIDI interface");
 
+	// Dual-core Nuked-SC55 split: run at maximum clock from boot.
+	// Firmware boots the ARM at its minimum (~605 MHz) and Circle
+	// leaves it there unless asked -- without this, the split runs
+	// at ~60% clock (proven by the standalone test kernels). The
+	// power-save path still drops to Low after the idle timeout
+	// and Awaken() restores Maximum; the 1 s Update() cadence in
+	// MainTask enforces the set speed against temperature.
+	CCPUThrottle::Get()->SetSpeed(CPUSpeedMaximum);
 	CCPUThrottle::Get()->DumpStatus();
 	SetPowerSaveTimeout(m_pConfig->SystemPowerSaveTimeout);
 
@@ -455,7 +465,7 @@ bool CMT32Pi::InitNukedSC55Synth()
 {
 	assert(m_pNukedSC55Synth == nullptr);
 
-	m_pNukedSC55Synth = new CNukedSC55Synth(m_pConfig->AudioSampleRate, m_pConfig->NukedGain, m_pConfig->NukedOversampling, m_pConfig->NukedH8Engine);
+	m_pNukedSC55Synth = new CNukedSC55Synth(m_pConfig->AudioSampleRate, m_pConfig->NukedGain, m_pConfig->NukedOversampling, m_pConfig->NukedH8Engine, m_pConfig->NukedSplit);
 	if (!m_pNukedSC55Synth->Initialize())
 	{
 		LOGWARN("Nuked-SC55 init failed; no complete SC-55 ROM set present?");
@@ -524,6 +534,16 @@ void CMT32Pi::MainTask()
 #endif
 
 		CPower::Update();
+
+		// CPU throttle temperature guard: enforces the currently
+		// set speed (Maximum in normal operation, Low in
+		// power-save) once per second. Update() only acts on high
+		// temperature, so it cannot fight the power-save state.
+		if (nTicks - m_nThrottleUpdateTicks >= HZ)
+		{
+			m_nThrottleUpdateTicks = nTicks;
+			CCPUThrottle::Get()->Update();
+		}
 
 		// Check for deferred SoundFont switch
 		if (m_bDeferredSoundFontSwitchFlag)
@@ -665,6 +685,27 @@ void CMT32Pi::AudioTask()
 		const int nResult = m_pSound->Write(IntBuffer, nWriteBytes);
 		if (nResult != static_cast<int>(nWriteBytes))
 			LOGERR("Sound data dropped");
+
+
+	}
+}
+
+void CMT32Pi::PCMTask()
+{
+	LOGNOTE("PCM task on Core 3 starting up");
+
+	// Dual-core Nuked-SC55 split (trim): core 3 renders bounded
+	// batches of PCM ticks under the raw lock, chasing core 2's
+	// published cycle count. The synth's iteration yields when
+	// there is no work and parks when the split is inactive, so
+	// this loop is also the idle path for every other synth -- no
+	// work is ever done here unless the Nuked split is live.
+	while (m_bRunning)
+	{
+		if (m_pNukedSC55Synth && m_pNukedSC55Synth->SplitActive())
+			m_pNukedSC55Synth->PCMTaskIteration();
+		else
+			CScheduler::Get()->Yield();
 	}
 }
 
@@ -681,6 +722,9 @@ void CMT32Pi::Run(unsigned nCore)
 
 		case 2:
 			return AudioTask();
+
+		case 3:
+			return PCMTask();
 
 		default:
 			break;
@@ -1262,12 +1306,24 @@ void CMT32Pi::SwitchSynth(TSynth NewSynth)
 		return;
 	}
 
+	CSynthBase* pOldSynth = m_pCurrentSynth;
 	m_pCurrentSynth->AllSoundOff();
 	m_pCurrentSynth = pNewSynth;
 	const char* pMode = NewSynth == TSynth::MT32 ? "MT-32 mode" : (NewSynth == TSynth::EmuSC ? "EmuSC mode" : (NewSynth == TSynth::NukedSC55 ? "Nuked-SC55 mode" : "SoundFont mode"));
 	LOGNOTE("Switching to %s", pMode);
 	LCDLog(TLCDLogType::Notice, pMode);
 	CDiagLog::Get().LogLine("switch synth=%s", pMode);
+	// Split park/reactivate across the switch (trim): parking on
+	// switch-from stops core 3 consuming cycles and filling the
+	// ring while another synth plays; reactivating on switch-to
+	// (ring cleared) gives a clean start. Each takes the synth's
+	// m_Lock, so no RenderFrames call can be in flight across the
+	// transition; the calls are no-ops when the split was never
+	// eligible or is wedged.
+	if (pOldSynth == m_pNukedSC55Synth && m_pNukedSC55Synth != nullptr)
+		m_pNukedSC55Synth->SplitDeactivate();
+	if (pNewSynth == m_pNukedSC55Synth && m_pNukedSC55Synth != nullptr)
+		m_pNukedSC55Synth->SplitActivate();
 }
 
 void CMT32Pi::SwitchMT32ROMSet(TMT32ROMSet ROMSet)
