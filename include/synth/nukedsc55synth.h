@@ -40,6 +40,16 @@ class Emulator;
 struct RomsetInfo;
 struct ThreadSplitStateCircle;
 
+// Nuked resampler selection (cfg [nuked] resampler): kaiser is the
+// 66-tap polyphase FIR (default, best quality); cubic is Catmull-Rom
+// (4 taps, ~10x cheaper); linear is the original 2-tap lerp.
+enum class TNukedResampler
+{
+	Kaiser,
+	Cubic,
+	Linear
+};
+
 class CNukedSC55Synth : public CSynthBase
 {
 public:
@@ -50,7 +60,7 @@ public:
 
 	CONFIG_ENUM(TH8Engine, ENUM_NUKEDH8ENGINE);
 
-	CNukedSC55Synth(unsigned nSampleRate, float nGain, bool bOversampling);
+	CNukedSC55Synth(unsigned nSampleRate, float nGain, bool bOversampling, TNukedResampler Resampler);
 	virtual ~CNukedSC55Synth() override;
 
 	// Dual-core split: true while the PCM task (core 3) may be
@@ -103,6 +113,12 @@ public:
 	virtual void SetMasterVolume(u8 nVolume) override;
 	virtual size_t Render(s16* pOutBuffer, size_t nFrames) override;
 	virtual size_t Render(float* pOutBuffer, size_t nFrames) override;
+
+	// Dev side-by-side toggle (HW2): advance the resampler selection
+	// (kaiser -> cubic -> linear) and return the EFFECTIVE resampler
+	// name for the LCD (kaiser selection on a non-64k rate reports
+	// cubic, which is what is actually heard).
+	const char* CycleResampler();
 	virtual void ReportStatus() const override;
 	virtual void UpdateLCD(CLCD& LCD, unsigned int nTicks) override;
 
@@ -193,6 +209,37 @@ private:
 	TSplitSample m_SampleA;
 	TSplitSample m_SampleB;
 	bool m_bWindowValid;
+
+	// Polyphase FIR resampler (64k -> 48k only; coefficients in
+	// fir64k48k.h). History is circular (128 slots, interleaved
+	// L/R floats); the newest sample fed sits at (m_FirFed-1)&127.
+	// m_FirPhase is always m_FirOutIndex % 3; output n consumes
+	// newest input m = (4n - phase) / 3, feeding from the ring
+	// until m_FirFed > m.
+	bool m_bFirActive;
+	float m_FirHist[128 * 2];
+	size_t m_FirFed;
+	size_t m_FirOutIndex;
+	unsigned m_FirPhase;
+	void ResetFirState();
+	// Derive the effective resampler from the selection + rates and
+	// reset all resampler state so the newly active resampler primes
+	// fresh. Caller must hold m_Lock once rendering has started
+	// (Init runs pre-render, so it calls this unlocked).
+	void ApplyResamplerSelection();
+
+	// Cubic Catmull-Rom resampler window (4 samples bracketing the
+	// output position, m_dReadFrac relative to m_CubicA). Primed
+	// from the ring (first call, or after an underrun); m_CubicPrev
+	// duplicates m_CubicA on prime (frac starts at 0, so the first
+	// output is exactly m_CubicA regardless).
+	TSplitSample m_CubicPrev;
+	TSplitSample m_CubicA;
+	TSplitSample m_CubicB;
+	TSplitSample m_CubicNext;
+	bool m_bCubicValid;
+	bool m_bCubicActive;
+	TNukedResampler m_Resampler;
 
 	CRingBuffer<TSplitSample, SplitRingFrames> m_SampleRing;
 	volatile size_t m_nSampleRingFill;

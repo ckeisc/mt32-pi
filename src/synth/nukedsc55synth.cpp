@@ -40,6 +40,7 @@
 #include "diaglog.h"
 #include "lcd/ui.h"
 #include "synth/nukedsc55synth.h"
+#include "synth/fir64k48k.h"
 #include "utility.h"
 
 // Nuked-SC55 backend headers are only included here (this file is compiled
@@ -247,7 +248,7 @@ const char* FriendlyModelName(Romset Romset)
 
 } // namespace
 
-CNukedSC55Synth::CNukedSC55Synth(unsigned nSampleRate, float nGain, bool bOversampling)
+CNukedSC55Synth::CNukedSC55Synth(unsigned nSampleRate, float nGain, bool bOversampling, TNukedResampler Resampler)
 	: CSynthBase(nSampleRate),
 	  m_pSplitState(nullptr),
 	  m_bSplitActive(false),
@@ -267,6 +268,18 @@ CNukedSC55Synth::CNukedSC55Synth(unsigned nSampleRate, float nGain, bool bOversa
 	  m_SampleA{},
 	  m_SampleB{},
 	  m_bWindowValid(false),
+	  m_bFirActive(false),
+	  m_FirHist{},
+	  m_FirFed(0),
+	  m_FirOutIndex(0),
+	  m_FirPhase(0),
+	  m_CubicPrev{},
+	  m_CubicA{},
+	  m_CubicB{},
+	  m_CubicNext{},
+	  m_bCubicValid(false),
+	  m_bCubicActive(false),
+	  m_Resampler(Resampler),
 	  m_SampleRing{},
 	  m_nSampleRingFill(0),
 	  m_nSampleRingDrops(0),
@@ -626,6 +639,7 @@ bool CNukedSC55Synth::Initialize()
 	m_nNativeRate    = PCM_GetOutputFrequency(m_pEmulator->GetPCM());
 	m_dResampleRatio = static_cast<double>(m_nNativeRate) / static_cast<double>(m_nSampleRate);
 
+	ApplyResamplerSelection();
 	m_pEmulator->SetSampleCallback([](void* pUserData, const AudioFrame<int32_t>& Frame) {
 		static_cast<CNukedSC55Synth*>(pUserData)->OnSample(Frame.left, Frame.right);
 	}, this);
@@ -679,8 +693,8 @@ bool CNukedSC55Synth::Initialize()
 	LOGNOTE("Nuked-SC55 initialized: romset %s (%s v%s), native rate %u Hz, oversampling %s",
 	        pDefinition->name, m_ModelName, m_ROMVersion, m_nNativeRate, m_bOversampling ? "on" : "off");
 
-	CDiagLog::Get().LogLine("init synth=nuked romset=%s rate=%u oversampling=%s h8_engine=%s sync=%s heap_free_low_kb=%u prime_insn=%llu prime_emu_us=%llu prime_pcm_us=%llu",
-	                        pDefinition->name, m_nNativeRate, m_bOversampling ? "on" : "off", H8EngineName(TH8Engine::Decoder2),
+	CDiagLog::Get().LogLine("init synth=nuked romset=%s rate=%u oversampling=%s resamp=%s h8_engine=%s sync=%s heap_free_low_kb=%u prime_insn=%llu prime_emu_us=%llu prime_pcm_us=%llu",
+	                        pDefinition->name, m_nNativeRate, m_bOversampling ? "on" : "off", m_bFirActive ? "kaiser" : (m_bCubicActive ? "cubic" : "linear"), H8EngineName(TH8Engine::Decoder2),
 	                        m_bSplitActive ? "trim" : "single",
 	                        static_cast<unsigned>(CMemorySystem::Get()->GetHeapFreeSpace(HEAP_LOW) / 1024),
 	                        static_cast<unsigned long long>(NukedProfile().nInstructions),
@@ -855,6 +869,56 @@ void CNukedSC55Synth::SetMasterVolume(u8 nVolume)
 	m_nVolume = nVolume;
 }
 
+void CNukedSC55Synth::ResetFirState()
+{
+	memset(m_FirHist, 0, sizeof(m_FirHist));
+	m_FirFed = 0;
+	m_FirOutIndex = 0;
+	m_FirPhase = 0;
+}
+
+void CNukedSC55Synth::ApplyResamplerSelection()
+{
+	// Effective resampler: kaiser runs the FIR only on 64k -> 48k
+	// (MK1 oversampling on, 48 kHz output); otherwise it falls back
+	// to cubic (general, better than lerp). Cubic selection runs
+	// cubic at any rate; linear runs the lerp. All resampler state
+	// is reset so the newly active resampler primes fresh; the ring
+	// is NOT cleared, so audio continues from the queued native
+	// samples and a mid-song switch is nearly seamless.
+	m_bFirActive = (m_Resampler == TNukedResampler::Kaiser &&
+	                m_nNativeRate == 64000 && m_nSampleRate == 48000);
+	m_bCubicActive = !m_bFirActive && (m_Resampler != TNukedResampler::Linear);
+	ResetFirState();
+	m_bCubicValid = false;
+	m_bWindowValid = false;
+	m_dReadFrac = 0.0;
+}
+
+const char* CNukedSC55Synth::CycleResampler()
+{
+	// Dev A/B toggle (HW2): advance the selection, re-derive the
+	// effective resampler, and reset state -- all under m_Lock, so
+	// no RenderFrames call can observe a half-switched resampler.
+	m_Lock.Acquire();
+	switch (m_Resampler)
+	{
+	case TNukedResampler::Kaiser:
+		m_Resampler = TNukedResampler::Cubic;
+		break;
+	case TNukedResampler::Cubic:
+		m_Resampler = TNukedResampler::Linear;
+		break;
+	default:
+		m_Resampler = TNukedResampler::Kaiser;
+		break;
+	}
+	ApplyResamplerSelection();
+	const char* pName = m_bFirActive ? "kaiser" : (m_bCubicActive ? "cubic" : "linear");
+	m_Lock.Release();
+	return pName;
+}
+
 size_t CNukedSC55Synth::RenderFrames(float* pOutBuffer, size_t nFrames)
 {
 	if (!m_pEmulator)
@@ -972,36 +1036,137 @@ size_t CNukedSC55Synth::RenderFrames(float* pOutBuffer, size_t nFrames)
 	};
 
 	size_t nDone = 0;
-	for (; nDone < nFrames; ++nDone)
+	if (m_bFirActive)
 	{
-		if (!m_bWindowValid)
+		// Polyphase FIR, 64k -> 48k (L=3 up, M=4 down), Kaiser 125 dB
+		// target (measured worst stopband -114.7 dB, passband flat to
+		// 20 kHz, transition 20-28 kHz; 66 taps/output/phase, see
+		// fir64k48k.h). Output n uses phase p = n % 3 and newest
+		// input m = (4n - p) / 3; history is circular (128 slots).
+		// Feed native samples from the ring until m_FirFed > m,
+		// then dot-product the phase's 66 taps against history.
+		// nNeed above already covers FIR consumption (4/3 per output
+		// plus margin); the 66-sample history warms up from zeros
+		// on the first call (inaudible: the emulator starts silent).
+		for (; nDone < nFrames; ++nDone)
 		{
-			TSplitSample A, B;
-			if (!DequeueOne(A) || !DequeueOne(B))
-				break;
-			m_SampleA = A;
-			m_SampleB = B;
-			m_bWindowValid = true;
-		}
-		bool bStarved = false;
-		while (m_dReadFrac >= 1.0)
-		{
-			m_SampleA = m_SampleB;
-			if (!DequeueOne(m_SampleB))
+			const unsigned nPhase = m_FirPhase;
+			const size_t nM = (4 * m_FirOutIndex - nPhase) / 3;
+			bool bStarved = false;
+			while (m_FirFed <= nM)
 			{
-				bStarved = true;
-				break;
+				TSplitSample Sample;
+				if (!DequeueOne(Sample))
+				{
+					bStarved = true;
+					break;
+				}
+				const unsigned nSlot = static_cast<unsigned>(m_FirFed & 127u);
+				m_FirHist[nSlot * 2] = static_cast<float>(Sample.nLeft);
+				m_FirHist[nSlot * 2 + 1] = static_cast<float>(Sample.nRight);
+				++m_FirFed;
 			}
-			m_dReadFrac -= 1.0;
+			if (bStarved)
+				break;
+			const unsigned nNewest = static_cast<unsigned>(nM & 127u);
+			float nAccL = 0.0f;
+			float nAccR = 0.0f;
+			for (unsigned t = 0; t < 66; ++t)
+			{
+				const unsigned nSlot = (nNewest - t) & 127u;
+				const float nCoeff = kFir64k48k[nPhase][t];
+				nAccL += nCoeff * m_FirHist[nSlot * 2];
+				nAccR += nCoeff * m_FirHist[nSlot * 2 + 1];
+			}
+			pOutBuffer[nDone * 2] = nAccL * nScale;
+			pOutBuffer[nDone * 2 + 1] = nAccR * nScale;
+			++m_FirOutIndex;
+			m_FirPhase = (m_FirPhase + 1) % 3;
 		}
-		if (bStarved)
-			break;
+	}
+	else if (m_bCubicActive)
+	{
+		// Cubic Catmull-Rom (4 taps, general rate): window
+		// (prev, A, B, next) brackets the output position
+		// (m_dReadFrac relative to A); slides like the lerp
+		// window but 4-wide. Prime duplicates A into prev
+		// (frac starts at 0, so the first output is exactly A).
+		for (; nDone < nFrames; ++nDone)
+		{
+			if (!m_bCubicValid)
+			{
+				TSplitSample A, B;
+				if (!DequeueOne(A) || !DequeueOne(B))
+					break;
+				m_CubicPrev = A;
+				m_CubicA = A;
+				m_CubicB = B;
+				if (!DequeueOne(m_CubicNext))
+					m_CubicNext = B;
+				m_bCubicValid = true;
+			}
+			bool bStarved = false;
+			while (m_dReadFrac >= 1.0)
+			{
+				m_CubicPrev = m_CubicA;
+				m_CubicA = m_CubicB;
+				m_CubicB = m_CubicNext;
+				if (!DequeueOne(m_CubicNext))
+				{
+					bStarved = true;
+					break;
+				}
+				m_dReadFrac -= 1.0;
+			}
+			if (bStarved)
+				break;
 
-		const float nFrac = static_cast<float>(m_dReadFrac);
-		pOutBuffer[nDone * 2]     = (m_SampleA.nLeft + (m_SampleB.nLeft - m_SampleA.nLeft) * nFrac) * nScale;
-		pOutBuffer[nDone * 2 + 1] = (m_SampleA.nRight + (m_SampleB.nRight - m_SampleA.nRight) * nFrac) * nScale;
+			const float t = static_cast<float>(m_dReadFrac);
+			const float t2 = t * t;
+			const float t3 = t2 * t;
+			const float w0 = -0.5f * t + t2 - 0.5f * t3;
+			const float w1 = 1.0f - 2.5f * t2 + 1.5f * t3;
+			const float w2 = 0.5f * t + 2.0f * t2 - 1.5f * t3;
+			const float w3 = -0.5f * t2 + 0.5f * t3;
+			pOutBuffer[nDone * 2] = (w0 * m_CubicPrev.nLeft + w1 * m_CubicA.nLeft + w2 * m_CubicB.nLeft + w3 * m_CubicNext.nLeft) * nScale;
+			pOutBuffer[nDone * 2 + 1] = (w0 * m_CubicPrev.nRight + w1 * m_CubicA.nRight + w2 * m_CubicB.nRight + w3 * m_CubicNext.nRight) * nScale;
 
-		m_dReadFrac += m_dResampleRatio;
+			m_dReadFrac += m_dResampleRatio;
+		}
+	}
+	else
+	{
+		for (; nDone < nFrames; ++nDone)
+		{
+			if (!m_bWindowValid)
+			{
+				TSplitSample A, B;
+				if (!DequeueOne(A) || !DequeueOne(B))
+					break;
+				m_SampleA = A;
+				m_SampleB = B;
+				m_bWindowValid = true;
+			}
+			bool bStarved = false;
+			while (m_dReadFrac >= 1.0)
+			{
+				m_SampleA = m_SampleB;
+				if (!DequeueOne(m_SampleB))
+				{
+					bStarved = true;
+					break;
+				}
+				m_dReadFrac -= 1.0;
+			}
+			if (bStarved)
+				break;
+
+			const float nFrac = static_cast<float>(m_dReadFrac);
+			pOutBuffer[nDone * 2]     = (m_SampleA.nLeft + (m_SampleB.nLeft - m_SampleA.nLeft) * nFrac) * nScale;
+			pOutBuffer[nDone * 2 + 1] = (m_SampleA.nRight + (m_SampleB.nRight - m_SampleA.nRight) * nFrac) * nScale;
+
+			m_dReadFrac += m_dResampleRatio;
+		}
 	}
 	if (nDone < nFrames)
 	{
@@ -1016,6 +1181,10 @@ size_t CNukedSC55Synth::RenderFrames(float* pOutBuffer, size_t nFrames)
 		nUnderrunFrames += nFrames - nDone;
 		m_dReadFrac = 0.0;
 		m_bWindowValid = false;
+		if (m_bFirActive)
+			ResetFirState();
+		else if (m_bCubicActive)
+			m_bCubicValid = false;
 	}
 
 	if (bDiag)
