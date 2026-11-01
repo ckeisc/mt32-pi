@@ -696,13 +696,20 @@ void CMT32Pi::PCMTask()
 
 	// Dual-core Nuked-SC55 split (trim): core 3 renders bounded
 	// batches of PCM ticks under the raw lock, chasing core 2's
-	// published cycle count. The synth's iteration yields when
-	// there is no work and parks when the split is inactive, so
-	// this loop is also the idle path for every other synth -- no
-	// work is ever done here unless the Nuked split is live.
+	// published cycle count. The iteration is called
+	// UNCONDITIONALLY whenever the synth exists -- never gated on
+	// SplitActive() here. That gate is the old song-switch wedge:
+	// StopSplitPCM clears the active flag and then waits for the
+	// PCM idle ack, but the ack is written only by the iteration's
+	// parked branch, so gating the call on the flag means the ack
+	// can never arrive and every stop times out. The iteration
+	// itself gates on the flag, parks (acks idle) and yields when
+	// inactive, and backs off and yields when idle, so this loop
+	// is also the idle path for every other synth -- no work is
+	// ever done here unless the Nuked split is live.
 	while (m_bRunning)
 	{
-		if (m_pNukedSC55Synth && m_pNukedSC55Synth->SplitActive())
+		if (m_pNukedSC55Synth)
 			m_pNukedSC55Synth->PCMTaskIteration();
 		else
 			CScheduler::Get()->Yield();
