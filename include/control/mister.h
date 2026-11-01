@@ -37,6 +37,10 @@ public:
 
 	void Update(const TMisterStatus& SystemStatus);
 
+	// Last synth reported by MiSTer (Unknown if none reported yet or
+	// MiSTer stopped responding). Drives the Button1 cycle gate.
+	TMisterSynth GetLastMisterSynth() const { return m_LastMisterStatus.Synth; }
+
 private:
 	bool WriteConfigToMister(const TMisterStatus& NewStatus);
 	void ResetState();

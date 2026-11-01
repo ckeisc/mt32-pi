@@ -1498,6 +1498,170 @@ index 6737cd6..94846de 100644
  
  void MCU_ErrorTrap(mcu_t& mcu);
  
+diff --git a/src/backend/mcu_timer.cpp b/src/backend/mcu_timer.cpp
+index 4916ad5..9823793 100644
+--- a/src/backend/mcu_timer.cpp
++++ b/src/backend/mcu_timer.cpp
+@@ -376,28 +376,134 @@ inline void TIMER_ClockTmr(mcu_timer_t& timer)
+         MCU_Interrupt_SetRequest(*timer.mcu, INTERRUPT_SOURCE_TIMER_CMIB, 1);
+ }
+ 
+-void TIMER_Clock(mcu_timer_t& timer, uint64_t cycles)
++// mt32-pi (romacclz): event-driven ("lazy") TIMER_Clock. Timer ticks
++// that can neither match, wrap nor (re)issue an interrupt only
++// increment a counter, so runs of them are applied arithmetically,
++// and TIMER_Clock returns after a single compare while the next event
++// is still in the future. Register reads/writes materialize the
++// affected timer first, so every value the MCU can observe, and every
++// interrupt request, is identical to the legacy per-tick loops by
++// construction (validated on hardware by the tchk checker run:
++// 220,659,515 comparisons, 0 mismatches).
++
++static inline uint32_t FrtEventFree(const frt_t& f)
+ {
+-    const uint64_t target_cycles = cycles / 2;
++    if (((f.tcr & FRT_TCR_OVIE) != 0 && (f.tcsr & FRT_TCSR_OVF) != 0) ||
++        ((f.tcr & FRT_TCR_OCIEA) != 0 && (f.tcsr & FRT_TCSR_OCFA) != 0) ||
++        ((f.tcr & FRT_TCR_OCIEB) != 0 && (f.tcsr & FRT_TCSR_OCFB) != 0))
++        return 0;
++    const uint32_t ia = (uint32_t)((f.ocra - f.frc) & 0xffff);
++    const uint32_t ib = (uint32_t)((f.ocrb - f.frc) & 0xffff);
++    const uint32_t iw = (uint32_t)(0xffff - f.frc);
++    uint32_t e = ia < ib ? ia : ib;
++    if (iw < e)
++        e = iw;
++    return e;
++}
+ 
+-    timer.cycles = target_cycles;
++static inline uint32_t TmrEventFree(const tmr_t& t)
++{
++    if (((t.tcr & TMR_TCR_OVIE) != 0 && (t.tcsr & TMR_TCSR_OVF) != 0) ||
++        ((t.tcr & TMR_TCR_CMIEA) != 0 && (t.tcsr & TMR_TCSR_CMFA) != 0) ||
++        ((t.tcr & TMR_TCR_CMIEB) != 0 && (t.tcsr & TMR_TCSR_CMFB) != 0))
++        return 0;
++    const uint32_t ia = (uint32_t)((t.tcora - t.tcnt) & 0xff);
++    const uint32_t ib = (uint32_t)((t.tcorb - t.tcnt) & 0xff);
++    const uint32_t iw = (uint32_t)(0xff - t.tcnt);
++    uint32_t e = ia < ib ? ia : ib;
++    if (iw < e)
++        e = iw;
++    return e;
++}
+ 
+-    for (int i = 0; i < 3; i++)
++static void FrtMaterialize(mcu_timer_t& timer, uint32_t i, uint64_t T)
++{
++    frt_t& f = timer.frt[i];
++    while (f.deadline < T)
+     {
+-        while (timer.frt[i].deadline < target_cycles)
++        const uint32_t e = FrtEventFree(f);
++        if (e == 0)
+         {
+-            TIMER_ClockFrt(timer, i);
+-            timer.frt[i].deadline += timer.frt[i].stride;
++            TIMER_ClockFrt(timer, (int)i);
++            f.deadline += f.stride;
++            continue;
+         }
++        const unsigned shift = (unsigned)__builtin_ctz((unsigned)f.stride);
++        const uint64_t n = ((T - f.deadline) + f.stride - 1) >> shift;
++        uint64_t m = n < e ? n : e;
++        f.frc = (uint16_t)(f.frc + m);
++        f.deadline += m << shift;
+     }
++}
+ 
+-    while (timer.tmr.deadline < target_cycles)
++static void TmrMaterialize(mcu_timer_t& timer, uint64_t T)
++{
++    tmr_t& t = timer.tmr;
++    while (t.deadline < T)
+     {
+-        TIMER_ClockTmr(timer);
+-        timer.tmr.deadline += timer.tmr.stride;
++        const uint32_t e = TmrEventFree(t);
++        if (e == 0)
++        {
++            TIMER_ClockTmr(timer);
++            t.deadline += t.stride;
++            continue;
++        }
++        const unsigned shift = (unsigned)__builtin_ctz((unsigned)t.stride);
++        const uint64_t n = ((T - t.deadline) + t.stride - 1) >> shift;
++        uint64_t m = n < e ? n : e;
++        t.tcnt = (uint8_t)(t.tcnt + m);
++        t.deadline += m << shift;
+     }
+ }
+ 
++static void MaterializeAll(mcu_timer_t& timer, uint64_t T)
++{
++    for (uint32_t i = 0; i < 3; ++i)
++        FrtMaterialize(timer, i, T);
++    TmrMaterialize(timer, T);
++}
++
++static inline uint64_t FrtAttention(const frt_t& f)
++{
++    return f.deadline + (uint64_t)FrtEventFree(f) * f.stride + 1;
++}
++
++static inline uint64_t TmrAttention(const tmr_t& t)
++{
++    if (t.stride == 0)
++        return static_cast<uint64_t>(-1);
++    return t.deadline + (uint64_t)TmrEventFree(t) * t.stride + 1;
++}
++
++static void ClockLazy(mcu_timer_t& timer, uint64_t cycles)
++{
++    const uint64_t target_cycles = cycles / 2;
++    timer.cycles = target_cycles;
++    if (target_cycles < timer.next_attention)
++    {
++        timer.lazy_skips++;
++        return;
++    }
++    MaterializeAll(timer, target_cycles);
++    uint64_t attention = FrtAttention(timer.frt[0]);
++    for (uint32_t i = 1; i < 3; ++i)
++    {
++        const uint64_t a = FrtAttention(timer.frt[i]);
++        if (a < attention)
++            attention = a;
++    }
++    const uint64_t a = TmrAttention(timer.tmr);
++    if (a < attention)
++        attention = a;
++    timer.next_attention = attention;
++}
++
++void TIMER_Clock(mcu_timer_t& timer, uint64_t cycles)
++{
++    ClockLazy(timer, cycles);
++}
++
++
+ // These tables are indexed by the low CKSn bits of the TCR.
+ constexpr FRT_Step_Table FRT_STEP_TABLE_GENERIC = {4, 8, 32, 2};
+ constexpr FRT_Step_Table FRT_STEP_TABLE_MK1     = {4, 8, 32, 4};
+diff --git a/src/backend/mcu_timer.h b/src/backend/mcu_timer.h
+index c883521..2b77501 100644
+--- a/src/backend/mcu_timer.h
++++ b/src/backend/mcu_timer.h
+@@ -56,6 +56,10 @@ struct tmr_t
+ struct mcu_timer_t
+ {
+     uint64_t cycles = 0;
++    // romacclz (lazy timer): smallest target (cycles/2) that needs
++    // non-trivial work; lazy_skips counts fast-path returns (diagnostic).
++    uint64_t next_attention = 0;
++    uint64_t lazy_skips = 0;
+ 
+     mcu_t*  mcu = nullptr;
+     frt_t   frt[3]{};
 diff --git a/src/backend/nuked_profile.h b/src/backend/nuked_profile.h
 new file mode 100644
 index 0000000..9ea3a05
@@ -1531,7 +1695,7 @@ index 0000000..9ea3a05
 +NukedProfileClockFn NukedProfileClock();
 +NukedProfileData& NukedProfile();
 diff --git a/src/backend/pcm.cpp b/src/backend/pcm.cpp
-index b8a4e27..a899b0e 100644
+index b8a4e27..af1eedc 100644
 --- a/src/backend/pcm.cpp
 +++ b/src/backend/pcm.cpp
 @@ -23,6 +23,8 @@
@@ -1543,7 +1707,70 @@ index b8a4e27..a899b0e 100644
  #include <cstdint>
  #include <cstring>
  
-@@ -258,6 +260,37 @@ void PCM_Init(pcm_t& pcm, mcu_t& mcu)
+@@ -62,8 +64,14 @@ uint8_t PCM_ReadROM(pcm_t& pcm, uint32_t address)
+     return 0;
+ }
+ 
+-void PCM_Write(pcm_t& pcm, uint32_t address, uint8_t data)
++// mt32-pi dual-core split (round 3): PCM_Write and PCM_WriteDeferred
++// share one body. Defer = false performs the ram1/ram2 store (the
++// original PCM_Write, unchanged); Defer = true hands the store back to
++// the caller. Everything else is identical by construction.
++template <bool Defer>
++static inline bool PCM_WriteImpl(pcm_t& pcm, uint32_t address, uint8_t data, PCMDeferredStore* out)
+ {
++    (void)out;
+     address &= 0x3f;
+     if (address < 0x4) // voice enable
+     {
+@@ -148,7 +156,15 @@ void PCM_Write(pcm_t& pcm, uint32_t address, uint8_t data)
+             if ((address & 4) == 0)
+                 ix |= 2;
+ 
+-            pcm.ram1[pcm.select_channel][ix] = pcm.write_latch;
++            if constexpr (Defer)
++            {
++                *out = PCMDeferredStore{0, pcm.select_channel, static_cast<uint8_t>(ix), 0, pcm.write_latch};
++                return true;
++            }
++            else
++            {
++                pcm.ram1[pcm.select_channel][ix] = pcm.write_latch;
++            }
+         }
+     }
+     else if ((address >= 0x10 && address < 0x20) || (address >= 0x30 && address < 0x38))
+@@ -170,9 +186,28 @@ void PCM_Write(pcm_t& pcm, uint32_t address, uint8_t data)
+             if (address & 32)
+                 ix |= 8;
+ 
+-            pcm.ram2[pcm.select_channel][ix] = static_cast<uint16_t>(pcm.write_latch);
++            if constexpr (Defer)
++            {
++                *out = PCMDeferredStore{1, pcm.select_channel, static_cast<uint8_t>(ix), 0, static_cast<uint16_t>(pcm.write_latch)};
++                return true;
++            }
++            else
++            {
++                pcm.ram2[pcm.select_channel][ix] = static_cast<uint16_t>(pcm.write_latch);
++            }
+         }
+     }
++    return false;
++}
++
++void PCM_Write(pcm_t& pcm, uint32_t address, uint8_t data)
++{
++    PCM_WriteImpl<false>(pcm, address, data, nullptr);
++}
++
++bool PCM_WriteDeferred(pcm_t& pcm, uint32_t address, uint8_t data, PCMDeferredStore* out)
++{
++    return PCM_WriteImpl<true>(pcm, address, data, out);
+ }
+ 
+ // rv: [30][2], [30][3]
+@@ -258,6 +293,37 @@ void PCM_Init(pcm_t& pcm, mcu_t& mcu)
      pcm.mcu = &mcu;
  }
  
@@ -1581,63 +1808,669 @@ index b8a4e27..a899b0e 100644
  // Sign-extends a 20-bit signed integer to a 32-bit signed integer.
  constexpr inline int32_t sx20(int32_t in)
  {
-@@ -573,8 +606,19 @@ void PCM_GetConfig(PCM_Config& config, uint8_t config_byte)
+@@ -571,10 +637,73 @@ void PCM_GetConfig(PCM_Config& config, uint8_t config_byte)
+     }
+ }
  
++// Round 3b ROM fetch (romfast, host-verified exhaustively against
++// PCM_ReadROM for every hiaddr, every 20-bit address, both config
++// modes): resolve the two possible banks once per slot, then fetch
++// with a select + indexed load. Anything the fast path does not
++// cover (JV880 mappings, a >= 2^20) falls back to PCM_ReadROM, so
++// the result is PCM_ReadROM's by construction.
++struct PCMRomBanks
++{
++    const uint8_t* lo;   // bank for 20-bit addresses with bit 19 clear (nullptr: reads 0)
++    const uint8_t* hi;   // bank for bit 19 set
++    bool           fast; // false: use PCM_ReadROM for every fetch
++};
++
++static inline const uint8_t* PCM_RomBankPtr(const pcm_t& pcm, int bank, int hiaddr)
++{
++    switch (bank)
++    {
++        case 0:
++            // MK1: waverom1[address & 0xfffff] = waverom1[a];
++            // mkII: waverom1[address & 0x1fffff] = waverom1[((hiaddr & 1) << 20) | a].
++            return pcm.mcu->is_mk1 ? pcm.waverom1 : pcm.waverom1 + ((uint32_t)(hiaddr & 1) << 20);
++        case 1:
++            return pcm.waverom2; // !jv880: waverom2[address & 0xfffff]
++        case 2:
++            return pcm.waverom3; // !jv880: waverom3[address & 0xfffff]
++        default:
++            return nullptr;      // banks 3-7: 0 on non-JV880
++    }
++}
++
++static inline PCMRomBanks PCM_RomBanks(const pcm_t& pcm, int hiaddr)
++{
++    PCMRomBanks b{nullptr, nullptr, false};
++    if (pcm.mcu->is_jv880)
++        return b;
++    b.fast = true;
++    if (pcm.config_reg_3d & 0x20)
++    {
++        const int bank = ((hiaddr << 20) >> 21) & 7;
++        b.lo = PCM_RomBankPtr(pcm, bank, hiaddr);
++        b.hi = b.lo;
++    }
++    else
++    {
++        b.lo = PCM_RomBankPtr(pcm, ((hiaddr << 20) >> 19) & 7, hiaddr);
++        b.hi = PCM_RomBankPtr(pcm, (((hiaddr << 20) | 0x80000) >> 19) & 7, hiaddr);
++    }
++    return b;
++}
++
++static inline uint8_t PCM_RomFetch(pcm_t& pcm, const PCMRomBanks& b, int hiaddr, uint32_t a)
++{
++    if (!b.fast || (a >> 20) != 0)
++        return PCM_ReadROM(pcm, (uint32_t)((hiaddr << 20) | a));
++    const uint8_t* p = (a & 0x80000u) ? b.hi : b.lo;
++    return p ? p[a] : (uint8_t)0;
++}
  void PCM_Update(pcm_t& pcm, uint64_t cycles)
  {
-+    // mt32-pi profiling: only calls that will render at least one tick
-+    // take clock readings, so the common no-op call costs one comparison.
-+    const NukedProfileClockFn pProfileClock = NukedProfileClock();
-+    const uint64_t nProfileStart = (pProfileClock && pcm.cycles < cycles) ? pProfileClock() : 0;
-+
      while (pcm.cycles < cycles)
      {
-+        // mt32-pi dual-core split (trim): count the tick for the
-+        // split diag. No-op when the split is inactive (g_splitT
-+        // null); the trim profile has no per-tick boundary work.
++        // mt32-pi dual-core split (round 3): per-tick hook (tick count +
++        // the sync profile's tick-boundary work: deferred-store drain or
++        // lock hand-off). No-op in single-threaded mode (g_splitT null).
 +        if (g_splitT)
 +            g_splitT->DrainBeforeTick(pcm);
 +
          const uint32_t voice_active = pcm.voice_mask & pcm.voice_mask_pending;
          { // final mixing
              int shifter = pcm.ram2[30][10];
-@@ -1425,7 +1469,16 @@ void PCM_Update(pcm_t& pcm, uint64_t cycles)
+@@ -1088,6 +1217,18 @@ void PCM_Update(pcm_t& pcm, uint64_t cycles)
+         pcm.rcsum[0] = 0;
+         pcm.rcsum[1] = 0;
+ 
++        // ScalarAcc applies only while slot 31 is outside the loop
++        // (reg_slots < 32: always true for the SC-55 firmware, and assumed
++        // by the split's 800-cycle tick cap). With 32 slots, slot 31's
++        // filter registers ram1[31][1]/[3] ARE the mix bus words (the
++        // chip's register file aliases them), so the bus must flow through
++        // slot 31's filter in serial order: that tick runs the original
++        // loop. The random-state host test (tools/hosttest) found this
++        // aliasing; pipe/splitacc/layout have the same exposure.
++        if (pcm.config.reg_slots < 32)
++        {
++        // ScalarAcc: exact register accumulators (see the mix tail below).
++        int32_t accL = 0, accR = 0, accC0 = 0, accC1 = 0;
+         for (int slot = 0; slot < pcm.config.reg_slots; slot++)
+         {
+             uint32_t *ram1 = pcm.ram1[slot];
+@@ -1104,6 +1245,11 @@ void PCM_Update(pcm_t& pcm, uint64_t cycles)
+             const bool b6 = (ram2[7] & 0x40) != 0; // 1
+             const bool b7 = (ram2[7] & 0x80) != 0; // 1
+             int hiaddr = (ram2[7] >> 8) & 15; // 1
++            // RomFast (round 3b): resolve PCM_ReadROM's bank switch once per
++            // slot; the 5 fetches below become select + indexed load.
++            // PCM_RomFetch falls back to PCM_ReadROM for anything the fast
++            // path does not cover, so the bytes are PCM_ReadROM's exactly.
++            const PCMRomBanks rombanks = PCM_RomBanks(pcm, hiaddr);
+             int old_nibble = (ram2[7] >> 12) & 15; // 1
+ 
+             int address = (int)ram1[4]; // 0
+@@ -1136,7 +1282,7 @@ void PCM_Update(pcm_t& pcm, uint64_t cycles)
+                 wave_address += nibble_add - nibble_subtract;
+             wave_address &= 0xfffff;
+ 
+-            int newnibble = PCM_ReadROM(pcm, (uint32_t)((hiaddr << 20) | wave_address));
++            int newnibble = PCM_RomFetch(pcm, rombanks, hiaddr, (uint32_t)(wave_address));
+             const bool newnibble_sel = address_b4 ^ ((b6 || !nibble_cmp1) && okey);
+             if (newnibble_sel)
+                 newnibble = (newnibble >> 4) & 15;
+@@ -1156,7 +1302,7 @@ void PCM_Update(pcm_t& pcm, uint64_t cycles)
+ 
+             // address 0
+             int address_cnt = address;
+-            int samp0 = (int8_t)PCM_ReadROM(pcm, (uint32_t)((hiaddr << 20) | address_cnt)); // 18
++            int samp0 = (int8_t)PCM_RomFetch(pcm, rombanks, hiaddr, (uint32_t)(address_cnt)); // 18
+ 
+             cmp1 = address;
+             cmp2 = address_cnt;
+@@ -1182,7 +1328,7 @@ void PCM_Update(pcm_t& pcm, uint64_t cycles)
+             address_cnt = address_cnt2 & 0xfffff; // 11
+             b15 = b6 && (b15 ^ address_cmp); // 11
+ 
+-            int samp1 = (int8_t)PCM_ReadROM(pcm, (uint32_t)((hiaddr << 20) | address_cnt)); // 20
++            int samp1 = (int8_t)PCM_RomFetch(pcm, rombanks, hiaddr, (uint32_t)(address_cnt)); // 20
+ 
+             cmp1 = address;
+             cmp2 = address_cnt;
+@@ -1211,7 +1357,7 @@ void PCM_Update(pcm_t& pcm, uint64_t cycles)
+             address_cnt = address_cnt2 & 0xfffff; // 15
+             b15 = b6 && (b15 ^ address_cmp); // 15
+ 
+-            int samp2 = (int8_t)PCM_ReadROM(pcm, (uint32_t)((hiaddr << 20) | address_cnt)); // 1
++            int samp2 = (int8_t)PCM_RomFetch(pcm, rombanks, hiaddr, (uint32_t)(address_cnt)); // 1
+ 
+             cmp1 = address;
+             cmp2 = address_cnt;
+@@ -1240,7 +1386,7 @@ void PCM_Update(pcm_t& pcm, uint64_t cycles)
+             address_cnt = address_cnt2 & 0xfffff; // 19
+             b15 = b6 && (b15 ^ address_cmp); // 19
+ 
+-            int samp3 = (int8_t)PCM_ReadROM(pcm, (uint32_t)((hiaddr << 20) | address_cnt)); // 5
++            int samp3 = (int8_t)PCM_RomFetch(pcm, rombanks, hiaddr, (uint32_t)(address_cnt)); // 5
+ 
+             cmp1 = address;
+             cmp2 = address_cnt;
+@@ -1425,7 +1571,475 @@ void PCM_Update(pcm_t& pcm, uint64_t cycles)
                  if (pcm.mcu->is_jv880)
                      MCU_GA_SetGAInt(*pcm.mcu, 5, 1);
                  else
 -                    MCU_Interrupt_SetRequest(*pcm.mcu, INTERRUPT_SOURCE_IRQ0, 1);
-+                    // mt32-pi dual-core split (trim): the assert
-+                    // travels to the MCU thread through the IRQ0 flag
-+                    // when the split is live (MK1 only) -- the direct
-+                    // SetRequest below must not run in that case, or
-+                    // the PCM thread would write the MCU thread's
-+                    // interrupt state (and the IRQ would be delivered
-+                    // twice). Core 2 folds the flag into
-+                    // interrupt_pending at the top of its next step.
-+                    // With no split live, this is the direct call.
++                    SplitAssertIrq0(pcm);
++            }
++
++            int volmul1 = 0;
++            int volmul2 = 0;
++
++            calc_tv(pcm, 0, ram2[3], &ram2[9], active, &volmul1);
++            calc_tv(pcm, 1, ram2[4], &ram2[10], active, &volmul2);
++            calc_tv(pcm, 2, ram2[5], &ram2[11], active, NULL);
++
++            // if (volmul1 && volmul2)
++            //     volmul1 += 0;
++
++            int sample = (ram2[6] & 2) == 0 ? (int)ram1[3] : v3;
++            //sample = test;
++
++            int multiv1 = multi(sample, (int8_t)(volmul1 >> 8));
++            int multiv2 = multi(sample, (int8_t)((volmul1 >> 1) & 127));
++
++            int sample2 = addclip20(multiv1 >> 6, multiv2 >> 13, ((multiv2 >> 12) | (multiv1 >> 5)) & 1);
++
++            int multiv3 = multi(sample2, (int8_t)(volmul2 >> 8));
++            int multiv4 = multi(sample2, (int8_t)((volmul2 >> 1) & 127));
++
++            int sample3 = addclip20(multiv3 >> 6, multiv4 >> 13, ((multiv4 >> 12) | (multiv3 >> 5)) & 1);
++
++            int pan = active ? ram2[1] : 0;
++            int rc = active ? ram2[2] : 0;
++
++            int sampl = multi(sample3, (int8_t)((pan >> 8) & 255));
++            int sampr = multi(sample3, (int8_t)((pan >> 0) & 255));
++
++            int rc0 = multi(sample3, (int8_t)((rc >> 8) & 255)) >> 5; // reverb
++            int rc1 = multi(sample3, (int8_t)((rc >> 0) & 255)) >> 5; // chorus
++            
++            // ScalarAcc (round 3b): the scalar form of the chain-break idea
++            // (catalog B2, never tried as a scalar change). The original
++            // accumulates through MEMORY: per slot it loads and stores
++            // pcm.ram1[31][1], pcm.ram1[31][3], pcm.rcsum[0], pcm.rcsum[1]
++            // (8 AGU slots on a single-AGU core) and the stores alias the
++            // slot's own uint32 ram1 pointer, forcing reloads. Here each
++            // slot's exact terms (sx20(term) + cin, plus its slot2
++            // injection terms under the original two switches' mapping,
++            // merged) go to four register accumulators, combined once per
++            // tick. Exactness: addclip20(a, b, cin) = sx20(a) + sx20(b) +
++            // cin and sx20 is reduction mod 2^20 to [-2^19, 2^19), so the
++            // serial chain's value at any sx20 read equals the mod-2^20 sum
++            // of all raw terms and cin bits regardless of grouping; every
++            // downstream reader of accum_l/r and rcsum observes them through
++            // sx20 (addclip20 / multi) or through write_mask (low bits).
++            // Terms are < 2^19 + 1 in magnitude, <= 32 + 6 of them: no int32
++            // overflow. Same argument and same combine as splitacc/layout;
++            // ram1[31][1]/[3] stay at their pre-loop zero (valid only while
++            // slot 31 is outside the loop -- see the reg_slots guard).
++            const int32_t tL0 = sx20(sampl >> 6) + ((sampl >> 5) & 1);
++            const int32_t tR0 = sx20(sampr >> 6) + ((sampr >> 5) & 1);
++            const int32_t tC00 = sx20(rc0 >> 1) + (rc0 & 1);
++            const int32_t tC10 = sx20(rc1 >> 1) + (rc1 & 1);
++            int32_t tL = tL0, tR = tR0, tC0 = tC00, tC1 = tC10;
++            const int slot2 = (slot == pcm.config.reg_slots - 1) ? 31 : slot + 1;
++            switch (slot2)
++            {
++                case 17:
++                    tL += sx20(rcadd[0] >> 1) + (rcadd[0] & 1);
++                    tC1 += sx20(rcadd2[0] >> 1) + (rcadd2[0] & 1);
++                    break;
++                case 18:
++                    tR += sx20(rcadd[1] >> 1) + (rcadd[1] & 1);
++                    tC1 += sx20(rcadd2[1] >> 1) + (rcadd2[1] & 1);
++                    break;
++                case 21:
++                    tL += sx20(rcadd[2] >> 1) + (rcadd[2] & 1);
++                    tC0 += sx20(rcadd2[2] >> 1) + (rcadd2[2] & 1);
++                    break;
++                case 22:
++                    tR += sx20(rcadd[3] >> 1) + (rcadd[3] & 1);
++                    tC1 += sx20(rcadd2[3] >> 1) + (rcadd2[3] & 1);
++                    break;
++                case 23:
++                    tL += sx20(rcadd[4] >> 1) + (rcadd[4] & 1);
++                    tC0 += sx20(rcadd2[4] >> 1) + (rcadd2[4] & 1);
++                    break;
++                case 31:
++                    tR += sx20(rcadd[5] >> 1) + (rcadd[5] & 1);
++                    tC1 += sx20(rcadd2[5] >> 1) + (rcadd2[5] & 1);
++                    break;
++                default:
++                    break;
++            }
++            accL += tL;
++            accR += tR;
++            accC0 += tC0;
++            accC1 += tC1;
++
++            if (key && pcm.nfs)
++            {
++                ram2[7] &= ~0xf020;
++                ram2[7] |= (uint16_t)(((usenew || kon) ? newnibble : old_nibble) << 12);
++
++                // update key
++                ram2[7] |= (uint16_t)(key << 5);
++            }
++
++            if (!active)
++            {
++                if (pcm.nfs)
++                {
++                    ram1[1] = 0;
++                    ram1[3] = 0;
++                    ram1[5] = 0;
++                }
++
++                ram2[8] = 0;
++                ram2[9] = 0;
++                ram2[10] = 0;
++            }
++        }
++        // ScalarAcc combine: congruent mod 2^20 to the original serial
++        // sums; every reader observes them through sx20 or write_mask.
++        pcm.accum_l = accL;
++        pcm.accum_r = accR;
++        pcm.rcsum[0] = accC0;
++        pcm.rcsum[1] = accC1;
++        }
++        else
++        {
++        for (int slot = 0; slot < pcm.config.reg_slots; slot++)
++        {
++            uint32_t *ram1 = pcm.ram1[slot];
++            uint16_t *ram2 = pcm.ram2[slot];
++            const bool okey = (ram2[7] & 0x20) != 0;
++            const bool key = (voice_active >> slot) & 1;
++
++            const bool active = okey && key;
++            const bool kon = key && !okey;
++
++            // address generator
++
++            bool b15 = (ram2[8] & 0x8000) != 0; // 0
++            const bool b6 = (ram2[7] & 0x40) != 0; // 1
++            const bool b7 = (ram2[7] & 0x80) != 0; // 1
++            int hiaddr = (ram2[7] >> 8) & 15; // 1
++            // RomFast (round 3b): resolve PCM_ReadROM's bank switch once per
++            // slot; the 5 fetches below become select + indexed load.
++            // PCM_RomFetch falls back to PCM_ReadROM for anything the fast
++            // path does not cover, so the bytes are PCM_ReadROM's exactly.
++            const PCMRomBanks rombanks = PCM_RomBanks(pcm, hiaddr);
++            int old_nibble = (ram2[7] >> 12) & 15; // 1
++
++            int address = (int)ram1[4]; // 0
++            int address_end = (int)ram1[0]; // 1 or 2
++            int address_loop = (int)ram1[2]; // 2 or 1
++
++            int cmp1 = b15 ? address_loop : address_end;
++            int cmp2 = address;
++            const bool nibble_cmp1 = (cmp1 & 0xffff0) == (cmp2 & 0xffff0); // 2
++            bool irq_flag = 0;
++
++            // fixme:
++            if (kon)
++                irq_flag = ((cmp1 + address_loop) & 0x100000) != 0;
++            else
++                irq_flag = ((address + ((-address_loop) & 0xfffff)) & 0x100000) != 0;
++            irq_flag ^= b7;
++
++            int nibble_address = (!b6 && nibble_cmp1) ? address_loop : address; // 3
++            const bool address_b4 = (nibble_address & 0x10) != 0;
++            int wave_address = nibble_address >> 5;
++            const bool xor2 = (address_b4 ^ b7);
++            const bool check1 = xor2 && active;
++            const bool xor1 = (b15 ^ !nibble_cmp1);
++            const bool nibble_add = b6 ? check1 && xor1 : (!nibble_cmp1 && check1);
++            const bool nibble_subtract = b6 && !xor1 && active && !xor2;
++            if (b7)
++                wave_address -= nibble_add - nibble_subtract;
++            else
++                wave_address += nibble_add - nibble_subtract;
++            wave_address &= 0xfffff;
++
++            int newnibble = PCM_RomFetch(pcm, rombanks, hiaddr, (uint32_t)(wave_address));
++            const bool newnibble_sel = address_b4 ^ ((b6 || !nibble_cmp1) && okey);
++            if (newnibble_sel)
++                newnibble = (newnibble >> 4) & 15;
++            else
++                newnibble &= 15;
++
++            int sub_phase = (ram2[8] & 0x3fff); // 1
++            int interp_ratio = (sub_phase >> 7) & 127;
++            sub_phase += pcm.ram2[ram2[7] & 31][0]; // 5
++            int sub_phase_of = (sub_phase >> 14) & 7;
++            if (pcm.nfs)
++            {
++                ram2[8] &= ~0x3fff;
++                ram2[8] |= sub_phase & 0x3fff;
++            }
++
++
++            // address 0
++            int address_cnt = address;
++            int samp0 = (int8_t)PCM_RomFetch(pcm, rombanks, hiaddr, (uint32_t)(address_cnt)); // 18
++
++            cmp1 = address;
++            cmp2 = address_cnt;
++            const bool nibble_cmp2 = (cmp1 & 0xffff0) == (cmp2 & 0xffff0); // 8
++            cmp1 = b15 ? address_loop : address_end;
++            cmp2 = address_cnt;
++            bool address_cmp = (cmp1 & 0xfffff) == (cmp2 & 0xfffff); // 9
++
++            int next_address = address_cnt; // 11
++            bool usenew = !nibble_cmp2;
++            bool next_b15 = b15;
++
++            cmp1 = (!b6 && address_cmp) ? address_loop : address_cnt;
++            cmp2 = address_cnt;
++            int address_cnt2 = (kon || (!b6 && address_cmp)) ? cmp1 : cmp2;
++
++            bool address_add = (!address_cmp && b6 && !b15) || (!address_cmp && !b6);
++            bool address_sub = !address_cmp && b6 && b15;
++            if (b7)
++                address_cnt2 -= address_add - address_sub;
++            else
++                address_cnt2 += address_add - address_sub;
++            address_cnt = address_cnt2 & 0xfffff; // 11
++            b15 = b6 && (b15 ^ address_cmp); // 11
++
++            int samp1 = (int8_t)PCM_RomFetch(pcm, rombanks, hiaddr, (uint32_t)(address_cnt)); // 20
++
++            cmp1 = address;
++            cmp2 = address_cnt;
++            const bool nibble_cmp3 = (cmp1 & 0xffff0) == (cmp2 & 0xffff0); // 12
++            cmp1 = b15 ? address_loop : address_end;
++            cmp2 = address_cnt;
++            address_cmp = (cmp1 & 0xfffff) == (cmp2 & 0xfffff); // 13
++
++            if (sub_phase_of >= 1)
++            {
++                next_address = address_cnt; // 13
++                usenew = !nibble_cmp3;
++                next_b15 = b15;
++            }
++
++            cmp1 = (!b6 && address_cmp) ? address_loop : address_cnt;
++            cmp2 = address_cnt;
++            address_cnt2 = (kon || (!b6 && address_cmp)) ? cmp1 : cmp2;
++
++            address_add = (!address_cmp && b6 && !b15) || (!address_cmp && !b6);
++            address_sub = !address_cmp && b6 && b15;
++            if (b7)
++                address_cnt2 -= address_add - address_sub;
++            else
++                address_cnt2 += address_add - address_sub;
++            address_cnt = address_cnt2 & 0xfffff; // 15
++            b15 = b6 && (b15 ^ address_cmp); // 15
++
++            int samp2 = (int8_t)PCM_RomFetch(pcm, rombanks, hiaddr, (uint32_t)(address_cnt)); // 1
++
++            cmp1 = address;
++            cmp2 = address_cnt;
++            const bool nibble_cmp4 = (cmp1 & 0xffff0) == (cmp2 & 0xffff0); // 16
++            cmp1 = b15 ? address_loop : address_end;
++            cmp2 = address_cnt;
++            address_cmp = (cmp1 & 0xfffff) == (cmp2 & 0xfffff); // 17
++
++            if (sub_phase_of >= 2)
++            {
++                next_address = address_cnt; // 17
++                usenew = !nibble_cmp4;
++                next_b15 = b15;
++            }
++
++            cmp1 = (!b6 && address_cmp) ? address_loop : address_cnt;
++            cmp2 = address_cnt;
++            address_cnt2 = (kon || (!b6 && address_cmp)) ? cmp1 : cmp2;
++
++            address_add = (!address_cmp && b6 && !b15) || (!address_cmp && !b6);
++            address_sub = !address_cmp && b6 && b15;
++            if (b7)
++                address_cnt2 -= address_add - address_sub;
++            else
++                address_cnt2 += address_add - address_sub;
++            address_cnt = address_cnt2 & 0xfffff; // 19
++            b15 = b6 && (b15 ^ address_cmp); // 19
++
++            int samp3 = (int8_t)PCM_RomFetch(pcm, rombanks, hiaddr, (uint32_t)(address_cnt)); // 5
++
++            cmp1 = address;
++            cmp2 = address_cnt;
++            const bool nibble_cmp5 = (cmp1 & 0xffff0) == (cmp2 & 0xffff0); // 20
++            cmp1 = b15 ? address_loop : address_end;
++            cmp2 = address_cnt;
++            address_cmp = (cmp1 & 0xfffff) == (cmp2 & 0xfffff); // 21
++
++            if (sub_phase_of >= 3)
++            {
++                next_address = address_cnt; // 21
++                usenew = !nibble_cmp5;
++                next_b15 = b15;
++            }
++
++            cmp1 = (!b6 && address_cmp) ? address_loop : address_cnt;
++            cmp2 = address_cnt;
++            address_cnt2 = (kon || (!b6 && address_cmp)) ? cmp1 : cmp2;
++
++            address_add = (!address_cmp && b6 && !b15) || (!address_cmp && !b6);
++            address_sub = !address_cmp && b6 && b15;
++            if (b7)
++                address_cnt2 -= address_add - address_sub;
++            else
++                address_cnt2 += address_add - address_sub;
++            address_cnt = address_cnt2 & 0xfffff; // 23
++            // b15 = b6 && (b15 ^ address_cmp); // 23
++
++            cmp1 = address;
++            cmp2 = address_cnt;
++            const bool nibble_cmp6 = (cmp1 & 0xffff0) == (cmp2 & 0xffff0); // 24
++
++            if (sub_phase_of >= 4)
++            {
++                next_address = address_cnt; // 1
++                usenew = !nibble_cmp6;
++                // b15 is not updated?
++            }
++
++            if (active && pcm.nfs)
++                ram1[4] = (uint32_t)next_address;
++
++            if (pcm.nfs)
++            {
++                ram2[8] &= ~0x8000;
++                ram2[8] |= (uint16_t)(next_b15 << 15);
++            }
++
++            // dpcm
++
++            // 18
++            int reference = (int)ram1[5];
++
++            // 19
++            int preshift = samp0 << 10;
++            int select_nibble = nibble_cmp2 ? old_nibble : newnibble;
++            int shift = (10 - select_nibble) & 15;
++
++            int shifted = (preshift << 1) >> shift;
++
++            if (sub_phase_of >= 1)
++                reference = addclip20(reference, shifted >> 1, shifted & 1);
++
++            preshift = samp1 << 10;
++            select_nibble = nibble_cmp3 ? old_nibble : newnibble;
++            shift = (10 - select_nibble) & 15;
++
++            shifted = (preshift << 1) >> shift;
++
++            if (sub_phase_of >= 2)
++                reference = addclip20(reference, shifted >> 1, shifted & 1);
++
++            preshift = samp2 << 10;
++            select_nibble = nibble_cmp4 ? old_nibble : newnibble;
++            shift = (10 - select_nibble) & 15;
++
++            shifted = (preshift << 1) >> shift;
++
++            if (sub_phase_of >= 3)
++                reference = addclip20(reference, shifted >> 1, shifted & 1);
++
++            preshift = samp3 << 10;
++            select_nibble = nibble_cmp5 ? old_nibble : newnibble;
++            shift = (10 - select_nibble) & 15;
++
++            shifted = (preshift << 1) >> shift;
++
++            if (sub_phase_of >= 4)
++                reference = addclip20(reference, shifted >> 1, shifted & 1);
++
++            // interpolation
++
++            int test = (int)ram1[5];
++
++            int step0 = multi(interp_lut[0][interp_ratio] << 6, (int8_t)samp0) >> 8;
++            select_nibble = nibble_cmp2 ? old_nibble : newnibble;
++            shift = (10 - select_nibble) & 15;
++            step0 =  (step0 << 1) >> shift;
++
++            test = addclip20(test, step0 >> 1, step0 & 1);
++
++
++            int step1 = multi(interp_lut[1][interp_ratio] << 6, (int8_t)samp1) >> 8;
++            select_nibble = nibble_cmp3 ? old_nibble : newnibble;
++            shift = (10 - select_nibble) & 15;
++            step1 = (step1 << 1) >> shift;
++
++            test = addclip20(test, step1 >> 1, step1 & 1);
++
++            int step2 = multi(interp_lut[2][interp_ratio] << 6, (int8_t)samp2) >> 8;
++            select_nibble = nibble_cmp4 ? old_nibble : newnibble;
++            shift = (10 - select_nibble) & 15;
++            step2 = (step2 << 1) >> shift;
++
++            int reg1 = (int)ram1[1];
++            int reg3 = (int)ram1[3];
++            int reg2_6 = (ram2[6] >> 8) & 127;
++
++            test = addclip20(test, step2 >> 1, step2 & 1);
++
++            int filter = ram2[11];
++            int v3;
++
++            if (pcm.mcu->is_mk1)
++            {
++                int mult1 = multi(reg1, (int8_t)(filter >> 8)); // 8
++                int mult2 = multi(reg1, (int8_t)((filter >> 1) & 127)); // 9
++                int mult3 = multi(reg1, (int8_t)reg2_6); // 10
++
++                int v2 = addclip20(reg3, mult1 >> 6, (mult1 >> 5) & 1); // 9
++                int v1 = addclip20(v2, mult2 >> 13, (mult2 >> 12) & 1); // 10
++                int subvar = addclip20(v1, (mult3 >> 6), (mult3 >> 5) & 1); // 11
++
++                ram1[3] = (uint32_t)v1;
++
++                v3 = addclip20(test, subvar ^ 0xfffff, 1); // 12
++
++                int mult4 = multi(v3, (int8_t)(filter >> 8));
++                int mult5 = multi(v3, (int8_t)((filter >> 1) & 127));
++                int v4 = addclip20(reg1, mult4 >> 6, (mult4 >> 5) & 1); // 14
++                int v5 = addclip20(v4, mult5 >> 13, (mult5 >> 12) & 1); // 15
++
++                ram1[1] = (uint32_t)v5;
++            }
++            else
++            {
++                // hack: use 32-bit math to avoid overflow
++                int mult1 = reg1 * (int8_t)(filter >> 8); // 8
++                int mult2 = reg1 * (int8_t)((filter >> 1) & 127); // 9
++                int mult3 = reg1 * (int8_t)reg2_6; // 10
++
++                int v2 = reg3 + (mult1 >> 6) + ((mult1 >> 5) & 1); // 9
++                int v1 = v2 + (mult2 >> 13) + ((mult2 >> 12) & 1); // 10
++                int subvar = v1 + (mult3 >> 6) + ((mult3 >> 5) & 1); // 11
++
++                ram1[3] = (uint32_t)v1;
++
++                int tests = test;
++                tests <<= 12;
++                tests >>= 12;
++
++                v3 = tests - subvar; // 12
++
++                int mult4 = v3 * (int8_t)(filter >> 8);
++                int mult5 = v3 * (int8_t)((filter >> 1) & 127);
++                int v4 = reg1 + (mult4 >> 6) + ((mult4 >> 5) & 1); // 14
++                int v5 = v4 + (mult5 >> 13) + ((mult5 >> 12) & 1); // 15
++
++                ram1[1] = (uint32_t)v5;
++            }
++
++
++            ram1[5] = (uint32_t)reference;
++
++            if (active && (ram2[6] & 1) != 0 && (ram2[8] & 0x4000) == 0 && !pcm.irq_assert && irq_flag)
++            {
++                //fprintf(stderr, "irq voice %i\n", slot);
++                if (pcm.nfs)
++                    ram2[8] |= 0x4000;
++                pcm.irq_assert = true;
++                pcm.irq_channel = (uint8_t)slot;
++                if (pcm.mcu->is_jv880)
++                    MCU_GA_SetGAInt(*pcm.mcu, 5, 1);
++                else
 +                    SplitAssertIrq0(pcm);
              }
  
              int volmul1 = 0;
-@@ -1560,6 +1613,12 @@ void PCM_Update(pcm_t& pcm, uint64_t cycles)
- 
-         pcm.cycles += pcm.mcu->is_jv880 ? (new_cycles * 25) / 29 : new_cycles;
-     }
+@@ -1548,6 +2162,10 @@ void PCM_Update(pcm_t& pcm, uint64_t cycles)
+                 ram2[10] = 0;
+             }
+         }
++        }
 +
-+    if (nProfileStart)
-+    {
-+        NukedProfile().nPCMUs += pProfileClock() - nProfileStart;
-+        ++NukedProfile().nPCMUpdates;
-+    }
- }
++        // PMU (shaped-var): voice-mix cycles for this batch,
++        // accumulated PER BATCH (not per tick) to keep read overhead
  
- uint32_t PCM_GetOutputFrequency(const pcm_t& pcm)
+         if (pcm.nfs)
+         {
 diff --git a/src/backend/pcm.h b/src/backend/pcm.h
-index 15f9a17..3f52d40 100644
+index 15f9a17..269a363 100644
 --- a/src/backend/pcm.h
 +++ b/src/backend/pcm.h
-@@ -82,6 +82,7 @@ struct pcm_t
+@@ -80,8 +80,26 @@ struct pcm_t
+ };
+ 
  void PCM_Write(pcm_t& pcm, uint32_t address, uint8_t data);
++
++// mt32-pi dual-core split (romacclz): one committed ram1/ram2 store,
++// produced by PCM_WriteDeferred instead of being applied, so the
++// PCM core can apply it at a tick boundary. value holds the full
++// write latch (ram1: 20 bits; ram2: low 16 bits).
++struct PCMDeferredStore
++{
++    uint8_t  is_ram2;
++    uint8_t  channel;
++    uint8_t  index;
++    uint8_t  pad;
++    uint32_t value;
++};
++// Exactly PCM_Write, except that a committing ram1/ram2 store is
++// returned in *out (and true) instead of being performed. Every other
++// effect (latches, voice mask, wave ROM, config) is applied as usual.
++bool PCM_WriteDeferred(pcm_t& pcm, uint32_t address, uint8_t data, PCMDeferredStore* out);
  uint8_t PCM_Read(pcm_t& pcm, uint32_t address);
  void PCM_Init(pcm_t& pcm, mcu_t& mcu);
 +void PCM_Reset(pcm_t& pcm);
@@ -1646,38 +2479,44 @@ index 15f9a17..3f52d40 100644
  void PCM_GetConfig(PCM_Config& config, uint8_t config_byte);
 diff --git a/src/backend/split_thread_circle.h b/src/backend/split_thread_circle.h
 new file mode 100644
-index 0000000..3220b2c
+index 0000000..ee9abaf
 --- /dev/null
 +++ b/src/backend/split_thread_circle.h
-@@ -0,0 +1,279 @@
+@@ -0,0 +1,348 @@
 +/*
-+ * mt32-pi dual-core Nuked-SC55 split: TRIM sync profile.
++ * mt32-pi dual-core Nuked-SC55 split: ROMACCLZ sync (trim + FIFO).
 + *
-+ * One shared pcm_t, no shadows, no FIFO, no RPC. Core 2 (the audio
++ * One shared pcm_t, no shadows, no RPC, no lock. Core 2 (the audio
 + * core) steps the H8 MCU and RELEASE-publishes its cycle count every
 + * 8 steps; core 3 (the PCM core) renders bounded batches of at most
-+ * 128 ticks, capped at published-800, under a raw TASK-level spinlock,
-+ * and posts samples into the synth's sample ring. Core 2 drains that
-+ * ring through the resampler. Core 2 never waits on core 3: the ring
-+ * fill level and the step budget bound the step loop, and a dead PCM
-+ * core shows up as measured starvation, never an infinite loop.
++ * 128 ticks, capped at published-800, and posts samples into the
++ * synth's sample ring. Core 2 drains that ring through the resampler.
 + *
-+ * This is the trim configuration proven on hardware in the standalone
-+ * dual-core test kernel (dual-core JV880 shape: shared pcm_t,
-+ * RELEASE-published cycles, ACQUIRE chase, 128-tick batches), with
-+ * the test-only machinery removed: no sync profiles, no tick
-+ * hand-off, no deferred-store FIFO, no no-lock experiment, no lazy
-+ * timer, no PCM variants, no PMU counters (contended lock timing uses
-+ * CTimer instead). The state layout keeps the trim cache-line
-+ * discipline: each writer group's fields sit on their own 64-byte
-+ * lines, separated by 64-byte spacing (spacing, not base alignment,
-+ * is what keeps two groups off one hardware line).
++ * The coordination is trim's (cache-line padding, publish every 8
++ * steps, ring Avail every 16, IRQ0 via flag, 64-poll idle backoff)
++ * with the batch spinlock replaced by a deferred-store FIFO (the
++ * measured-best combination from the standalone kernel's friend2 run:
++ * core 2 413 cycles/step with zero lock spins, core 3 14,189
++ * cycles/tick, -11% vs base). Core 2 never blocks: each committing
++ * ram1/ram2 store is pushed as a (ram, channel, index, value) record
++ * into a single-producer single-consumer FIFO; core 3 applies all
++ * pending records at each tick boundary, in order, before rendering
++ * the tick. That is exactly the single-threaded emulator's semantics:
++ * in MCU_Step a register write always lands BEFORE the PCM_Update
++ * that follows the step, i.e. at a tick boundary, never mid-tick.
++ * Core 2's own latch reads consult the pending records first (newest
++ * wins), so read-your-own-write holds exactly as in the
++ * single-threaded engine; words core 3 mutates (envelopes, addresses)
++ * read live, as they did before. A FIFO that ever fills (4096 pending
++ * stores; the hardware run's high-water was 127) waits at most 20 ms
++ * and then drops the store rather than hanging core 2; any non-zero
++ * fifo_full_waits or fifo_drops invalidates the run.
 + *
-+ * The split never sleeps: the raw lock spins on an atomic exchange
-+ * with a yield hint, and the fork's task loop yields to the scheduler
-+ * only in the PCM task's idle/parked branches, never inside a lock.
-+ * There is deliberately no sev/wfe handling here: no wait-for-event
-+ * exists on this path to lose a wakeup for.
++ * The state layout keeps the trim cache-line discipline: each writer
++ * group's fields sit on their own 64-byte lines, separated by 64-byte
++ * spacing (spacing, not base alignment, is what keeps two groups off
++ * one hardware line). There is deliberately no sev/wfe handling here:
++ * no wait-for-event exists on this path to lose a wakeup for.
 + */
 +
 +#ifndef _split_thread_circle_h
@@ -1709,15 +2548,6 @@ index 0000000..3220b2c
 +// Trim split state. See the file comment for the layout discipline.
 +struct alignas(64) ThreadSplitStateCircle
 +{
-+    // ---- own line: raw TASK-level spinlock word (0 = free, 1 = held).
-+    // Nothing else lives on this line. Acquired via atomic exchange;
-+    // waiters spin on a relaxed load + yield hint. No WFE, no sleep,
-+    // no CSpinLock, no critical section.
-+    alignas(64) uint32_t raw_lock{0};
-+    // Diagnostic: set (never cleared) when a core-2 lock acquire has
-+    // spun for more than ~50 ms. A batch is at most 128 ticks (~4 ms),
-+    // so this should never fire on a healthy run.
-+    volatile uint32_t lock_stall{0};
 +
 +    // ---- own line: core 2 -> core 3 published cycle count.
 +    // Plain field, accessed ONLY via __atomic builtins cross-core:
@@ -1729,51 +2559,120 @@ index 0000000..3220b2c
 +    volatile uint64_t pcm_task_us{0};
 +    volatile uint64_t max_pcm_lag{0};
 +    volatile uint64_t ticks{0};          // PCM ticks rendered (counted in DrainBeforeTick)
++    volatile uint64_t fifo_tail{0};      // FIFO consumer index (core 3)
 +    // IRQ0 request flag: core 3 sets 1 (RELEASE) when a voice-end IRQ
 +    // is asserted; core 2 folds it into interrupt_pending at the top
 +    // of its next step.
 +    volatile uint8_t  irq0_req{0};
 +    // Core-3 progress marker for diagnostics: 0 parked, 1 idle poll,
-+    // 2 about to take the batch lock, 3 inside PCM_Update, 4 releasing.
++    // 2 about to render, 3 inside PCM_Update, 4 batch done.
 +    volatile uint8_t  core3_phase{0};
 +
 +    // ---- line: core-2-written, core-2-read (diag snapshots) ----
-+    alignas(64) volatile uint64_t lock_waits{0};      // every core-2 lock op
-+    volatile uint64_t lock_contended{0};              // core-2 lock ops whose first try failed
-+    volatile uint64_t lock_wait_us{0};                // core-2 spin time, contended ops only (CTimer)
-+    volatile uint64_t publishes{0};                   // cycles_pub RELEASE stores
++    alignas(64) volatile uint64_t publishes{0};       // cycles_pub RELEASE stores
 +    volatile uint64_t irq0_folded{0};                 // IRQ0 flags folded by core 2
++    volatile uint64_t fifo_full_waits{0};             // FIFO pushes that had to wait for core 3 (must be 0)
++    volatile uint64_t fifo_hw{0};                     // FIFO depth high-water mark
++
++    // ---- line: FIFO producer index + core-2-private caches ----
++    alignas(64) volatile uint64_t fifo_head{0};       // FIFO producer index (core 2)
++    uint64_t fifo_tail_cache{0};                      // core-2 private copy of fifo_tail
++    volatile uint64_t fifo_drops{0};                  // stores dropped after a bounded full-wait (core 3 dead); must be 0
 +
 +    // Batch discipline: a tick is at most (31+1)*25 = 800 cycles, and
 +    // a batch renders at most 128 ticks (the 128-sample bound).
 +    static constexpr uint64_t MaxTickCycles = 800;
 +    static constexpr uint64_t MaxBatchTicks = 128;
 +
-+    // --- raw lock primitives ---
-+    bool RawTryAcquire()
++    // Deferred-store FIFO: 4096 records, power of two. Written by
++    // core 2, read by core 3, on its own cache lines.
++    static constexpr uint32_t SplitFifoSize = 4096;
++    static constexpr uint32_t SplitFifoMask = SplitFifoSize - 1;
++    alignas(64) PCMDeferredStore fifo[SplitFifoSize]{};
++
++    // Apply every pending deferred store, core 3, tick boundary. One
++    // ACQUIRE load of the producer index per tick in the common
++    // (empty) case.
++    void FifoDrain(pcm_t& pcm)
 +    {
-+        return __atomic_exchange_n(&raw_lock, 1u, __ATOMIC_ACQUIRE) == 0u;
-+    }
-+    void RawAcquire()
-+    {
-+        while (!RawTryAcquire())
++        uint64_t nTail = fifo_tail;
++        const uint64_t nHead = __atomic_load_n(&fifo_head, __ATOMIC_ACQUIRE);
++        if (nHead == nTail)
++            return;
++        while (nTail != nHead)
 +        {
-+            while (__atomic_load_n(&raw_lock, __ATOMIC_RELAXED) != 0u)
-+                SplitPause();
++            const PCMDeferredStore& st = fifo[nTail & SplitFifoMask];
++            if (st.is_ram2)
++                pcm.ram2[st.channel][st.index] = static_cast<uint16_t>(st.value);
++            else
++                pcm.ram1[st.channel][st.index] = st.value;
++            ++nTail;
 +        }
++        __atomic_store_n(&fifo_tail, nTail, __ATOMIC_RELEASE);
 +    }
-+    void RawRelease()
++
++    // Push one deferred store (core 2). If the FIFO is full (4096
++    // pending stores -- core 3 drains every tick, so this only happens
++    // when core 3 has stopped) it waits for core 3 for at most 20 ms
++    // and counts the wait; if core 3 is still not draining, the store
++    // is DROPPED and counted (fifo_drops) rather than hanging core 2
++    // forever. Any non-zero fifo_drops invalidates the run.
++    void FifoPush(const PCMDeferredStore& st)
 +    {
-+        __atomic_store_n(&raw_lock, 0u, __ATOMIC_RELEASE);
++        const uint64_t nHead = fifo_head;
++        if (nHead - fifo_tail_cache >= SplitFifoSize)
++        {
++            fifo_tail_cache = __atomic_load_n(&fifo_tail, __ATOMIC_ACQUIRE);
++            if (nHead - fifo_tail_cache >= SplitFifoSize)
++            {
++                fifo_full_waits = fifo_full_waits + 1;
++                const uint64_t t0 = CTimer::Get()->GetClockTicks();
++                do
++                {
++                    SplitPause();
++                    fifo_tail_cache = __atomic_load_n(&fifo_tail, __ATOMIC_ACQUIRE);
++                    if (CTimer::Get()->GetClockTicks() - t0 >= 20000ULL)
++                    {
++                        fifo_drops = fifo_drops + 1;
++                        return;
++                    }
++                } while (nHead - fifo_tail_cache >= SplitFifoSize);
++            }
++        }
++        fifo[nHead & SplitFifoMask] = st;
++        __atomic_store_n(&fifo_head, nHead + 1, __ATOMIC_RELEASE);
++        const uint64_t nDepth = nHead + 1 - fifo_tail_cache;
++        if (nDepth > fifo_hw)
++            fifo_hw = nDepth;
++    }
++
++    // Core-2 read-your-own-write overlay: the newest pending store to
++    // (ram, channel, index), if any. Scans newest to oldest; the FIFO
++    // is usually empty or a few records deep.
++    bool FifoLookup(bool bRam2, uint8_t nChannel, uint8_t nIndex, uint32_t* pValue)
++    {
++        const uint64_t nHead = fifo_head;
++        fifo_tail_cache = __atomic_load_n(&fifo_tail, __ATOMIC_ACQUIRE);
++        uint64_t n = nHead;
++        while (n != fifo_tail_cache)
++        {
++            --n;
++            const PCMDeferredStore& st = fifo[n & SplitFifoMask];
++            if ((st.is_ram2 != 0) == bRam2 && st.channel == nChannel && st.index == nIndex)
++            {
++                *pValue = st.value;
++                return true;
++            }
++        }
++        return false;
 +    }
 +
 +    // Per-tick hook, called by PCM_Update at the top of each tick
-+    // (core 3). Trim counts ticks only; there is no FIFO to drain
-+    // and no tick hand-off.
++    // (core 3). Counts ticks and drains the FIFO at the tick boundary.
 +    void DrainBeforeTick(pcm_t& pcm)
 +    {
-+        (void)pcm;
 +        ticks = ticks + 1;
++        FifoDrain(pcm);
 +    }
 +
 +    // (Re)initialise from live backend state. The caller guarantees
@@ -1788,7 +2687,10 @@ index 0000000..3220b2c
 +        max_pcm_lag = 0;
 +        ticks = 0;
 +        irq0_req = 0;
-+        raw_lock = 0;
++        fifo_head = 0;
++        fifo_tail = 0;
++        fifo_tail_cache = 0;
++        fifo_hw = 0;
 +        core3_phase = 0;
 +    }
 +};
@@ -1797,42 +2699,6 @@ index 0000000..3220b2c
 +// nukedsc55synth.cpp); null whenever the split is inactive, in which
 +// case the backend calls PCM_Read/PCM_Write directly.
 +extern ThreadSplitStateCircle* g_splitT;
-+
-+// Core-2 lock path (trim: raw lock, contended-only timing via CTimer;
-+// the first try is untimed, so the common uncontended op costs one
-+// atomic exchange).
-+inline void SplitCore2Acquire(ThreadSplitStateCircle& s)
-+{
-+    if (s.RawTryAcquire())
-+    {
-+        s.lock_waits = s.lock_waits + 1;
-+        return;
-+    }
-+    s.lock_contended = s.lock_contended + 1;
-+    const uint64_t c0 = CTimer::Get()->GetClockTicks();
-+    uint64_t nSpins = 0;
-+    while (!s.RawTryAcquire())
-+    {
-+        while (__atomic_load_n(&s.raw_lock, __ATOMIC_RELAXED) != 0u)
-+        {
-+            SplitPause();
-+            // Stall flag: a batch is at most ~4 ms, so 50 ms of
-+            // spinning means core 3 is wedged, not slow. Diagnostic
-+            // only: the wait itself stays unbounded (a bounded lock
-+            // acquire could enter the critical section it guards).
-+            if ((++nSpins & 0xFFFFu) == 0u && s.lock_stall == 0u &&
-+                CTimer::Get()->GetClockTicks() - c0 >= 50000ULL)
-+                s.lock_stall = 1u;
-+        }
-+    }
-+    s.lock_wait_us = s.lock_wait_us + (CTimer::Get()->GetClockTicks() - c0);
-+    s.lock_waits = s.lock_waits + 1;
-+}
-+
-+inline void SplitCore2Release(ThreadSplitStateCircle& s)
-+{
-+    s.RawRelease();
-+}
 +
 +// Core 3's voice-end IRQ assert. Called at the PCM_Update assert site
 +// in place of the direct MCU_Interrupt_SetRequest(IRQ0, 1).
@@ -1861,11 +2727,17 @@ index 0000000..3220b2c
 +    }
 +}
 +
-+// MCU thread: direct register write into shared pcm state. Which
-+// writes COMMIT a ram1/ram2 store is backend PCM_Write verbatim:
++// MCU thread: register write into shared pcm state. Which writes
++// COMMIT a ram1/ram2 store is backend PCM_Write verbatim:
 +// ram1 (0x04-0x10, 0x24-0x30) commits iff (addr&3)==3;
 +// ram2 (0x10-0x20, 0x30-0x38) commits iff (addr&1)==1. Non-committing
 +// bytes only touch core-2-private latch state and never synchronize.
++// A committing store is deferred: PCM_WriteDeferred computes the
++// record (every other effect applied as usual) and core 2 pushes it;
++// core 3 applies it at the next tick boundary. No lock anywhere.
++// Defensive fallback: if PCM_WriteDeferred ever reports no record for
++// a committing write (it cannot, by the verbatim commit test), the
++// store is written directly rather than dropped.
 +inline void SkelPCMWrite(mcu_t& mcu, uint32_t addr, uint8_t value)
 +{
 +    addr &= 0x3f;
@@ -1878,23 +2750,26 @@ index 0000000..3220b2c
 +        return;
 +    }
 +    ThreadSplitStateCircle& s = *g_splitT;
-+    SplitCore2Acquire(s);
-+    PCM_Write(*mcu.pcm, addr, value);
-+    SplitCore2Release(s);
++    PCMDeferredStore st{};
++    if (PCM_WriteDeferred(*mcu.pcm, addr, value, &st))
++        s.FifoPush(st);
++    else
++        PCM_Write(*mcu.pcm, addr, value);
 +}
 +
-+// MCU thread: direct read from shared pcm state. Status reads
-+// (0x3c/0x3e, including the IRQ-ack clear) hold the state lock;
-+// all other reads are direct. The 0x3e ACK clears irq_assert with an
-+// atomic exchange (core 3 sets it with a byte store), and clears the
-+// interrupt request only if the flag was actually set.
++// MCU thread: read from shared pcm state. Status reads (0x3c/0x3e,
++// including the IRQ-ack clear) run lock-free: the 0x3e ACK clears
++// irq_assert with an atomic exchange (core 3 sets it with a byte
++// store), and clears the interrupt request only if the flag was
++// actually set. Latch reads (PCM_Read's ram1/ram2 branches) see pending
++// stores first (read-your-own-write); index derivations are PCM_Read
++// verbatim. All other reads are direct.
 +inline uint8_t SkelPCMRead(mcu_t& mcu, uint32_t addr)
 +{
 +    addr &= 0x3f;
 +    ThreadSplitStateCircle& s = *g_splitT;
 +    if (addr == 0x3c || addr == 0x3e)
 +    {
-+        SplitCore2Acquire(s);
 +        pcm_t& pcm = *mcu.pcm;
 +        uint8_t status = 0;
 +        if (addr == 0x3e)
@@ -1905,13 +2780,40 @@ index 0000000..3220b2c
 +        status |= pcm.irq_channel;
 +        if (pcm.voice_mask_updating)
 +            status |= 32;
-+        SplitCore2Release(s);
 +        return status;
++    }
++    if (s.fifo_head != s.fifo_tail_cache)
++    {
++        pcm_t& pcm = *mcu.pcm;
++        if (((addr >= 0x4 && addr < 0x10) || (addr >= 0x24 && addr < 0x30)) && (addr & 3) == 1)
++        {
++            int ix = 0;
++            if (addr & 32) ix |= 1;
++            if ((addr & 8) == 0) ix |= 4;
++            if ((addr & 4) == 0) ix |= 2;
++            uint32_t v;
++            if (s.FifoLookup(false, pcm.select_channel, static_cast<uint8_t>(ix), &v))
++            {
++                pcm.read_latch = v;
++                return 0;
++            }
++        }
++        else if (((addr >= 0x10 && addr < 0x20) || (addr >= 0x30 && addr < 0x38)) && (addr & 1) == 0)
++        {
++            int ix = (addr >> 1) & 7;
++            if (addr & 32) ix |= 8;
++            uint32_t v;
++            if (s.FifoLookup(true, pcm.select_channel, static_cast<uint8_t>(ix), &v))
++            {
++                pcm.read_latch = static_cast<uint16_t>(v);
++                return 0;
++            }
++        }
 +    }
 +    return PCM_Read(*mcu.pcm, addr);
 +}
 +
-+// Circle dispatch for the PCM call sites in mcu.cpp: trim split
++// Circle dispatch for the PCM call sites in mcu.cpp: FIFO split
 +// (MK1 only) when the split is active, direct otherwise.
 +inline void SplitPCMWrite(mcu_t& mcu, uint32_t addr, uint8_t value)
 +{
