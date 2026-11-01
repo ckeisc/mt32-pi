@@ -1319,8 +1319,7 @@ void CMT32Pi::SwitchSynth(TSynth NewSynth)
 	m_pCurrentSynth = pNewSynth;
 	const char* pMode = NewSynth == TSynth::MT32 ? "MT-32 mode" : (NewSynth == TSynth::EmuSC ? "EmuSC mode" : (NewSynth == TSynth::NukedSC55 ? "Nuked-SC55 mode" : "SoundFont mode"));
 	LOGNOTE("Switching to %s", pMode);
-	// No LCD notice for the switch: the mode print repeated on every
-	// switch and flashed the display (removed at Joe's request).
+	LCDLog(TLCDLogType::Notice, pMode);
 	CDiagLog::Get().LogLine("switch synth=%s", pMode);
 	// Split park/reactivate across the switch (trim): parking on
 	// switch-from stops core 3 consuming cycles and filling the
