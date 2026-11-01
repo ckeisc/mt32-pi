@@ -1,5 +1,5 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 637f3e2..ffbc162 100644
+index 637f3e2..949890e 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -44,11 +44,13 @@ else()
@@ -29,6 +29,18 @@ index 637f3e2..ffbc162 100644
      src/backend/pcm.cpp
      src/backend/rom_io.cpp
      src/backend/rom.cpp
+@@ -143,6 +146,11 @@ if(NUKED_ENABLE_DECODER2)
+ endif()
+ 
+ target_include_directories(nuked-sc55-backend PUBLIC "src/backend" "${CMAKE_CURRENT_BINARY_DIR}/backend")
++# mt32-pi dual-core split: the Circle-port split header includes Circle
++# headers (spinlock / synchronize / scheduler / timer); the backend
++# builds from the mt32-pi tree, so the Circle include dir is the
++# sibling circle-stdlib checkout.
++target_include_directories(nuked-sc55-backend PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../circle-stdlib/libs/circle/include")
+ target_compile_features(nuked-sc55-backend PRIVATE cxx_std_23)
+ target_enable_warnings(nuked-sc55-backend)
+ target_enable_conversion_warnings(nuked-sc55-backend)
 diff --git a/src/backend/decoder2/cache.h b/src/backend/decoder2/cache.h
 index 6d49868..68e7617 100644
 --- a/src/backend/decoder2/cache.h
@@ -90,10 +102,10 @@ index f2728ca..7592ab9 100644
  
  void Dis_SCB_F(DisassembleDecoder& decoder, uint8_t byte, DisassembledInstruction& instr)
 diff --git a/src/backend/emu.cpp b/src/backend/emu.cpp
-index 976c02c..43cc683 100644
+index 976c02c..dcb1a92 100644
 --- a/src/backend/emu.cpp
 +++ b/src/backend/emu.cpp
-@@ -17,6 +17,7 @@
+@@ -17,10 +17,12 @@
  
  #include "emu.h"
  #include "diagnostics.h"
@@ -101,7 +113,50 @@ index 976c02c..43cc683 100644
  #include "lcd.h"
  #include "mcu.h"
  #include "mcu_timer.h"
-@@ -159,8 +160,55 @@ void Emulator::PostSystemReset(EMU_SystemReset reset)
+ #include "pcm.h"
++#include "split_thread_circle.h"
+ #include "submcu.h"
+ #include <bit>
+ #include <fstream>
+@@ -70,6 +72,37 @@ void Emulator::Reset()
+     SM_Reset(*m_sm);
+ }
+ 
++// Full power-on reset for the split restart path. Reset() alone is
++// MCU_Reset + SM_Reset, which leaves the cycle counters at the old
++// song's end value (so the next song-end condition is immediately
++// true again) and leaves the firmware's SLEEP flag set (so the H8
++// never executes another instruction after a reset). Everything
++// below restores boot state; ROM images are kept. Must run while
++// core 3 is parked, never mid-batch.
++void Emulator::ResetForRestart()
++{
++    MCU_Reset(*m_mcu);   // registers, PC/CP from the reset vector, SR, device registers, timers
++    SM_Reset(*m_sm);
++    mcu_t& m = *m_mcu;
++    m.cycles            = 0;
++    m.sleep             = 0;
++    m.ex_ignore         = 0;
++    m.exception_pending = (MCU_Exception_Source)-1;
++    m.interrupt_pending = decltype(m.interrupt_pending){};
++    m.trapa_pending     = decltype(m.trapa_pending){};
++    m.uart_write_ptr    = 0;
++    m.uart_read_ptr     = 0;
++    m.uart_rx_byte      = 0;
++    m.uart_rx_delay     = 0;
++    m.uart_tx_delay     = 0;
++    for (bool& b : m.ga_int)
++        b = false;
++    m.ga_int_trigger    = 0;
++    m.ga_lcd_counter    = 0;
++    m.analog_end_time   = 0;
++    PCM_Reset(*m_pcm);
++}
++
+ bool Emulator::StartLCD()
+ {
+     return LCD_Start(*m_lcd);
+@@ -159,11 +192,68 @@ void Emulator::PostSystemReset(EMU_SystemReset reset)
      }
  }
  
@@ -157,8 +212,21 @@ index 976c02c..43cc683 100644
      MCU_Step(*m_mcu);
  }
  
++void Emulator::StepMCU()
++{
++    MCU_StepMCU(*m_mcu);
++}
++
++void Emulator::StepPeripherals()
++{
++    MCU_StepPeripherals(*m_mcu);
++}
++
+ void Emulator::SaveNVRAM()
+ {
+     // emulator was constructed, but never init
 diff --git a/src/backend/emu.h b/src/backend/emu.h
-index 006ebd0..30550e4 100644
+index 006ebd0..ec48e6c 100644
 --- a/src/backend/emu.h
 +++ b/src/backend/emu.h
 @@ -68,6 +68,12 @@ public:
@@ -174,6 +242,23 @@ index 006ebd0..30550e4 100644
      // Loads roms from buffers referenced by `info`. If the slot for a rom in `info` has a non-empty `rom_data`, it
      // will be loaded even if the romset doesn't require it.
      //
+@@ -87,6 +93,16 @@ public:
+ 
+     void Step();
+ 
++    // mt32-pi dual-core split: the two halves of Step() (see mcu.h),
++    // driven by the wrapper's two core tasks. Step() itself is
++    // unchanged (single-threaded path).
++    void StepMCU();
++    void StepPeripherals();
++
++    // Full power-on reset for the split restart path (see emu.cpp).
++    // Must run while core 3 is parked, never mid-batch.
++    void ResetForRestart();
++
+     mcu_t& GetMCU() { return *m_mcu; }
+     pcm_t& GetPCM() { return *m_pcm; }
+     lcd_t& GetLCD() { return *m_lcd; }
 diff --git a/src/backend/jit.cpp b/src/backend/jit.cpp
 new file mode 100644
 index 0000000..e11bcd8
@@ -1228,10 +1313,10 @@ index 5207950..d57dfd2 100644
  class LCD_Backend
  {
 diff --git a/src/backend/mcu.cpp b/src/backend/mcu.cpp
-index 41e6b9f..ceb6cc7 100644
+index 41e6b9f..1d10ca5 100644
 --- a/src/backend/mcu.cpp
 +++ b/src/backend/mcu.cpp
-@@ -20,11 +20,13 @@
+@@ -20,11 +20,14 @@
  
  #include "decoder2/dispatch.h"
  #include "diagnostics.h"
@@ -1240,12 +1325,31 @@ index 41e6b9f..ceb6cc7 100644
  #include "mcu_opcodes.h"
  #include "mcu_timer.h"
  #include "pcm.h"
++#include "split_thread_circle.h"
  #include "submcu.h"
 +#include "nuked_profile.h"
  
  void MCU_ErrorTrap(mcu_t& mcu)
  {
-@@ -643,6 +645,7 @@ uint32_t MCU_Read32(mcu_t& mcu, uint32_t address)
+@@ -459,7 +462,7 @@ uint8_t MCU_Read(mcu_t& mcu, uint32_t address)
+                 uint16_t base = mcu.is_jv880 ? 0xf000 : 0xe000;
+                 if (address >= base && address < (base | 0x400u))
+                 {
+-                    ret = PCM_Read(*mcu.pcm, address & 0x3f);
++                    ret = SplitPCMRead(mcu, address & 0x3f);
+                 }
+                 else if (!mcu.is_scb55 && address >= 0xec00u && address < 0xf000u)
+                 {
+@@ -495,7 +498,7 @@ uint8_t MCU_Read(mcu_t& mcu, uint32_t address)
+             {
+                 if (address >= 0xe000 && address < 0xe040)
+                 {
+-                    ret = PCM_Read(*mcu.pcm, address & 0x3f);
++                    ret = SplitPCMRead(mcu, address & 0x3f);
+                 }
+                 else if (address >= 0xff80)
+                 {
+@@ -643,6 +646,7 @@ uint32_t MCU_Read32(mcu_t& mcu, uint32_t address)
  
  void MCU_Write(mcu_t& mcu, uint32_t address, uint8_t value)
  {
@@ -1253,7 +1357,25 @@ index 41e6b9f..ceb6cc7 100644
      uint8_t page = (address >> 16) & 0xf;
      address &= 0xffff;
      if (page == 0)
-@@ -784,14 +787,38 @@ void MCU_Write16(mcu_t& mcu, uint32_t address, uint16_t value)
+@@ -678,7 +682,7 @@ void MCU_Write(mcu_t& mcu, uint32_t address, uint8_t value)
+                 }
+                 else if (address >= (base | 0x000u) && address < (base | 0x400u))
+                 {
+-                    PCM_Write(*mcu.pcm, address & 0x3f, value);
++                    SplitPCMWrite(mcu, address & 0x3f, value);
+                 }
+                 else if (!mcu.is_scb55 && address >= 0xec00 && address < 0xf000)
+                 {
+@@ -706,7 +710,7 @@ void MCU_Write(mcu_t& mcu, uint32_t address, uint8_t value)
+             {
+                 if (address >= 0xe000 && address < 0xe040)
+                 {
+-                    PCM_Write(*mcu.pcm, address & 0x3f, value);
++                    SplitPCMWrite(mcu, address & 0x3f, value);
+                 }
+                 else if (address >= 0xff80)
+                 {
+@@ -784,14 +788,38 @@ void MCU_Write16(mcu_t& mcu, uint32_t address, uint16_t value)
      MCU_Write(mcu, address + 1, (uint8_t)(value & 0xff));
  }
  
@@ -1296,7 +1418,16 @@ index 41e6b9f..ceb6cc7 100644
  
      if (mcu.sr & STATUS_T)
      {
-@@ -904,8 +931,13 @@ void MCU_Step(mcu_t& mcu)
+@@ -896,7 +924,7 @@ void MCU_UpdateUART_TX(mcu_t& mcu)
+     // fprintf(stderr, "tx:%x\n", mcu.dev_register[DEV_TDR]);
+ }
+ 
+-void MCU_Step(mcu_t& mcu)
++void MCU_StepMCU(mcu_t& mcu)
+ {
+     if (!mcu.ex_ignore)
+         MCU_Interrupt_Handle(mcu);
+@@ -904,15 +932,21 @@ void MCU_Step(mcu_t& mcu)
          mcu.ex_ignore = 0;
  
      if (!mcu.sleep)
@@ -1310,14 +1441,47 @@ index 41e6b9f..ceb6cc7 100644
      mcu.cycles += 12; // FIXME: assume 12 cycles per instruction
  
      // if (mcu.cycles % 24000000 == 0)
+     //     fprintf(stderr, "seconds: %i\n", (int)(mcu.cycles / 24000000));
++}
+ 
+-    PCM_Update(*mcu.pcm, mcu.cycles);
+-
++void MCU_StepPeripherals(mcu_t& mcu)
++{
+     TIMER_Clock(*mcu.timer, mcu.cycles);
+ 
+     if (!mcu.is_mk1 && !mcu.is_jv880 && !mcu.is_scb55)
+@@ -939,6 +973,13 @@ void MCU_Step(mcu_t& mcu)
+     }
+ }
+ 
++void MCU_Step(mcu_t& mcu)
++{
++    MCU_StepMCU(mcu);
++    PCM_Update(*mcu.pcm, mcu.cycles);
++    MCU_StepPeripherals(mcu);
++}
++
+ void MCU_PatchROM(mcu_t& mcu)
+ {
+     (void)mcu;
 diff --git a/src/backend/mcu.h b/src/backend/mcu.h
-index 6737cd6..a026090 100644
+index 6737cd6..94846de 100644
 --- a/src/backend/mcu.h
 +++ b/src/backend/mcu.h
-@@ -303,6 +303,20 @@ void MCU_Reset(mcu_t& mcu);
+@@ -302,6 +302,28 @@ void MCU_Init(mcu_t& mcu, submcu_t& sm, pcm_t& pcm, mcu_timer_t& timer, lcd_t& l
+ void MCU_Reset(mcu_t& mcu);
  void MCU_PatchROM(mcu_t& mcu);
  void MCU_Step(mcu_t& mcu);
- 
++// mt32-pi dual-core split: MCU_Step refactored verbatim into its MCU
++// half (interrupt + instruction + cycle advance) and its peripherals
++// half (timers + UART/subMCU + analog + LCD). MCU_Step is exactly
++// StepMCU + PCM_Update + StepPeripherals, so the single-threaded
++// path is unchanged; the split wrapper drives StepMCU +
++// StepPeripherals on the audio core while core 3 runs PCM_Update.
++void MCU_StepMCU(mcu_t& mcu);
++void MCU_StepPeripherals(mcu_t& mcu);
++
 +// mt32-pi: runtime-selectable H8 execution path. Both interpreters are
 +// compiled in; the selection is consulted per instruction in
 +// MCU_ReadInstruction and may be changed between steps (all state is
@@ -1331,10 +1495,9 @@ index 6737cd6..a026090 100644
 +
 +void MCU_SetH8Engine(H8Engine engine);
 +H8Engine MCU_GetH8Engine();
-+
+ 
  void MCU_ErrorTrap(mcu_t& mcu);
  
- uint8_t MCU_Read(mcu_t& mcu, uint32_t address);
 diff --git a/src/backend/nuked_profile.h b/src/backend/nuked_profile.h
 new file mode 100644
 index 0000000..9ea3a05
@@ -1368,18 +1531,57 @@ index 0000000..9ea3a05
 +NukedProfileClockFn NukedProfileClock();
 +NukedProfileData& NukedProfile();
 diff --git a/src/backend/pcm.cpp b/src/backend/pcm.cpp
-index b8a4e27..96f0d75 100644
+index b8a4e27..a899b0e 100644
 --- a/src/backend/pcm.cpp
 +++ b/src/backend/pcm.cpp
-@@ -23,6 +23,7 @@
+@@ -23,6 +23,8 @@
  #include "pcm.h"
  #include "mcu.h"
  #include "mcu_interrupt.h"
 +#include "nuked_profile.h"
++#include "split_thread_circle.h"
  #include <cstdint>
  #include <cstring>
  
-@@ -573,6 +574,11 @@ void PCM_GetConfig(PCM_Config& config, uint8_t config_byte)
+@@ -258,6 +260,37 @@ void PCM_Init(pcm_t& pcm, mcu_t& mcu)
+     pcm.mcu = &mcu;
+ }
+ 
++// Full power-on reset of the PCM state for the split restart path
++// (see Emulator::ResetForRestart): every voice/config/counter field
++// zeroed, ROM images untouched (they are pointers, not fields reset
++// here), the mcu <-> pcm linkage preserved.
++void PCM_Reset(pcm_t& pcm)
++{
++    memset(pcm.ram1, 0, sizeof(pcm.ram1));
++    memset(pcm.ram2, 0, sizeof(pcm.ram2));
++    memset(pcm.eram, 0, sizeof(pcm.eram));
++    pcm.cycles              = 0;
++    pcm.voice_mask          = 0;
++    pcm.voice_mask_pending  = 0;
++    pcm.write_latch         = 0;
++    pcm.read_latch          = 0;
++    pcm.wave_read_address   = 0;
++    pcm.tv_counter          = 0;
++    pcm.wave_byte_latch     = 0;
++    pcm.select_channel      = 0;
++    pcm.config_reg_3c       = 0;
++    pcm.config_reg_3d       = 0;
++    pcm.irq_channel         = 0;
++    pcm.irq_assert          = false;
++    pcm.voice_mask_updating = false;
++    pcm.nfs                 = false;
++    pcm.accum_l             = 0;
++    pcm.accum_r             = 0;
++    pcm.rcsum[0]            = 0;
++    pcm.rcsum[1]            = 0;
++    pcm.config              = PCM_Config{};
++}
++
+ // Sign-extends a 20-bit signed integer to a 32-bit signed integer.
+ constexpr inline int32_t sx20(int32_t in)
+ {
+@@ -573,8 +606,19 @@ void PCM_GetConfig(PCM_Config& config, uint8_t config_byte)
  
  void PCM_Update(pcm_t& pcm, uint64_t cycles)
  {
@@ -1390,8 +1592,34 @@ index b8a4e27..96f0d75 100644
 +
      while (pcm.cycles < cycles)
      {
++        // mt32-pi dual-core split (trim): count the tick for the
++        // split diag. No-op when the split is inactive (g_splitT
++        // null); the trim profile has no per-tick boundary work.
++        if (g_splitT)
++            g_splitT->DrainBeforeTick(pcm);
++
          const uint32_t voice_active = pcm.voice_mask & pcm.voice_mask_pending;
-@@ -1560,6 +1566,12 @@ void PCM_Update(pcm_t& pcm, uint64_t cycles)
+         { // final mixing
+             int shifter = pcm.ram2[30][10];
+@@ -1425,7 +1469,16 @@ void PCM_Update(pcm_t& pcm, uint64_t cycles)
+                 if (pcm.mcu->is_jv880)
+                     MCU_GA_SetGAInt(*pcm.mcu, 5, 1);
+                 else
+-                    MCU_Interrupt_SetRequest(*pcm.mcu, INTERRUPT_SOURCE_IRQ0, 1);
++                    // mt32-pi dual-core split (trim): the assert
++                    // travels to the MCU thread through the IRQ0 flag
++                    // when the split is live (MK1 only) -- the direct
++                    // SetRequest below must not run in that case, or
++                    // the PCM thread would write the MCU thread's
++                    // interrupt state (and the IRQ would be delivered
++                    // twice). Core 2 folds the flag into
++                    // interrupt_pending at the top of its next step.
++                    // With no split live, this is the direct call.
++                    SplitAssertIrq0(pcm);
+             }
+ 
+             int volmul1 = 0;
+@@ -1560,6 +1613,12 @@ void PCM_Update(pcm_t& pcm, uint64_t cycles)
  
          pcm.cycles += pcm.mcu->is_jv880 ? (new_cycles * 25) / 29 : new_cycles;
      }
@@ -1404,3 +1632,300 @@ index b8a4e27..96f0d75 100644
  }
  
  uint32_t PCM_GetOutputFrequency(const pcm_t& pcm)
+diff --git a/src/backend/pcm.h b/src/backend/pcm.h
+index 15f9a17..3f52d40 100644
+--- a/src/backend/pcm.h
++++ b/src/backend/pcm.h
+@@ -82,6 +82,7 @@ struct pcm_t
+ void PCM_Write(pcm_t& pcm, uint32_t address, uint8_t data);
+ uint8_t PCM_Read(pcm_t& pcm, uint32_t address);
+ void PCM_Init(pcm_t& pcm, mcu_t& mcu);
++void PCM_Reset(pcm_t& pcm);
+ void PCM_Update(pcm_t& pcm, uint64_t cycles);
+ uint32_t PCM_GetOutputFrequency(const pcm_t& pcm);
+ void PCM_GetConfig(PCM_Config& config, uint8_t config_byte);
+diff --git a/src/backend/split_thread_circle.h b/src/backend/split_thread_circle.h
+new file mode 100644
+index 0000000..3220b2c
+--- /dev/null
++++ b/src/backend/split_thread_circle.h
+@@ -0,0 +1,279 @@
++/*
++ * mt32-pi dual-core Nuked-SC55 split: TRIM sync profile.
++ *
++ * One shared pcm_t, no shadows, no FIFO, no RPC. Core 2 (the audio
++ * core) steps the H8 MCU and RELEASE-publishes its cycle count every
++ * 8 steps; core 3 (the PCM core) renders bounded batches of at most
++ * 128 ticks, capped at published-800, under a raw TASK-level spinlock,
++ * and posts samples into the synth's sample ring. Core 2 drains that
++ * ring through the resampler. Core 2 never waits on core 3: the ring
++ * fill level and the step budget bound the step loop, and a dead PCM
++ * core shows up as measured starvation, never an infinite loop.
++ *
++ * This is the trim configuration proven on hardware in the standalone
++ * dual-core test kernel (dual-core JV880 shape: shared pcm_t,
++ * RELEASE-published cycles, ACQUIRE chase, 128-tick batches), with
++ * the test-only machinery removed: no sync profiles, no tick
++ * hand-off, no deferred-store FIFO, no no-lock experiment, no lazy
++ * timer, no PCM variants, no PMU counters (contended lock timing uses
++ * CTimer instead). The state layout keeps the trim cache-line
++ * discipline: each writer group's fields sit on their own 64-byte
++ * lines, separated by 64-byte spacing (spacing, not base alignment,
++ * is what keeps two groups off one hardware line).
++ *
++ * The split never sleeps: the raw lock spins on an atomic exchange
++ * with a yield hint, and the fork's task loop yields to the scheduler
++ * only in the PCM task's idle/parked branches, never inside a lock.
++ * There is deliberately no sev/wfe handling here: no wait-for-event
++ * exists on this path to lose a wakeup for.
++ */
++
++#ifndef _split_thread_circle_h
++#define _split_thread_circle_h
++
++#include <cstdint>
++
++#include <circle/timer.h>
++
++#include "mcu.h"
++#include "mcu_interrupt.h"
++#include "pcm.h"
++
++// Local cross-core barrier ("dmb ish": inner-shareable, the right
++// domain for visibility between cores of one SoC).
++static inline void SplitDMB()
++{
++    __asm__ volatile ("dmb ish" ::: "memory");
++}
++
++// Scheduler-free pause: ARM YIELD hint. Used inside lock spins and
++// the PCM task's idle backoff; the fork's task loop yields to the
++// scheduler separately when the PCM task has no work at all.
++static inline void SplitPause()
++{
++    __asm__ volatile ("yield" ::: "memory");
++}
++
++// Trim split state. See the file comment for the layout discipline.
++struct alignas(64) ThreadSplitStateCircle
++{
++    // ---- own line: raw TASK-level spinlock word (0 = free, 1 = held).
++    // Nothing else lives on this line. Acquired via atomic exchange;
++    // waiters spin on a relaxed load + yield hint. No WFE, no sleep,
++    // no CSpinLock, no critical section.
++    alignas(64) uint32_t raw_lock{0};
++    // Diagnostic: set (never cleared) when a core-2 lock acquire has
++    // spun for more than ~50 ms. A batch is at most 128 ticks (~4 ms),
++    // so this should never fire on a healthy run.
++    volatile uint32_t lock_stall{0};
++
++    // ---- own line: core 2 -> core 3 published cycle count.
++    // Plain field, accessed ONLY via __atomic builtins cross-core:
++    // core 2 stores with RELEASE, core 3 loads with ACQUIRE.
++    alignas(64) uint64_t cycles_pub{0};
++
++    // ---- line: core-3-written, core-2-read ----
++    alignas(64) volatile uint64_t pcm_rendered{0};
++    volatile uint64_t pcm_task_us{0};
++    volatile uint64_t max_pcm_lag{0};
++    volatile uint64_t ticks{0};          // PCM ticks rendered (counted in DrainBeforeTick)
++    // IRQ0 request flag: core 3 sets 1 (RELEASE) when a voice-end IRQ
++    // is asserted; core 2 folds it into interrupt_pending at the top
++    // of its next step.
++    volatile uint8_t  irq0_req{0};
++    // Core-3 progress marker for diagnostics: 0 parked, 1 idle poll,
++    // 2 about to take the batch lock, 3 inside PCM_Update, 4 releasing.
++    volatile uint8_t  core3_phase{0};
++
++    // ---- line: core-2-written, core-2-read (diag snapshots) ----
++    alignas(64) volatile uint64_t lock_waits{0};      // every core-2 lock op
++    volatile uint64_t lock_contended{0};              // core-2 lock ops whose first try failed
++    volatile uint64_t lock_wait_us{0};                // core-2 spin time, contended ops only (CTimer)
++    volatile uint64_t publishes{0};                   // cycles_pub RELEASE stores
++    volatile uint64_t irq0_folded{0};                 // IRQ0 flags folded by core 2
++
++    // Batch discipline: a tick is at most (31+1)*25 = 800 cycles, and
++    // a batch renders at most 128 ticks (the 128-sample bound).
++    static constexpr uint64_t MaxTickCycles = 800;
++    static constexpr uint64_t MaxBatchTicks = 128;
++
++    // --- raw lock primitives ---
++    bool RawTryAcquire()
++    {
++        return __atomic_exchange_n(&raw_lock, 1u, __ATOMIC_ACQUIRE) == 0u;
++    }
++    void RawAcquire()
++    {
++        while (!RawTryAcquire())
++        {
++            while (__atomic_load_n(&raw_lock, __ATOMIC_RELAXED) != 0u)
++                SplitPause();
++        }
++    }
++    void RawRelease()
++    {
++        __atomic_store_n(&raw_lock, 0u, __ATOMIC_RELEASE);
++    }
++
++    // Per-tick hook, called by PCM_Update at the top of each tick
++    // (core 3). Trim counts ticks only; there is no FIFO to drain
++    // and no tick hand-off.
++    void DrainBeforeTick(pcm_t& pcm)
++    {
++        (void)pcm;
++        ticks = ticks + 1;
++    }
++
++    // (Re)initialise from live backend state. The caller guarantees
++    // core 3 is parked and the MCU thread is not stepping.
++    // Cumulative counters are deliberately NOT reset (the app
++    // snapshots them per window).
++    void InitFromPCM(pcm_t& pcm, mcu_t& mcu)
++    {
++        cycles_pub = (uint64_t)mcu.cycles;
++        pcm_rendered = pcm.cycles;
++        pcm_task_us = 0;
++        max_pcm_lag = 0;
++        ticks = 0;
++        irq0_req = 0;
++        raw_lock = 0;
++        core3_phase = 0;
++    }
++};
++
++// The split state instance. Defined by the synth (g_splitT in
++// nukedsc55synth.cpp); null whenever the split is inactive, in which
++// case the backend calls PCM_Read/PCM_Write directly.
++extern ThreadSplitStateCircle* g_splitT;
++
++// Core-2 lock path (trim: raw lock, contended-only timing via CTimer;
++// the first try is untimed, so the common uncontended op costs one
++// atomic exchange).
++inline void SplitCore2Acquire(ThreadSplitStateCircle& s)
++{
++    if (s.RawTryAcquire())
++    {
++        s.lock_waits = s.lock_waits + 1;
++        return;
++    }
++    s.lock_contended = s.lock_contended + 1;
++    const uint64_t c0 = CTimer::Get()->GetClockTicks();
++    uint64_t nSpins = 0;
++    while (!s.RawTryAcquire())
++    {
++        while (__atomic_load_n(&s.raw_lock, __ATOMIC_RELAXED) != 0u)
++        {
++            SplitPause();
++            // Stall flag: a batch is at most ~4 ms, so 50 ms of
++            // spinning means core 3 is wedged, not slow. Diagnostic
++            // only: the wait itself stays unbounded (a bounded lock
++            // acquire could enter the critical section it guards).
++            if ((++nSpins & 0xFFFFu) == 0u && s.lock_stall == 0u &&
++                CTimer::Get()->GetClockTicks() - c0 >= 50000ULL)
++                s.lock_stall = 1u;
++        }
++    }
++    s.lock_wait_us = s.lock_wait_us + (CTimer::Get()->GetClockTicks() - c0);
++    s.lock_waits = s.lock_waits + 1;
++}
++
++inline void SplitCore2Release(ThreadSplitStateCircle& s)
++{
++    s.RawRelease();
++}
++
++// Core 3's voice-end IRQ assert. Called at the PCM_Update assert site
++// in place of the direct MCU_Interrupt_SetRequest(IRQ0, 1).
++// pcm.irq_assert / irq_channel are already set by the caller. When
++// the split is live (MK1 only), only the flag is set; core 2 folds it
++// into interrupt_pending at the top of its next step. Otherwise the
++// direct call (single-threaded path, or non-MK1) is preserved.
++inline void SplitAssertIrq0(pcm_t& pcm)
++{
++    if (g_splitT && pcm.mcu->is_mk1)
++        __atomic_store_n(&g_splitT->irq0_req, static_cast<uint8_t>(1), __ATOMIC_RELEASE);
++    else
++        MCU_Interrupt_SetRequest(*pcm.mcu, INTERRUPT_SOURCE_IRQ0, 1);
++}
++
++// Core 2: fold a pending IRQ0 request into interrupt_pending. Called
++// at the top of every step by the synth's split step loop (one
++// ACQUIRE byte load; the line is written by core 3 only on voice ends).
++inline void SplitFoldIrq0(ThreadSplitStateCircle& s, mcu_t& mcu)
++{
++    if (__atomic_load_n(&s.irq0_req, __ATOMIC_ACQUIRE) != 0u)
++    {
++        __atomic_exchange_n(&s.irq0_req, static_cast<uint8_t>(0), __ATOMIC_ACQ_REL);
++        MCU_Interrupt_SetRequest(mcu, INTERRUPT_SOURCE_IRQ0, 1);
++        s.irq0_folded = s.irq0_folded + 1;
++    }
++}
++
++// MCU thread: direct register write into shared pcm state. Which
++// writes COMMIT a ram1/ram2 store is backend PCM_Write verbatim:
++// ram1 (0x04-0x10, 0x24-0x30) commits iff (addr&3)==3;
++// ram2 (0x10-0x20, 0x30-0x38) commits iff (addr&1)==1. Non-committing
++// bytes only touch core-2-private latch state and never synchronize.
++inline void SkelPCMWrite(mcu_t& mcu, uint32_t addr, uint8_t value)
++{
++    addr &= 0x3f;
++    const bool bCommits =
++        ((((addr >= 0x04 && addr < 0x10) || (addr >= 0x24 && addr < 0x30)) && ((addr & 3) == 3)) ||
++         (((addr >= 0x10 && addr < 0x20) || (addr >= 0x30 && addr < 0x38)) && ((addr & 1) == 1)));
++    if (!bCommits)
++    {
++        PCM_Write(*mcu.pcm, addr, value);
++        return;
++    }
++    ThreadSplitStateCircle& s = *g_splitT;
++    SplitCore2Acquire(s);
++    PCM_Write(*mcu.pcm, addr, value);
++    SplitCore2Release(s);
++}
++
++// MCU thread: direct read from shared pcm state. Status reads
++// (0x3c/0x3e, including the IRQ-ack clear) hold the state lock;
++// all other reads are direct. The 0x3e ACK clears irq_assert with an
++// atomic exchange (core 3 sets it with a byte store), and clears the
++// interrupt request only if the flag was actually set.
++inline uint8_t SkelPCMRead(mcu_t& mcu, uint32_t addr)
++{
++    addr &= 0x3f;
++    ThreadSplitStateCircle& s = *g_splitT;
++    if (addr == 0x3c || addr == 0x3e)
++    {
++        SplitCore2Acquire(s);
++        pcm_t& pcm = *mcu.pcm;
++        uint8_t status = 0;
++        if (addr == 0x3e)
++        {
++            if (__atomic_exchange_n(&pcm.irq_assert, false, __ATOMIC_ACQ_REL))
++                MCU_Interrupt_SetRequest(mcu, INTERRUPT_SOURCE_IRQ0, 0);
++        }
++        status |= pcm.irq_channel;
++        if (pcm.voice_mask_updating)
++            status |= 32;
++        SplitCore2Release(s);
++        return status;
++    }
++    return PCM_Read(*mcu.pcm, addr);
++}
++
++// Circle dispatch for the PCM call sites in mcu.cpp: trim split
++// (MK1 only) when the split is active, direct otherwise.
++inline void SplitPCMWrite(mcu_t& mcu, uint32_t addr, uint8_t value)
++{
++    if (g_splitT && mcu.is_mk1)
++        SkelPCMWrite(mcu, addr, value);
++    else
++        PCM_Write(*mcu.pcm, addr, value);
++}
++
++inline uint8_t SplitPCMRead(mcu_t& mcu, uint32_t addr)
++{
++    if (g_splitT && mcu.is_mk1)
++        return SkelPCMRead(mcu, addr);
++    return PCM_Read(*mcu.pcm, addr);
++}
++
++#endif

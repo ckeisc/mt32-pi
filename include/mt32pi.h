@@ -121,6 +121,7 @@ private:
 	void MainTask();
 	void UITask();
 	void AudioTask();
+	void PCMTask();
 
 	void UpdateUSB(bool bStartup = false);
 	void UpdateNetwork();
@@ -130,6 +131,7 @@ private:
 	bool ParseCustomSysEx(const u8* pData, size_t nSize);
 
 	void ProcessEventQueue();
+
 	void ProcessButtonEvent(const TButtonEvent& Event);
 
 	// Actions that can be triggered via events
@@ -202,11 +204,18 @@ private:
 
 	volatile bool m_bRunning;
 	volatile bool m_bUITaskDone;
+
+	// Last MainTask tick at which the CPU throttle temperature
+	// guard ran (1 s cadence; see MainTask). Initialized by the
+	// constructor's member list.
+	unsigned m_nThrottleUpdateTicks;
+
 	bool m_bLEDOn;
 	unsigned m_nLEDOnTime;
 
 	// Audio output
 	CSoundBaseDevice* m_pSound;
+
 
 	// Extra devices
 	CPisound* m_pPisound;

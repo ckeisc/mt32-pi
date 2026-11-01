@@ -73,8 +73,14 @@ public:
 
 		if (m_nInPtr != m_nOutPtr)
 		{
-			OutItem = m_Data[m_nOutPtr++];
-			m_nOutPtr &= BufferMask;
+			// NOTE: written with explicit assignment, not ++/&=:
+			// ++ and compound assignment on a volatile object are
+			// deprecated in C++20 (and removed in C++23), and this
+			// header is also instantiated from C++20 translation
+			// units (nukedsc55synth.cpp) built with -Werror.
+			OutItem = m_Data[m_nOutPtr];
+			m_nOutPtr = m_nOutPtr + 1;
+			m_nOutPtr = m_nOutPtr & BufferMask;
 			bSuccess = true;
 		}
 
@@ -89,13 +95,16 @@ public:
 
 		while (m_nInPtr != m_nOutPtr && nDequeued < nMaxCount)
 		{
-			pOutBuffer[nDequeued++] = m_Data[m_nOutPtr++];
-			m_nOutPtr &= BufferMask;
+			pOutBuffer[nDequeued++] = m_Data[m_nOutPtr];
+			m_nOutPtr = m_nOutPtr + 1;
+			m_nOutPtr = m_nOutPtr & BufferMask;
 		}
 
 		m_Lock.Release();
 		return nDequeued;
 	}
+
+
 
 private:
 	static_assert(Utility::IsPowerOfTwo(N), "Ring buffer size must be a power of 2");
@@ -104,8 +113,9 @@ private:
 	{
 		if (((m_nInPtr + 1) & BufferMask) != m_nOutPtr)
 		{
-			m_Data[m_nInPtr++] = Item;
-			m_nInPtr &= BufferMask;
+			m_Data[m_nInPtr] = Item;
+			m_nInPtr = m_nInPtr + 1;
+			m_nInPtr = m_nInPtr & BufferMask;
 			return true;
 		}
 

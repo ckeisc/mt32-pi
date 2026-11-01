@@ -65,6 +65,10 @@ void CDiagLog::LogLine(const char* pFormat, ...)
 	Buffer[nLength++] = '\n';
 	Buffer[nLength]   = '\0';
 
+	// The diag lock covers both f_write and f_sync: an unlocked
+	// f_sync concurrent with another core's f_write shares FatFs's
+	// volume window on one FIL and can garble the log or corrupt
+	// the volume.
 	m_Lock.Acquire();
 	UINT nWritten = 0;
 	f_write(&m_File, Buffer, static_cast<UINT>(nLength), &nWritten);
