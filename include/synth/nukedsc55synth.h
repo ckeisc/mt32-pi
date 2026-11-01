@@ -275,11 +275,7 @@ private:
 	u64 m_nMCUUs = 0;
 	u64 m_nLastSplitFifoFullWaits = 0;
 	u64 m_nLastSplitFifoDrops = 0;
-	u64 m_nLastSplitPublishes = 0;
-	u64 m_nLastSplitTicks = 0;
-	u64 m_nLastSplitIrq0Folded = 0;
 	u64 m_nLastSplitPCMUs = 0;
-	u64 m_nLastWrittenFrames = 0;
 
 	// Sounding-note tracking for power management (core 0 only:
 	// written by the MIDI path, read by IsActive, both on MainTask,

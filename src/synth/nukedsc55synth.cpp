@@ -1315,38 +1315,46 @@ void CNukedSC55Synth::UpdateLCD(CLCD& LCD, unsigned int nTicks)
 				ThreadSplitStateCircle& S = *m_pSplitState;
 				const u64 nFifoFullWaits  = S.fifo_full_waits - m_nLastSplitFifoFullWaits;
 				const u64 nFifoDrops      = S.fifo_drops - m_nLastSplitFifoDrops;
-				const u64 nPublishes      = S.publishes - m_nLastSplitPublishes;
-				const u64 nTicks          = S.ticks - m_nLastSplitTicks;
-				const u64 nIrq0Folded     = S.irq0_folded - m_nLastSplitIrq0Folded;
 				const u64 nPCMUs          = S.pcm_task_us - m_nLastSplitPCMUs;
 				const u64 nMCUUs          = m_nMCUUs;
-				const u64 nWritten = m_nWrittenFrames - m_nLastWrittenFrames;
-				DiagLog.LogLine("window synth=nuked sync=romacclz pct=%llu avg_us=%llu max_us=%llu miss_pct=%llu underrun_frames=%llu temp_c=%u core2_pct=%llu core3_pct=%llu fifo_full_waits=%llu fifo_hw=%llu fifo_drops=%llu ring_drops=%llu publishes=%llu ticks=%llu irq0_folded=%llu max_lag=%llu phase=%u written=%llu",
-				                static_cast<unsigned long long>(nPct),
-				                static_cast<unsigned long long>(nAvgUs),
-				                static_cast<unsigned long long>(Stats.nMaxUs),
-				                static_cast<unsigned long long>(nMissPct),
-				                static_cast<unsigned long long>(Stats.nUnderrunFrames),
-				                nTempC,
-				                static_cast<unsigned long long>(nWindowUs > 0 ? nMCUUs * 100 / nWindowUs : 0),
-				                static_cast<unsigned long long>(nWindowUs > 0 ? nPCMUs * 100 / nWindowUs : 0),
-				                static_cast<unsigned long long>(nFifoFullWaits),
-				                static_cast<unsigned long long>(S.fifo_hw),
-				                static_cast<unsigned long long>(nFifoDrops),
-				                static_cast<unsigned long long>(m_nSampleRingDrops),
-				                static_cast<unsigned long long>(nPublishes),
-				                static_cast<unsigned long long>(nTicks),
-				                static_cast<unsigned long long>(nIrq0Folded),
-				                static_cast<unsigned long long>(S.max_pcm_lag),
-				                S.core3_phase,
-				                static_cast<unsigned long long>(nWritten));
+								// Window summary (5 s): real-time + render + core load +
+				// FIFO/ring health + peak lag. sync= omitted (constant
+				// per boot, already in the init line); temp_c omitted
+				// when invalid (0 = no reading).
+				if (nTempC != 0)
+				{
+					DiagLog.LogLine("window synth=nuked pct=%llu avg_us=%llu max_us=%llu miss_pct=%llu underrun_frames=%llu temp_c=%u core2_pct=%llu core3_pct=%llu fifo_full_waits=%llu fifo_drops=%llu ring_drops=%llu max_lag=%llu",
+					                static_cast<unsigned long long>(nPct),
+					                static_cast<unsigned long long>(nAvgUs),
+					                static_cast<unsigned long long>(Stats.nMaxUs),
+					                static_cast<unsigned long long>(nMissPct),
+					                static_cast<unsigned long long>(Stats.nUnderrunFrames),
+					                nTempC,
+					                static_cast<unsigned long long>(nWindowUs > 0 ? nMCUUs * 100 / nWindowUs : 0),
+					                static_cast<unsigned long long>(nWindowUs > 0 ? nPCMUs * 100 / nWindowUs : 0),
+					                static_cast<unsigned long long>(nFifoFullWaits),
+					                static_cast<unsigned long long>(nFifoDrops),
+					                static_cast<unsigned long long>(m_nSampleRingDrops),
+					                static_cast<unsigned long long>(S.max_pcm_lag));
+				}
+				else
+				{
+					DiagLog.LogLine("window synth=nuked pct=%llu avg_us=%llu max_us=%llu miss_pct=%llu underrun_frames=%llu core2_pct=%llu core3_pct=%llu fifo_full_waits=%llu fifo_drops=%llu ring_drops=%llu max_lag=%llu",
+					                static_cast<unsigned long long>(nPct),
+					                static_cast<unsigned long long>(nAvgUs),
+					                static_cast<unsigned long long>(Stats.nMaxUs),
+					                static_cast<unsigned long long>(nMissPct),
+					                static_cast<unsigned long long>(Stats.nUnderrunFrames),
+					                static_cast<unsigned long long>(nWindowUs > 0 ? nMCUUs * 100 / nWindowUs : 0),
+					                static_cast<unsigned long long>(nWindowUs > 0 ? nPCMUs * 100 / nWindowUs : 0),
+					                static_cast<unsigned long long>(nFifoFullWaits),
+					                static_cast<unsigned long long>(nFifoDrops),
+					                static_cast<unsigned long long>(m_nSampleRingDrops),
+					                static_cast<unsigned long long>(S.max_pcm_lag));
+				}
 				m_nLastSplitFifoFullWaits = S.fifo_full_waits;
 				m_nLastSplitFifoDrops = S.fifo_drops;
-				m_nLastSplitPublishes = S.publishes;
-				m_nLastSplitTicks = S.ticks;
-				m_nLastSplitIrq0Folded = S.irq0_folded;
 				m_nLastSplitPCMUs = S.pcm_task_us;
-				m_nLastWrittenFrames = m_nWrittenFrames;
 				m_nMCUUs = 0;
 			}
 			else
@@ -1362,17 +1370,33 @@ void CNukedSC55Synth::UpdateLCD(CLCD& LCD, unsigned int nTicks)
 				m_nLastProfilePCMUs            = Profile.nPCMUs;
 				m_nLastProfileInsn             = Profile.nInstructions;
 
-				DiagLog.LogLine("window synth=nuked sync=single pct=%llu avg_us=%llu max_us=%llu miss_pct=%llu underrun_frames=%llu temp_c=%u emu_pct=%llu mcu_pct=%llu pcm_pct=%llu insn_per_sec=%llu",
-				                static_cast<unsigned long long>(nPct),
-				                static_cast<unsigned long long>(nAvgUs),
-				                static_cast<unsigned long long>(Stats.nMaxUs),
-				                static_cast<unsigned long long>(nMissPct),
-				                static_cast<unsigned long long>(Stats.nUnderrunFrames),
-				                nTempC,
-				                static_cast<unsigned long long>(nWindowUs > 0 ? nTotalDelta * 100 / nWindowUs : 0),
-				                static_cast<unsigned long long>(nTotalDelta > 0 ? (nTotalDelta - nPCMDelta) * 100 / nTotalDelta : 0),
-				                static_cast<unsigned long long>(nTotalDelta > 0 ? nPCMDelta * 100 / nTotalDelta : 0),
-				                static_cast<unsigned long long>(nWindowUs > 0 ? nInsnDelta * 1000000ULL / nWindowUs : 0));
+								if (nTempC != 0)
+				{
+					DiagLog.LogLine("window synth=nuked pct=%llu avg_us=%llu max_us=%llu miss_pct=%llu underrun_frames=%llu temp_c=%u emu_pct=%llu mcu_pct=%llu pcm_pct=%llu insn_per_sec=%llu",
+					                static_cast<unsigned long long>(nPct),
+					                static_cast<unsigned long long>(nAvgUs),
+					                static_cast<unsigned long long>(Stats.nMaxUs),
+					                static_cast<unsigned long long>(nMissPct),
+					                static_cast<unsigned long long>(Stats.nUnderrunFrames),
+					                nTempC,
+					                static_cast<unsigned long long>(nWindowUs > 0 ? nTotalDelta * 100 / nWindowUs : 0),
+					                static_cast<unsigned long long>(nTotalDelta > 0 ? (nTotalDelta - nPCMDelta) * 100 / nTotalDelta : 0),
+					                static_cast<unsigned long long>(nTotalDelta > 0 ? nPCMDelta * 100 / nTotalDelta : 0),
+					                static_cast<unsigned long long>(nWindowUs > 0 ? nInsnDelta * 1000000ULL / nWindowUs : 0));
+				}
+				else
+				{
+					DiagLog.LogLine("window synth=nuked pct=%llu avg_us=%llu max_us=%llu miss_pct=%llu underrun_frames=%llu emu_pct=%llu mcu_pct=%llu pcm_pct=%llu insn_per_sec=%llu",
+					                static_cast<unsigned long long>(nPct),
+					                static_cast<unsigned long long>(nAvgUs),
+					                static_cast<unsigned long long>(Stats.nMaxUs),
+					                static_cast<unsigned long long>(nMissPct),
+					                static_cast<unsigned long long>(Stats.nUnderrunFrames),
+					                static_cast<unsigned long long>(nWindowUs > 0 ? nTotalDelta * 100 / nWindowUs : 0),
+					                static_cast<unsigned long long>(nTotalDelta > 0 ? (nTotalDelta - nPCMDelta) * 100 / nTotalDelta : 0),
+					                static_cast<unsigned long long>(nTotalDelta > 0 ? nPCMDelta * 100 / nTotalDelta : 0),
+					                static_cast<unsigned long long>(nWindowUs > 0 ? nInsnDelta * 1000000ULL / nWindowUs : 0));
+				}
 			}
 		}
 	}
