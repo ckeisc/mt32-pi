@@ -41,10 +41,17 @@ public:
 	// MiSTer stopped responding). Drives the Button1 cycle gate.
 	TMisterSynth GetLastMisterSynth() const { return m_LastMisterStatus.Synth; }
 
+	// SC-55 engine selected via HW1 (Button1), for the MiSTer
+	// FluidSynth reinterpretation (see ApplyConfig). Called only
+	// by Button1 switches to Nuked/EmuSC/SoundFont; MT32 switches
+	// do not touch it, and MiSTer disconnect does not reset it.
+	void SetHW1SC55Synth(TSynth Synth) { m_bHW1SC55Selected = true; m_HW1SC55Synth = Synth; }
+
 private:
 	bool WriteConfigToMister(const TMisterStatus& NewStatus);
 	void ResetState();
 	void ApplyConfig(const TMisterStatus& NewStatus, const TMisterStatus& SystemStatus);
+	TSynth ResolveSC55Synth() const;
 	void EnqueueDisplayImageEvent();
 	void EnqueueAllSoundOffEvent();
 
@@ -54,6 +61,13 @@ private:
 	bool bMisterActive;
 	TMisterStatus m_LastSystemStatus;
 	TMisterStatus m_LastMisterStatus;
+
+	// HW1 SC-55 selection (see SetHW1SC55Synth). False until the
+	// first Button1 switch to Nuked/EmuSC/SoundFont; the synth
+	// value is meaningless until then (ResolveSC55Synth falls
+	// back to Nuked).
+	bool m_bHW1SC55Selected;
+	TSynth m_HW1SC55Synth;
 };
 
 #endif

@@ -1229,6 +1229,7 @@ void CMT32Pi::ProcessButtonEvent(const TButtonEvent& Event)
 			LCDLog(TLCDLogType::Notice, "%s", GetSynthMode(m_pCurrentSynth));
 			return;
 		}
+		CSynthBase* pBeforeSwitch = m_pCurrentSynth;
 		// Cycle through the available synths, gated by the last synth
 		// set explicitly from the MiSTer side:
 		// - MiSTer set MT32: Munt only (Button1 goes to/stays on MT32)
@@ -1277,6 +1278,17 @@ void CMT32Pi::ProcessButtonEvent(const TButtonEvent& Event)
 				else if (m_pSoundFontSynth)
 					SwitchSynth(TSynth::SoundFont);
 			}
+		}
+		// Record an HW1 SC-55 selection for the MiSTer FluidSynth
+		// reinterpretation (see CMisterControl::ApplyConfig): only
+		// a Button1 switch that actually changed the synth, to
+		// Nuked/EmuSC/SoundFont, counts. MT32 switches and no-op
+		// presses (show-only, unavailable, already active) leave
+		// the selection untouched.
+		if (m_pCurrentSynth != pBeforeSwitch &&
+		    (m_pCurrentSynth == m_pNukedSC55Synth || m_pCurrentSynth == m_pEmuSCSynth || m_pCurrentSynth == m_pSoundFontSynth))
+		{
+			m_MisterControl.SetHW1SC55Synth(m_pCurrentSynth == m_pNukedSC55Synth ? TSynth::NukedSC55 : (m_pCurrentSynth == m_pEmuSCSynth ? TSynth::EmuSC : TSynth::SoundFont));
 		}
 	}
 	else if (Event.Button == TButton::Button2 && !Event.bRepeat)
