@@ -1199,43 +1199,91 @@ void CMT32Pi::ProcessButtonEvent(const TButtonEvent& Event)
 
 	if (Event.Button == TButton::Button1 && !Event.bRepeat)
 	{
-		// Cycle through the available synths
-		// Order: SoundFont -> NukedSC55 -> EmuSC -> MT32 (wraps)
-		if (m_pCurrentSynth == m_pMT32Synth)
+		// Cycle through the available synths, gated by the last synth
+		// set explicitly from the MiSTer side:
+		// - MiSTer set SoundFont: SoundFont -> NukedSC55 -> EmuSC -> SoundFont
+		// - MiSTer set MT32: Munt only (Button1 goes to/stays on MT32)
+		// - Never set (or any other MiSTer value): the original full cycle
+		//   MT32 -> SoundFont -> EmuSC -> NukedSC55 -> MT32
+		// Unavailable synths are skipped in every case. Explicit switches
+		// (SysEx, MiSTer commands, boot default) are not gated.
+		const TMisterSynth MisterSynth = m_MisterControl.GetLastMisterSynth();
+		if (MisterSynth == TMisterSynth::MT32)
 		{
-			if (m_pSoundFontSynth)
-				SwitchSynth(TSynth::SoundFont);
-			else if (m_pNukedSC55Synth)
-				SwitchSynth(TSynth::NukedSC55);
-			else if (m_pEmuSCSynth)
-				SwitchSynth(TSynth::EmuSC);
-		}
-		else if (m_pCurrentSynth == m_pSoundFontSynth)
-		{
-			if (m_pNukedSC55Synth)
-				SwitchSynth(TSynth::NukedSC55);
-			else if (m_pEmuSCSynth)
-				SwitchSynth(TSynth::EmuSC);
-			else if (m_pMT32Synth)
+			if (m_pCurrentSynth != m_pMT32Synth && m_pMT32Synth)
 				SwitchSynth(TSynth::MT32);
 		}
-		else if (m_pCurrentSynth == m_pEmuSCSynth)
+		else if (MisterSynth == TMisterSynth::SoundFont)
 		{
-			if (m_pMT32Synth)
-				SwitchSynth(TSynth::MT32);
-			else if (m_pSoundFontSynth)
-				SwitchSynth(TSynth::SoundFont);
-			else if (m_pNukedSC55Synth)
-				SwitchSynth(TSynth::NukedSC55);
+			if (m_pCurrentSynth == m_pSoundFontSynth)
+			{
+				if (m_pNukedSC55Synth)
+					SwitchSynth(TSynth::NukedSC55);
+				else if (m_pEmuSCSynth)
+					SwitchSynth(TSynth::EmuSC);
+			}
+			else if (m_pCurrentSynth == m_pNukedSC55Synth)
+			{
+				if (m_pEmuSCSynth)
+					SwitchSynth(TSynth::EmuSC);
+				else if (m_pSoundFontSynth)
+					SwitchSynth(TSynth::SoundFont);
+			}
+			else if (m_pCurrentSynth == m_pEmuSCSynth)
+			{
+				if (m_pSoundFontSynth)
+					SwitchSynth(TSynth::SoundFont);
+				else if (m_pNukedSC55Synth)
+					SwitchSynth(TSynth::NukedSC55);
+			}
+			else // MT32 or unexpected: back to the family default
+			{
+				if (m_pSoundFontSynth)
+					SwitchSynth(TSynth::SoundFont);
+				else if (m_pNukedSC55Synth)
+					SwitchSynth(TSynth::NukedSC55);
+				else if (m_pEmuSCSynth)
+					SwitchSynth(TSynth::EmuSC);
+			}
 		}
-		else
+		else // Never set, or a MiSTer value with no family: original full cycle
 		{
-			if (m_pEmuSCSynth)
-				SwitchSynth(TSynth::EmuSC);
-			else if (m_pMT32Synth)
-				SwitchSynth(TSynth::MT32);
-			else if (m_pSoundFontSynth)
-				SwitchSynth(TSynth::SoundFont);
+			if (m_pCurrentSynth == m_pMT32Synth)
+			{
+				if (m_pSoundFontSynth)
+					SwitchSynth(TSynth::SoundFont);
+				else if (m_pEmuSCSynth)
+					SwitchSynth(TSynth::EmuSC);
+				else if (m_pNukedSC55Synth)
+					SwitchSynth(TSynth::NukedSC55);
+			}
+			else if (m_pCurrentSynth == m_pSoundFontSynth)
+			{
+				if (m_pEmuSCSynth)
+					SwitchSynth(TSynth::EmuSC);
+				else if (m_pNukedSC55Synth)
+					SwitchSynth(TSynth::NukedSC55);
+				else if (m_pMT32Synth)
+					SwitchSynth(TSynth::MT32);
+			}
+			else if (m_pCurrentSynth == m_pEmuSCSynth)
+			{
+				if (m_pNukedSC55Synth)
+					SwitchSynth(TSynth::NukedSC55);
+				else if (m_pMT32Synth)
+					SwitchSynth(TSynth::MT32);
+				else if (m_pSoundFontSynth)
+					SwitchSynth(TSynth::SoundFont);
+			}
+			else
+			{
+				if (m_pMT32Synth)
+					SwitchSynth(TSynth::MT32);
+				else if (m_pSoundFontSynth)
+					SwitchSynth(TSynth::SoundFont);
+				else if (m_pEmuSCSynth)
+					SwitchSynth(TSynth::EmuSC);
+			}
 		}
 	}
 	else if (Event.Button == TButton::Button2 && !Event.bRepeat)
