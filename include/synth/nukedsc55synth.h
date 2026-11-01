@@ -226,9 +226,8 @@ private:
 	// like the profile line). Lag peaks are reported as-is (peaks
 	// since activation).
 	u64 m_nMCUUs = 0;
-	u64 m_nLastSplitLockWaits = 0;
-	u64 m_nLastSplitLockContended = 0;
-	u64 m_nLastSplitLockWaitUs = 0;
+	u64 m_nLastSplitFifoFullWaits = 0;
+	u64 m_nLastSplitFifoDrops = 0;
 	u64 m_nLastSplitPublishes = 0;
 	u64 m_nLastSplitTicks = 0;
 	u64 m_nLastSplitIrq0Folded = 0;

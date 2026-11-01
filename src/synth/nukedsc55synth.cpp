@@ -389,9 +389,10 @@ bool CNukedSC55Synth::StopSplitPCM()
 		if (CTimer::Get()->GetClockTicks() >= nDeadlineUs)
 		{
 			m_bSplitWedged = true;
-			CDiagLog::Get().LogLine("splitpark_timeout ticks=%llu pcmidle=no raw_lock=%u",
+			CDiagLog::Get().LogLine("splitpark_timeout ticks=%llu pcmidle=no fifo_head=%llu fifo_tail=%llu",
 			                        static_cast<unsigned long long>(m_pSplitState ? m_pSplitState->ticks : 0),
-			                        m_pSplitState ? m_pSplitState->raw_lock : 0);
+			                        static_cast<unsigned long long>(m_pSplitState ? m_pSplitState->fifo_head : 0),
+			                        static_cast<unsigned long long>(m_pSplitState ? m_pSplitState->fifo_tail : 0));
 			return false;
 		}
 		CScheduler::Get()->Yield();
@@ -535,10 +536,8 @@ void CNukedSC55Synth::PCMTaskIteration()
 	const uint64_t nBatchEnd = std::min(PCM.cycles + ThreadSplitStateCircle::MaxBatchTicks * nTick,
 	                                    nPublished - ThreadSplitStateCircle::MaxTickCycles);
 	S.core3_phase = 3;
-	S.RawAcquire();
 	PCM_Update(PCM, nBatchEnd);
 	S.core3_phase = 4;
-	S.RawRelease();
 
 	// Publish the render position (the diag line reads this) and
 	// the peak lag for the diag line.
@@ -1145,16 +1144,15 @@ void CNukedSC55Synth::UpdateLCD(CLCD& LCD, unsigned int nTicks)
 				// 2 -- so it is replaced, not supplemented, while
 				// the split is active.)
 				ThreadSplitStateCircle& S = *m_pSplitState;
-				const u64 nLockWaits      = S.lock_waits - m_nLastSplitLockWaits;
-				const u64 nLockContended  = S.lock_contended - m_nLastSplitLockContended;
-				const u64 nLockWaitUs     = S.lock_wait_us - m_nLastSplitLockWaitUs;
+				const u64 nFifoFullWaits  = S.fifo_full_waits - m_nLastSplitFifoFullWaits;
+				const u64 nFifoDrops      = S.fifo_drops - m_nLastSplitFifoDrops;
 				const u64 nPublishes      = S.publishes - m_nLastSplitPublishes;
 				const u64 nTicks          = S.ticks - m_nLastSplitTicks;
 				const u64 nIrq0Folded     = S.irq0_folded - m_nLastSplitIrq0Folded;
 				const u64 nPCMUs          = S.pcm_task_us - m_nLastSplitPCMUs;
 				const u64 nMCUUs          = m_nMCUUs;
 				const u64 nWritten = m_nWrittenFrames - m_nLastWrittenFrames;
-				DiagLog.LogLine("window synth=nuked sync=trim pct=%llu avg_us=%llu max_us=%llu miss_pct=%llu underrun_frames=%llu temp_c=%u core2_pct=%llu core3_pct=%llu lock_waits=%llu lock_contended=%llu lock_wait_us=%llu lock_stall=%u ring_drops=%llu publishes=%llu ticks=%llu irq0_folded=%llu max_lag=%llu phase=%u written=%llu",
+				DiagLog.LogLine("window synth=nuked sync=romacclz pct=%llu avg_us=%llu max_us=%llu miss_pct=%llu underrun_frames=%llu temp_c=%u core2_pct=%llu core3_pct=%llu fifo_full_waits=%llu fifo_hw=%llu fifo_drops=%llu ring_drops=%llu publishes=%llu ticks=%llu irq0_folded=%llu max_lag=%llu phase=%u written=%llu",
 				                static_cast<unsigned long long>(nPct),
 				                static_cast<unsigned long long>(nAvgUs),
 				                static_cast<unsigned long long>(Stats.nMaxUs),
@@ -1163,10 +1161,9 @@ void CNukedSC55Synth::UpdateLCD(CLCD& LCD, unsigned int nTicks)
 				                nTempC,
 				                static_cast<unsigned long long>(nWindowUs > 0 ? nMCUUs * 100 / nWindowUs : 0),
 				                static_cast<unsigned long long>(nWindowUs > 0 ? nPCMUs * 100 / nWindowUs : 0),
-				                static_cast<unsigned long long>(nLockWaits),
-				                static_cast<unsigned long long>(nLockContended),
-				                static_cast<unsigned long long>(nLockWaitUs),
-				                S.lock_stall,
+				                static_cast<unsigned long long>(nFifoFullWaits),
+				                static_cast<unsigned long long>(S.fifo_hw),
+				                static_cast<unsigned long long>(nFifoDrops),
 				                static_cast<unsigned long long>(m_nSampleRingDrops),
 				                static_cast<unsigned long long>(nPublishes),
 				                static_cast<unsigned long long>(nTicks),
@@ -1174,9 +1171,8 @@ void CNukedSC55Synth::UpdateLCD(CLCD& LCD, unsigned int nTicks)
 				                static_cast<unsigned long long>(S.max_pcm_lag),
 				                S.core3_phase,
 				                static_cast<unsigned long long>(nWritten));
-				m_nLastSplitLockWaits = S.lock_waits;
-				m_nLastSplitLockContended = S.lock_contended;
-				m_nLastSplitLockWaitUs = S.lock_wait_us;
+				m_nLastSplitFifoFullWaits = S.fifo_full_waits;
+				m_nLastSplitFifoDrops = S.fifo_drops;
 				m_nLastSplitPublishes = S.publishes;
 				m_nLastSplitTicks = S.ticks;
 				m_nLastSplitIrq0Folded = S.irq0_folded;
