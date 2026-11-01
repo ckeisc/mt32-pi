@@ -695,7 +695,7 @@ bool CNukedSC55Synth::Initialize()
 
 	CDiagLog::Get().LogLine("init synth=nuked romset=%s rate=%u oversampling=%s resamp=%s h8_engine=%s sync=%s heap_free_low_kb=%u prime_insn=%llu prime_emu_us=%llu prime_pcm_us=%llu",
 	                        pDefinition->name, m_nNativeRate, m_bOversampling ? "on" : "off", m_bFirActive ? "kaiser" : (m_bCubicActive ? "cubic" : "linear"), H8EngineName(TH8Engine::Decoder2),
-	                        m_bSplitActive ? "trim" : "single",
+	                        m_bSplitActive ? "romacclz" : "single",
 	                        static_cast<unsigned>(CMemorySystem::Get()->GetHeapFreeSpace(HEAP_LOW) / 1024),
 	                        static_cast<unsigned long long>(NukedProfile().nInstructions),
 	                        static_cast<unsigned long long>(NukedProfile().nTotalUs),
@@ -1281,7 +1281,7 @@ void CNukedSC55Synth::UpdateLCD(CLCD& LCD, unsigned int nTicks)
 		{
 			CCPUThrottle* pThrottle = CCPUThrottle::Get();
 			// One consolidated window line per interval (standalone-style):
-			// engine identity (sync=trim/single) + real-time rate + render
+			// engine identity (sync=romacclz/single) + real-time rate + render
 			// time + split counters or backend phase split. This replaces
 			// the separate render/split/profile lines, halving the f_sync
 			// stalls per interval. The resampler lives inside RenderFrames
