@@ -114,6 +114,8 @@ CMT32Pi::CMT32Pi(CI2CMaster* pI2CMaster, CSPIMaster* pSPIMaster, CInterruptSyste
 	  m_bRunning(true),
 	  m_bUITaskDone(false),
 	  m_nThrottleUpdateTicks(0),
+	  m_bHW1Armed(false),
+	  m_nHW1LastPressTicks(0),
 	  m_bLEDOn(false),
 	  m_nLEDOnTime(0),
 
@@ -1208,6 +1210,25 @@ void CMT32Pi::ProcessButtonEvent(const TButtonEvent& Event)
 
 	if (Event.Button == TButton::Button1 && !Event.bRepeat)
 	{
+		// HW1 show-first: a press while no engine label is showing
+		// only shows the currently selected engine's label (the
+		// same Notice a switch shows) and does NOT switch, so
+		// the current engine can be checked without changing
+		// it. A press within the label window (3 s, matching
+		// CUserInterface::SystemMessageDisplayTimeMillis, which
+		// is private there so the value is repeated here) runs
+		// the switch logic below; each switch re-arms the window
+		// (its new label shows for 3 s), so repeated presses
+		// cycle. The timestamp is refreshed on every HW1 press.
+		const unsigned nNowTicks = CTimer::GetClockTicks();
+		const bool bArmed = m_bHW1Armed && (nNowTicks - m_nHW1LastPressTicks) < static_cast<unsigned>(Utility::MillisToTicks(3000));
+		m_bHW1Armed = true;
+		m_nHW1LastPressTicks = nNowTicks;
+		if (m_pCurrentSynth != nullptr && !bArmed)
+		{
+			LCDLog(TLCDLogType::Notice, "%s", GetSynthMode(m_pCurrentSynth));
+			return;
+		}
 		// Cycle through the available synths, gated by the last synth
 		// set explicitly from the MiSTer side:
 		// - MiSTer set MT32: Munt only (Button1 goes to/stays on MT32)
@@ -1311,6 +1332,11 @@ void CMT32Pi::ProcessButtonEvent(const TButtonEvent& Event)
 	}
 }
 
+const char* CMT32Pi::GetSynthMode(const CSynthBase* pSynth) const
+{
+	return pSynth == m_pMT32Synth ? "MT-32 mode" : (pSynth == m_pEmuSCSynth ? "EmuSC mode" : (pSynth == m_pNukedSC55Synth ? "Nuked-SC55 mode" : "SoundFont mode"));
+}
+
 void CMT32Pi::SwitchSynth(TSynth NewSynth)
 {
 	CSynthBase* pNewSynth = nullptr;
@@ -1339,7 +1365,7 @@ void CMT32Pi::SwitchSynth(TSynth NewSynth)
 	CSynthBase* pOldSynth = m_pCurrentSynth;
 	m_pCurrentSynth->AllSoundOff();
 	m_pCurrentSynth = pNewSynth;
-	const char* pMode = NewSynth == TSynth::MT32 ? "MT-32 mode" : (NewSynth == TSynth::EmuSC ? "EmuSC mode" : (NewSynth == TSynth::NukedSC55 ? "Nuked-SC55 mode" : "SoundFont mode"));
+	const char* pMode = GetSynthMode(pNewSynth);
 	LOGNOTE("Switching to %s", pMode);
 	LCDLog(TLCDLogType::Notice, pMode);
 	CDiagLog::Get().LogLine("switch synth=%s", pMode);
