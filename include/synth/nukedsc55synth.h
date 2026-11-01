@@ -50,7 +50,7 @@ public:
 
 	CONFIG_ENUM(TH8Engine, ENUM_NUKEDH8ENGINE);
 
-	CNukedSC55Synth(unsigned nSampleRate, float nGain, bool bOversampling, TH8Engine H8Engine);
+	CNukedSC55Synth(unsigned nSampleRate, float nGain, bool bOversampling);
 	virtual ~CNukedSC55Synth() override;
 
 	// Dual-core split: true while the PCM task (core 3) may be
@@ -178,7 +178,6 @@ private:
 
 	float m_nGain;
 	bool m_bOversampling;
-	TH8Engine m_H8Engine;
 	u8 m_nVolume;
 
 	unsigned m_nNativeRate;

@@ -465,7 +465,7 @@ bool CMT32Pi::InitNukedSC55Synth()
 {
 	assert(m_pNukedSC55Synth == nullptr);
 
-	m_pNukedSC55Synth = new CNukedSC55Synth(m_pConfig->AudioSampleRate, m_pConfig->NukedGain, m_pConfig->NukedOversampling, m_pConfig->NukedH8Engine);
+	m_pNukedSC55Synth = new CNukedSC55Synth(m_pConfig->AudioSampleRate, m_pConfig->NukedGain, m_pConfig->NukedOversampling);
 	if (!m_pNukedSC55Synth->Initialize())
 	{
 		LOGWARN("Nuked-SC55 init failed; no complete SC-55 ROM set present?");

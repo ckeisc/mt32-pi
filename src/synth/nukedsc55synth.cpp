@@ -247,7 +247,7 @@ const char* FriendlyModelName(Romset Romset)
 
 } // namespace
 
-CNukedSC55Synth::CNukedSC55Synth(unsigned nSampleRate, float nGain, bool bOversampling, TH8Engine H8Engine)
+CNukedSC55Synth::CNukedSC55Synth(unsigned nSampleRate, float nGain, bool bOversampling)
 	: CSynthBase(nSampleRate),
 	  m_pSplitState(nullptr),
 	  m_bSplitActive(false),
@@ -258,7 +258,6 @@ CNukedSC55Synth::CNukedSC55Synth(unsigned nSampleRate, float nGain, bool bOversa
 	  m_pRomsetInfo(nullptr),
 	  m_nGain(nGain),
 	  m_bOversampling(bOversampling),
-	  m_H8Engine(H8Engine),
 	  m_nVolume(100),
 	  m_nNativeRate(0),
 	  m_dResampleRatio(1.0),
@@ -634,7 +633,7 @@ bool CNukedSC55Synth::Initialize()
 
 	// Apply the configured H8 execution path before reset/priming so
 	// the whole boot sequence runs on the selected engine.
-	m_pEmulator->SetH8Engine(ToBackendEngine(m_H8Engine));
+	m_pEmulator->SetH8Engine(ToBackendEngine(TH8Engine::Decoder2));
 
 	m_pEmulator->Reset();
 
@@ -682,7 +681,7 @@ bool CNukedSC55Synth::Initialize()
 	        pDefinition->name, m_ModelName, m_ROMVersion, m_nNativeRate, m_bOversampling ? "on" : "off");
 
 	CDiagLog::Get().LogLine("init synth=nuked romset=%s rate=%u oversampling=%s h8_engine=%s sync=%s heap_free_low_kb=%u prime_insn=%llu prime_emu_us=%llu prime_pcm_us=%llu",
-	                        pDefinition->name, m_nNativeRate, m_bOversampling ? "on" : "off", H8EngineName(m_H8Engine),
+	                        pDefinition->name, m_nNativeRate, m_bOversampling ? "on" : "off", H8EngineName(TH8Engine::Decoder2),
 	                        m_bSplitActive ? "trim" : "single",
 	                        static_cast<unsigned>(CMemorySystem::Get()->GetHeapFreeSpace(HEAP_LOW) / 1024),
 	                        static_cast<unsigned long long>(NukedProfile().nInstructions),
