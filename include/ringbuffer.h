@@ -104,16 +104,7 @@ public:
 		return nDequeued;
 	}
 
-	// Diagnostic snapshot of the fill level (0 .. N-1). The lock
-	// is held only for the two pointer reads, never across a
-	// wait, so this is safe from any task context.
-	size_t GetLevel()
-	{
-		m_Lock.Acquire();
-		const size_t nLevel = (m_nInPtr - m_nOutPtr) & BufferMask;
-		m_Lock.Release();
-		return nLevel;
-	}
+
 
 private:
 	static_assert(Utility::IsPowerOfTwo(N), "Ring buffer size must be a power of 2");

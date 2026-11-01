@@ -1080,49 +1080,23 @@ void CNukedSC55Synth::ReportStatus() const
 
 void CNukedSC55Synth::UpdateLCD(CLCD& LCD, unsigned int nTicks)
 {
-	// Debug-kernel heartbeat row: reserve the bottom text row for
-	// a liveness line (bars shrink by one row), mirroring the MT32
-	// synth's bars-plus-status layout. Graphical: rows are 8px, so
-	// the bottom row is Height()/8 - 1 and bars lose 8px;
-	// character: rows are cells, so the bottom row is Height() - 1
-	// and bars lose one row.
-	u8 nStatusRow, nBarHeight;
+	// Bars shrink by one row, mirroring the MT32 synth's
+	// bars-plus-status layout (the bottom row was the debug
+	// heartbeat row, removed: its 16 ms Flip flashed the
+	// display). Graphical: rows are 8px, so bars lose 8px;
+	// character: rows are cells, so bars lose one row.
+	u8 nBarHeight;
 	if (LCD.GetType() == CLCD::TType::Character)
-	{
-		nStatusRow = LCD.Height() - 1;
 		nBarHeight = LCD.Height() - 1;
-	}
 	else
-	{
-		nStatusRow = LCD.Height() / 8 - 1;
 		nBarHeight = LCD.Height() - 8;
-	}
 	float ChannelLevels[16], PeakLevels[16];
 	m_MIDIMonitor.GetChannelLevels(nTicks, ChannelLevels, PeakLevels, 1 << 9);
 	CUserInterface::DrawChannelLevels(LCD, nBarHeight, ChannelLevels, PeakLevels, 16, true);
 
-	// Core-2/core-3 aliveness (debug kernel): lock-free,
-	// SD-free counters -- core-3 native frames written
-	// (m_nWrittenFrames, volatile, updated by OnSample)
-	// and core-2 RenderFrames calls (m_Stats.nCalls, read
-	// under the brief stats lock). No diag lock is taken
-	// here, so this line keeps ticking even if the diag
-	// flush wedges in f_sync. The toggling char (2 Hz,
-	// from the µs tick clock) proves UITask itself runs:
-	// a ticking char with frozen W/R means UITask is alive
-	// and the render path is stuck, while a frozen char
-	// means UITask itself is stuck. Drawn and pushed
-	// BEFORE the diag flush below.
-	m_StatsLock.Acquire();
-	const u64 nRenderCalls = m_Stats.nCalls;
-	m_StatsLock.Release();
-	char HeartbeatBuffer[32];
-	snprintf(HeartbeatBuffer, sizeof(HeartbeatBuffer), "%c W%llu R%llu",
-	         ((nTicks / 500000) & 1) ? '*' : '-',
-	         static_cast<unsigned long long>(m_nWrittenFrames),
-	         static_cast<unsigned long long>(nRenderCalls));
-	LCD.Print(HeartbeatBuffer, 0, nStatusRow, true, false);
-	LCD.Flip();
+	// (Debug heartbeat removed: its 16 ms status-row print + Flip
+	// flashed the whole display. Core-2/core-3 aliveness now lives
+	// in the diag window line's calls/written fields instead.)
 
 	// Flush accumulated render timing statistics to the diagnostic log
 	CDiagLog& DiagLog = CDiagLog::Get();
@@ -1141,16 +1115,26 @@ void CNukedSC55Synth::UpdateLCD(CLCD& LCD, unsigned int nTicks)
 		if (bDue)
 		{
 			CCPUThrottle* pThrottle = CCPUThrottle::Get();
-			DiagLog.LogLine("render synth=nuked calls=%llu frames=%llu avg_us=%llu max_us=%llu miss_pct=%llu underrun_frames=%llu temp_c=%u",
-			                static_cast<unsigned long long>(Stats.nCalls),
-			                static_cast<unsigned long long>(Stats.nFrames),
-			                static_cast<unsigned long long>(Stats.nTotalUs / Stats.nCalls),
-			                static_cast<unsigned long long>(Stats.nMaxUs),
-			                static_cast<unsigned long long>(Stats.nMisses * 100 / Stats.nCalls),
-			                static_cast<unsigned long long>(Stats.nUnderrunFrames),
-			                pThrottle ? pThrottle->GetTemperature() : 0);
-
+			// One consolidated window line per interval (standalone-style):
+			// engine identity (sync=trim/single) + real-time rate + render
+			// time + split counters or backend phase split. This replaces
+			// the separate render/split/profile lines, halving the f_sync
+			// stalls per interval. The resampler lives inside RenderFrames
+			// here (unlike the standalone's separate resampler), so its time
+			// is inside avg_us/max_us, not a separate field; cycle-based
+			// fields are unavailable (CTimer wall clock, no PMU).
 			const u64 nWindowUs = nNowUs - Stats.nWindowStartUs;
+			const u64 nAvgUs = Stats.nCalls > 0 ? Stats.nTotalUs / Stats.nCalls : 0;
+			const u64 nMissPct = Stats.nCalls > 0 ? Stats.nMisses * 100 / Stats.nCalls : 0;
+			const unsigned nTempC = pThrottle ? pThrottle->GetTemperature() : 0;
+			u64 nPct = 0;
+			if (nWindowUs > 0 && m_dResampleRatio > 0.0)
+			{
+				const u64 nDueFrames = static_cast<u64>(nWindowUs * (static_cast<double>(m_nNativeRate) / m_dResampleRatio) / 1000000.0);
+				if (nDueFrames > 0)
+					nPct = Stats.nFrames * 100 / nDueFrames;
+			}
+
 
 			if (m_bSplitActive && m_pSplitState)
 			{
@@ -1172,19 +1156,27 @@ void CNukedSC55Synth::UpdateLCD(CLCD& LCD, unsigned int nTicks)
 				const u64 nIrq0Folded     = S.irq0_folded - m_nLastSplitIrq0Folded;
 				const u64 nPCMUs          = S.pcm_task_us - m_nLastSplitPCMUs;
 				const u64 nMCUUs          = m_nMCUUs;
-				DiagLog.LogLine("split synth=nuked lock_waits=%llu lock_contended=%llu lock_wait_us=%llu publishes=%llu ticks=%llu irq0_folded=%llu lock_stall=%u mcu_core2_pct=%llu pcm_core3_pct=%llu max_lag=%llu phase=%u ring_drops=%llu",
+				const u64 nWritten = m_nWrittenFrames - m_nLastWrittenFrames;
+				DiagLog.LogLine("window synth=nuked sync=trim pct=%llu avg_us=%llu max_us=%llu miss_pct=%llu underrun_frames=%llu temp_c=%u core2_pct=%llu core3_pct=%llu lock_waits=%llu lock_contended=%llu lock_wait_us=%llu lock_stall=%u ring_drops=%llu publishes=%llu ticks=%llu irq0_folded=%llu max_lag=%llu phase=%u written=%llu",
+				                static_cast<unsigned long long>(nPct),
+				                static_cast<unsigned long long>(nAvgUs),
+				                static_cast<unsigned long long>(Stats.nMaxUs),
+				                static_cast<unsigned long long>(nMissPct),
+				                static_cast<unsigned long long>(Stats.nUnderrunFrames),
+				                nTempC,
+				                static_cast<unsigned long long>(nWindowUs > 0 ? nMCUUs * 100 / nWindowUs : 0),
+				                static_cast<unsigned long long>(nWindowUs > 0 ? nPCMUs * 100 / nWindowUs : 0),
 				                static_cast<unsigned long long>(nLockWaits),
 				                static_cast<unsigned long long>(nLockContended),
 				                static_cast<unsigned long long>(nLockWaitUs),
+				                S.lock_stall,
+				                static_cast<unsigned long long>(m_nSampleRingDrops),
 				                static_cast<unsigned long long>(nPublishes),
 				                static_cast<unsigned long long>(nTicks),
 				                static_cast<unsigned long long>(nIrq0Folded),
-				                S.lock_stall,
-				                static_cast<unsigned long long>(nWindowUs > 0 ? nMCUUs * 100 / nWindowUs : 0),
-				                static_cast<unsigned long long>(nWindowUs > 0 ? nPCMUs * 100 / nWindowUs : 0),
 				                static_cast<unsigned long long>(S.max_pcm_lag),
 				                S.core3_phase,
-				                static_cast<unsigned long long>(m_nSampleRingDrops));
+				                static_cast<unsigned long long>(nWritten));
 				m_nLastSplitLockWaits = S.lock_waits;
 				m_nLastSplitLockContended = S.lock_contended;
 				m_nLastSplitLockWaitUs = S.lock_wait_us;
@@ -1192,6 +1184,7 @@ void CNukedSC55Synth::UpdateLCD(CLCD& LCD, unsigned int nTicks)
 				m_nLastSplitTicks = S.ticks;
 				m_nLastSplitIrq0Folded = S.irq0_folded;
 				m_nLastSplitPCMUs = S.pcm_task_us;
+				m_nLastWrittenFrames = m_nWrittenFrames;
 				m_nMCUUs = 0;
 			}
 			else
@@ -1207,15 +1200,17 @@ void CNukedSC55Synth::UpdateLCD(CLCD& LCD, unsigned int nTicks)
 				m_nLastProfilePCMUs            = Profile.nPCMUs;
 				m_nLastProfileInsn             = Profile.nInstructions;
 
-				if (nTotalDelta > 0 && nWindowUs > 0)
-				{
-					DiagLog.LogLine("profile synth=nuked engine=%s emu_pct=%llu mcu_pct=%llu pcm_pct=%llu insn_per_sec=%llu",
-					                H8EngineName(m_H8Engine),
-					                static_cast<unsigned long long>(nTotalDelta * 100 / nWindowUs),
-					                static_cast<unsigned long long>((nTotalDelta - nPCMDelta) * 100 / nTotalDelta),
-					                static_cast<unsigned long long>(nPCMDelta * 100 / nTotalDelta),
-					                static_cast<unsigned long long>(nInsnDelta * 1000000ULL / nWindowUs));
-				}
+				DiagLog.LogLine("window synth=nuked sync=single pct=%llu avg_us=%llu max_us=%llu miss_pct=%llu underrun_frames=%llu temp_c=%u emu_pct=%llu mcu_pct=%llu pcm_pct=%llu insn_per_sec=%llu",
+				                static_cast<unsigned long long>(nPct),
+				                static_cast<unsigned long long>(nAvgUs),
+				                static_cast<unsigned long long>(Stats.nMaxUs),
+				                static_cast<unsigned long long>(nMissPct),
+				                static_cast<unsigned long long>(Stats.nUnderrunFrames),
+				                nTempC,
+				                static_cast<unsigned long long>(nWindowUs > 0 ? nTotalDelta * 100 / nWindowUs : 0),
+				                static_cast<unsigned long long>(nTotalDelta > 0 ? (nTotalDelta - nPCMDelta) * 100 / nTotalDelta : 0),
+				                static_cast<unsigned long long>(nTotalDelta > 0 ? nPCMDelta * 100 / nTotalDelta : 0),
+				                static_cast<unsigned long long>(nWindowUs > 0 ? nInsnDelta * 1000000ULL / nWindowUs : 0));
 			}
 		}
 	}
