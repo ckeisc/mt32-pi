@@ -313,20 +313,6 @@ H8Engine ToBackendEngine(CNukedSC55Synth::TH8Engine Engine)
 
 }
 
-const char* CNukedSC55Synth::CycleH8Engine()
-{
-	m_Lock.Acquire();
-	m_H8Engine = (m_H8Engine == TH8Engine::Decoder2) ? TH8Engine::Legacy
-	           : (m_H8Engine == TH8Engine::Legacy)   ? TH8Engine::JIT
-	                                                 : TH8Engine::Decoder2;
-	if (m_pEmulator)
-		m_pEmulator->SetH8Engine(ToBackendEngine(m_H8Engine));
-	m_Lock.Release();
-
-	CDiagLog::Get().LogLine("h8_engine synth=nuked engine=%s", H8EngineName(m_H8Engine));
-	return H8EngineName(m_H8Engine);
-}
-
 CNukedSC55Synth::~CNukedSC55Synth()
 {
 	// Park the PCM task before destroying anything it touches. (In

@@ -92,7 +92,6 @@ public:
 	// Cycle the H8 execution path (Button 2 while this synth is
 	// active). Takes effect between instructions; returns the config
 	// string name of the newly selected engine.
-	const char* CycleH8Engine();
 	static const char* H8EngineName(TH8Engine Engine);
 
 	// CSynthBase

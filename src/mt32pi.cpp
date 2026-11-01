@@ -1248,9 +1248,10 @@ void CMT32Pi::ProcessButtonEvent(const TButtonEvent& Event)
 		}
 		else if (m_pCurrentSynth == m_pNukedSC55Synth)
 		{
-			// Nuked-SC55 uses a single ROM set, so Button 2 instead
-			// cycles the H8 execution path (decoder2 <-> legacy)
-			LCDLog(TLCDLogType::Notice, "H8 engine: %s", m_pNukedSC55Synth->CycleH8Engine());
+			// No Button 2 action for Nuked-SC55: the H8 engine is
+			// fixed to decoder2 (runtime toggle removed). The branch
+			// is kept so Button 2 does not fall through to the
+			// SoundFont path while Nuked-SC55 is active.
 		}
 		else
 		{
@@ -1318,7 +1319,8 @@ void CMT32Pi::SwitchSynth(TSynth NewSynth)
 	m_pCurrentSynth = pNewSynth;
 	const char* pMode = NewSynth == TSynth::MT32 ? "MT-32 mode" : (NewSynth == TSynth::EmuSC ? "EmuSC mode" : (NewSynth == TSynth::NukedSC55 ? "Nuked-SC55 mode" : "SoundFont mode"));
 	LOGNOTE("Switching to %s", pMode);
-	LCDLog(TLCDLogType::Notice, pMode);
+	// No LCD notice for the switch: the mode print repeated on every
+	// switch and flashed the display (removed at Joe's request).
 	CDiagLog::Get().LogLine("switch synth=%s", pMode);
 	// Split park/reactivate across the switch (trim): parking on
 	// switch-from stops core 3 consuming cycles and filling the
