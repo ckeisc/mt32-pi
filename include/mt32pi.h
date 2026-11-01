@@ -136,6 +136,7 @@ private:
 
 	// Actions that can be triggered via events
 	void SwitchSynth(TSynth Synth);
+	const char* GetSynthMode(const CSynthBase* pSynth) const;
 	void SwitchMT32ROMSet(TMT32ROMSet ROMSet);
 	void NextMT32ROMSet();
 	void SwitchSoundFont(size_t nIndex);
@@ -209,6 +210,13 @@ private:
 	// guard ran (1 s cadence; see MainTask). Initialized by the
 	// constructor's member list.
 	unsigned m_nThrottleUpdateTicks;
+
+	// HW1 show-first window (see ProcessButtonEvent): whether the
+	// window has been armed at least once, and the clock tick of
+	// the last HW1 press. Initialized by the constructor's
+	// member list.
+	bool m_bHW1Armed;
+	unsigned m_nHW1LastPressTicks;
 
 	bool m_bLEDOn;
 	unsigned m_nLEDOnTime;

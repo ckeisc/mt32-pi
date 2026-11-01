@@ -28,6 +28,7 @@
 #include <circle/sched/scheduler.h>
 
 #include <cstdarg>
+#include <strings.h>
 
 #include "diaglog.h"
 #include "lcd/drivers/hd44780.h"
@@ -113,6 +114,8 @@ CMT32Pi::CMT32Pi(CI2CMaster* pI2CMaster, CSPIMaster* pSPIMaster, CInterruptSyste
 	  m_bRunning(true),
 	  m_bUITaskDone(false),
 	  m_nThrottleUpdateTicks(0),
+	  m_bHW1Armed(false),
+	  m_nHW1LastPressTicks(0),
 	  m_bLEDOn(false),
 	  m_nLEDOnTime(0),
 
@@ -465,7 +468,15 @@ bool CMT32Pi::InitNukedSC55Synth()
 {
 	assert(m_pNukedSC55Synth == nullptr);
 
-	m_pNukedSC55Synth = new CNukedSC55Synth(m_pConfig->AudioSampleRate, m_pConfig->NukedGain, m_pConfig->NukedOversampling);
+		// [nuked] resampler: kaiser (default), cubic, linear
+	// (case-insensitive; anything else falls back to kaiser).
+	TNukedResampler Resampler = TNukedResampler::Kaiser;
+	if (strcasecmp(m_pConfig->NukedResampler, "cubic") == 0)
+		Resampler = TNukedResampler::Cubic;
+	else if (strcasecmp(m_pConfig->NukedResampler, "linear") == 0)
+		Resampler = TNukedResampler::Linear;
+
+	m_pNukedSC55Synth = new CNukedSC55Synth(m_pConfig->AudioSampleRate, m_pConfig->NukedGain, m_pConfig->NukedOversampling, Resampler);
 	if (!m_pNukedSC55Synth->Initialize())
 	{
 		LOGWARN("Nuked-SC55 init failed; no complete SC-55 ROM set present?");
@@ -1199,30 +1210,45 @@ void CMT32Pi::ProcessButtonEvent(const TButtonEvent& Event)
 
 	if (Event.Button == TButton::Button1 && !Event.bRepeat)
 	{
+		// HW1 show-first: a press while no engine label is showing
+		// only shows the currently selected engine's label (the
+		// same Notice a switch shows) and does NOT switch, so
+		// the current engine can be checked without changing
+		// it. A press within the label window (3 s, matching
+		// CUserInterface::SystemMessageDisplayTimeMillis, which
+		// is private there so the value is repeated here) runs
+		// the switch logic below; each switch re-arms the window
+		// (its new label shows for 3 s), so repeated presses
+		// cycle. The timestamp is refreshed on every HW1 press.
+		const unsigned nNowTicks = CTimer::GetClockTicks();
+		const bool bArmed = m_bHW1Armed && (nNowTicks - m_nHW1LastPressTicks) < static_cast<unsigned>(Utility::MillisToTicks(3000));
+		m_bHW1Armed = true;
+		m_nHW1LastPressTicks = nNowTicks;
+		if (m_pCurrentSynth != nullptr && !bArmed)
+		{
+			LCDLog(TLCDLogType::Notice, "%s", GetSynthMode(m_pCurrentSynth));
+			return;
+		}
+		CSynthBase* pBeforeSwitch = m_pCurrentSynth;
 		// Cycle through the available synths, gated by the last synth
 		// set explicitly from the MiSTer side:
-		// - MiSTer set SoundFont: SoundFont -> NukedSC55 -> EmuSC -> SoundFont
 		// - MiSTer set MT32: Munt only (Button1 goes to/stays on MT32)
-		// - Never set (or any other MiSTer value): the original full cycle
-		//   MT32 -> SoundFont -> EmuSC -> NukedSC55 -> MT32
-		// Unavailable synths are skipped in every case. Explicit switches
-		// (SysEx, MiSTer commands, boot default) are not gated.
+		// - Otherwise (SoundFont-gate or never set): NukedSC55 ->
+		//   EmuSC -> SoundFont -> NukedSC55. MT32 is not in the
+		//   Button1 cycle (reached via MiSTer instead); the old
+		//   SoundFont-gate branch is gone because it filtered MT32
+		//   out, which the new cycle already does. Unavailable
+		//   synths are skipped in every case. Explicit switches
+		//   (SysEx, MiSTer commands, boot default) are not gated.
 		const TMisterSynth MisterSynth = m_MisterControl.GetLastMisterSynth();
 		if (MisterSynth == TMisterSynth::MT32)
 		{
 			if (m_pCurrentSynth != m_pMT32Synth && m_pMT32Synth)
 				SwitchSynth(TSynth::MT32);
 		}
-		else if (MisterSynth == TMisterSynth::SoundFont)
+		else
 		{
-			if (m_pCurrentSynth == m_pSoundFontSynth)
-			{
-				if (m_pNukedSC55Synth)
-					SwitchSynth(TSynth::NukedSC55);
-				else if (m_pEmuSCSynth)
-					SwitchSynth(TSynth::EmuSC);
-			}
-			else if (m_pCurrentSynth == m_pNukedSC55Synth)
+			if (m_pCurrentSynth == m_pNukedSC55Synth)
 			{
 				if (m_pEmuSCSynth)
 					SwitchSynth(TSynth::EmuSC);
@@ -1233,57 +1259,36 @@ void CMT32Pi::ProcessButtonEvent(const TButtonEvent& Event)
 			{
 				if (m_pSoundFontSynth)
 					SwitchSynth(TSynth::SoundFont);
-				else if (m_pNukedSC55Synth)
-					SwitchSynth(TSynth::NukedSC55);
-			}
-			else // MT32 or unexpected: back to the family default
-			{
-				if (m_pSoundFontSynth)
-					SwitchSynth(TSynth::SoundFont);
-				else if (m_pNukedSC55Synth)
-					SwitchSynth(TSynth::NukedSC55);
-				else if (m_pEmuSCSynth)
-					SwitchSynth(TSynth::EmuSC);
-			}
-		}
-		else // Never set, or a MiSTer value with no family: original full cycle
-		{
-			if (m_pCurrentSynth == m_pMT32Synth)
-			{
-				if (m_pSoundFontSynth)
-					SwitchSynth(TSynth::SoundFont);
-				else if (m_pEmuSCSynth)
-					SwitchSynth(TSynth::EmuSC);
 				else if (m_pNukedSC55Synth)
 					SwitchSynth(TSynth::NukedSC55);
 			}
 			else if (m_pCurrentSynth == m_pSoundFontSynth)
 			{
-				if (m_pEmuSCSynth)
-					SwitchSynth(TSynth::EmuSC);
-				else if (m_pNukedSC55Synth)
-					SwitchSynth(TSynth::NukedSC55);
-				else if (m_pMT32Synth)
-					SwitchSynth(TSynth::MT32);
-			}
-			else if (m_pCurrentSynth == m_pEmuSCSynth)
-			{
 				if (m_pNukedSC55Synth)
 					SwitchSynth(TSynth::NukedSC55);
-				else if (m_pMT32Synth)
-					SwitchSynth(TSynth::MT32);
-				else if (m_pSoundFontSynth)
-					SwitchSynth(TSynth::SoundFont);
-			}
-			else
-			{
-				if (m_pMT32Synth)
-					SwitchSynth(TSynth::MT32);
-				else if (m_pSoundFontSynth)
-					SwitchSynth(TSynth::SoundFont);
 				else if (m_pEmuSCSynth)
 					SwitchSynth(TSynth::EmuSC);
 			}
+			else // MT32 or unexpected: back to the cycle head
+			{
+				if (m_pNukedSC55Synth)
+					SwitchSynth(TSynth::NukedSC55);
+				else if (m_pEmuSCSynth)
+					SwitchSynth(TSynth::EmuSC);
+				else if (m_pSoundFontSynth)
+					SwitchSynth(TSynth::SoundFont);
+			}
+		}
+		// Record an HW1 SC-55 selection for the MiSTer FluidSynth
+		// reinterpretation (see CMisterControl::ApplyConfig): only
+		// a Button1 switch that actually changed the synth, to
+		// Nuked/EmuSC/SoundFont, counts. MT32 switches and no-op
+		// presses (show-only, unavailable, already active) leave
+		// the selection untouched.
+		if (m_pCurrentSynth != pBeforeSwitch &&
+		    (m_pCurrentSynth == m_pNukedSC55Synth || m_pCurrentSynth == m_pEmuSCSynth || m_pCurrentSynth == m_pSoundFontSynth))
+		{
+			m_MisterControl.SetHW1SC55Synth(m_pCurrentSynth == m_pNukedSC55Synth ? TSynth::NukedSC55 : (m_pCurrentSynth == m_pEmuSCSynth ? TSynth::EmuSC : TSynth::SoundFont));
 		}
 	}
 	else if (Event.Button == TButton::Button2 && !Event.bRepeat)
@@ -1297,10 +1302,11 @@ void CMT32Pi::ProcessButtonEvent(const TButtonEvent& Event)
 		}
 		else if (m_pCurrentSynth == m_pNukedSC55Synth)
 		{
-			// No Button 2 action for Nuked-SC55: the H8 engine is
-			// fixed to decoder2 (runtime toggle removed). The branch
-			// is kept so Button 2 does not fall through to the
-			// SoundFont path while Nuked-SC55 is active.
+			// Button 2 is currently unbound for Nuked-SC55 (the
+			// resampler cycle is available via CycleResampler()
+			// but not wired). The branch is kept so Button 2 does
+			// not fall through to the SoundFont path while
+			// Nuked-SC55 is active.
 		}
 		else
 		{
@@ -1338,6 +1344,11 @@ void CMT32Pi::ProcessButtonEvent(const TButtonEvent& Event)
 	}
 }
 
+const char* CMT32Pi::GetSynthMode(const CSynthBase* pSynth) const
+{
+	return pSynth == m_pMT32Synth ? "MT-32 mode" : (pSynth == m_pEmuSCSynth ? "EmuSC mode" : (pSynth == m_pNukedSC55Synth ? "Nuked-SC55 mode" : "SoundFont mode"));
+}
+
 void CMT32Pi::SwitchSynth(TSynth NewSynth)
 {
 	CSynthBase* pNewSynth = nullptr;
@@ -1366,7 +1377,7 @@ void CMT32Pi::SwitchSynth(TSynth NewSynth)
 	CSynthBase* pOldSynth = m_pCurrentSynth;
 	m_pCurrentSynth->AllSoundOff();
 	m_pCurrentSynth = pNewSynth;
-	const char* pMode = NewSynth == TSynth::MT32 ? "MT-32 mode" : (NewSynth == TSynth::EmuSC ? "EmuSC mode" : (NewSynth == TSynth::NukedSC55 ? "Nuked-SC55 mode" : "SoundFont mode"));
+	const char* pMode = GetSynthMode(pNewSynth);
 	LOGNOTE("Switching to %s", pMode);
 	LCDLog(TLCDLogType::Notice, pMode);
 	CDiagLog::Get().LogLine("switch synth=%s", pMode);

@@ -34,7 +34,9 @@ CMisterControl::CMisterControl(CI2CMaster* pI2CMaster, TEventQueue& EventQueue)
 
 	  bMisterActive(false),
 	  m_LastSystemStatus{TMisterSynth::Unknown, 0xFF, 0xFF},
-	  m_LastMisterStatus{TMisterSynth::Unknown, 0xFF, 0xFF}
+	  m_LastMisterStatus{TMisterSynth::Unknown, 0xFF, 0xFF},
+	  m_bHW1SC55Selected(false),
+	  m_HW1SC55Synth(TSynth::NukedSC55)
 {
 }
 
@@ -107,14 +109,58 @@ void CMisterControl::Update(const TMisterStatus& SystemStatus)
 	}
 }
 
+TSynth CMisterControl::ResolveSC55Synth() const
+{
+	// MiSTer FluidSynth no longer means SoundFont literally: it
+	// means the current SC-55 engine -- the engine last selected
+	// via HW1 (Nuked/EmuSC/SoundFont), or Nuked if none has been
+	// selected yet (runtime-only; reset on boot, untouched by
+	// MiSTer disconnect).
+	if (m_bHW1SC55Selected)
+		return m_HW1SC55Synth;
+	return TSynth::NukedSC55;
+}
+
 void CMisterControl::ApplyConfig(const TMisterStatus& NewStatus, const TMisterStatus& CurrentStatus)
 {
 	TEvent Event;
 
-	if (NewStatus.Synth != CurrentStatus.Synth)
+	// MiSTer synth mapping: MT32/EmuSC/Nuked are literal. MiSTer
+	// FluidSynth (SoundFont) no longer means SoundFont literally:
+	// MiSTer can only report Munt/FluidSynth, so FluidSynth means
+	// the current SC-55 engine (HW1-selected, or Nuked by default).
+	// Any other value (e.g. Unknown) keeps the old catch-all to
+	// SoundFont. The event is enqueued only when the RESOLVED
+	// target differs from the current synth, so a MiSTer report
+	// that resolves to the synth already active is a silent
+	// no-op (no "Already active!" notice).
+	TSynth TargetSynth;
+	if (NewStatus.Synth == TMisterSynth::MT32)
+		TargetSynth = TSynth::MT32;
+	else if (NewStatus.Synth == TMisterSynth::EmuSC)
+		TargetSynth = TSynth::EmuSC;
+	else if (NewStatus.Synth == TMisterSynth::NukedSC55)
+		TargetSynth = TSynth::NukedSC55;
+	else if (NewStatus.Synth == TMisterSynth::SoundFont)
+		TargetSynth = ResolveSC55Synth();
+	else
+		TargetSynth = TSynth::SoundFont;
+	TSynth CurrentSynth = TSynth::SoundFont;
+	bool bCurrentKnown = true;
+	if (CurrentStatus.Synth == TMisterSynth::MT32)
+		CurrentSynth = TSynth::MT32;
+	else if (CurrentStatus.Synth == TMisterSynth::EmuSC)
+		CurrentSynth = TSynth::EmuSC;
+	else if (CurrentStatus.Synth == TMisterSynth::NukedSC55)
+		CurrentSynth = TSynth::NukedSC55;
+	else if (CurrentStatus.Synth == TMisterSynth::SoundFont)
+		CurrentSynth = TSynth::SoundFont;
+	else
+		bCurrentKnown = false;
+	if (!bCurrentKnown || TargetSynth != CurrentSynth)
 	{
 		Event.Type = TEventType::SwitchSynth;
-		Event.SwitchSynth.Synth = NewStatus.Synth == TMisterSynth::MT32 ? TSynth::MT32 : (NewStatus.Synth == TMisterSynth::EmuSC ? TSynth::EmuSC : (NewStatus.Synth == TMisterSynth::NukedSC55 ? TSynth::NukedSC55 : TSynth::SoundFont));
+		Event.SwitchSynth.Synth = TargetSynth;
 		m_pEventQueue->Enqueue(Event);
 	}
 
