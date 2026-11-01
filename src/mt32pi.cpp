@@ -1200,41 +1200,42 @@ void CMT32Pi::ProcessButtonEvent(const TButtonEvent& Event)
 	if (Event.Button == TButton::Button1 && !Event.bRepeat)
 	{
 		// Cycle through the available synths
+		// Order: SoundFont -> NukedSC55 -> EmuSC -> MT32 (wraps)
 		if (m_pCurrentSynth == m_pMT32Synth)
 		{
 			if (m_pSoundFontSynth)
 				SwitchSynth(TSynth::SoundFont);
-			else if (m_pEmuSCSynth)
-				SwitchSynth(TSynth::EmuSC);
 			else if (m_pNukedSC55Synth)
 				SwitchSynth(TSynth::NukedSC55);
+			else if (m_pEmuSCSynth)
+				SwitchSynth(TSynth::EmuSC);
 		}
 		else if (m_pCurrentSynth == m_pSoundFontSynth)
 		{
-			if (m_pEmuSCSynth)
-				SwitchSynth(TSynth::EmuSC);
-			else if (m_pNukedSC55Synth)
+			if (m_pNukedSC55Synth)
 				SwitchSynth(TSynth::NukedSC55);
+			else if (m_pEmuSCSynth)
+				SwitchSynth(TSynth::EmuSC);
 			else if (m_pMT32Synth)
 				SwitchSynth(TSynth::MT32);
 		}
 		else if (m_pCurrentSynth == m_pEmuSCSynth)
 		{
-			if (m_pNukedSC55Synth)
-				SwitchSynth(TSynth::NukedSC55);
-			else if (m_pMT32Synth)
-				SwitchSynth(TSynth::MT32);
-			else if (m_pSoundFontSynth)
-				SwitchSynth(TSynth::SoundFont);
-		}
-		else
-		{
 			if (m_pMT32Synth)
 				SwitchSynth(TSynth::MT32);
 			else if (m_pSoundFontSynth)
 				SwitchSynth(TSynth::SoundFont);
-			else if (m_pEmuSCSynth)
+			else if (m_pNukedSC55Synth)
+				SwitchSynth(TSynth::NukedSC55);
+		}
+		else
+		{
+			if (m_pEmuSCSynth)
 				SwitchSynth(TSynth::EmuSC);
+			else if (m_pMT32Synth)
+				SwitchSynth(TSynth::MT32);
+			else if (m_pSoundFontSynth)
+				SwitchSynth(TSynth::SoundFont);
 		}
 	}
 	else if (Event.Button == TButton::Button2 && !Event.bRepeat)
