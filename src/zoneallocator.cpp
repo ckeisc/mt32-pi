@@ -38,10 +38,13 @@ LOGMODULE("zoneallocator");
 // (~21 MB) through C++ new (~53 MB total for its init), and Nuked-SC55's
 // emulator state takes ~34 MB more (its ROM staging buffers are moved
 // into the backend and released after load to keep this down). 96 MB
-// covers both engines plus the kernel's own allocations, and leaves the
-// zone the same size it had before the Nuked-SC55 engine was added
-// (~840 MB on a 1 GB Pi, ~330 MB on a 512 MB Pi Zero 2 W) for SoundFonts.
-constexpr size_t MallocHeapSize = 96 * MEGABYTE;
+// covered both engines at init, but left only ~1.1 MB free at MT-32
+// ROM-switch time (diag-20), so a CM-32L reopen (1 MB PCM plus
+// timbres/reverb) exhausted it and hung inside Munt's open().
+// 128 MB leaves ~33 MB free at switch time for the reopen, and still
+// leaves the zone ~298 MB on a 512 MB Pi Zero 2 W (enough for the
+// 255 MB Kitrinx SoundFont).
+constexpr size_t MallocHeapSize = 128 * MEGABYTE;
 
 CZoneAllocator* CZoneAllocator::s_pThis = nullptr;
 
