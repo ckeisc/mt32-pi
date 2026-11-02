@@ -244,9 +244,6 @@ void CMT32Synth::SetMIDIChannels(TMIDIChannels Channels)
 
 bool CMT32Synth::SwitchROMSet(TMT32ROMSet ROMSet)
 {
-	const MT32Emu::ROMImage* pControlROMImage;
-	const MT32Emu::ROMImage* pPCMROMImage;
-
 	// Is this ROM set already active?
 	if (ROMSet == m_CurrentROMSet)
 	{
@@ -255,8 +252,16 @@ bool CMT32Synth::SwitchROMSet(TMT32ROMSet ROMSet)
 		return false;
 	}
 
-	// Get ROM set if available
-	if (!m_ROMManager.GetROMSet(ROMSet, m_CurrentROMSet, pControlROMImage, pPCMROMImage))
+	// Get ROM set if available, into temporaries: m_CurrentROMSet and
+	// the ROM image pointers are only committed after a successful
+	// open() below, so a failed switch leaves the previous set fully
+	// intact instead of claiming a set the synth never opened (the old
+	// code set m_CurrentROMSet via GetROMSet before open() and only
+	// asserted on open(), which release builds ignore).
+	TMT32ROMSet NewROMSet;
+	const MT32Emu::ROMImage* pControlROMImage;
+	const MT32Emu::ROMImage* pPCMROMImage;
+	if (!m_ROMManager.GetROMSet(ROMSet, NewROMSet, pControlROMImage, pPCMROMImage))
 	{
 		if (m_pUI)
 			m_pUI->ShowSystemMessage("ROM set not avail!");
@@ -266,11 +271,26 @@ bool CMT32Synth::SwitchROMSet(TMT32ROMSet ROMSet)
 	// Reopen synth with new ROMs
 	m_Lock.Acquire();
 	m_pSynth->close();
-	assert(m_pSynth->open(*pControlROMImage, *pPCMROMImage));
+	if (!m_pSynth->open(*pControlROMImage, *pPCMROMImage))
+	{
+		LOGNOTE("ROM set switch to %d failed, restoring previous set", static_cast<u8>(ROMSet));
+		// Roll back to the previous ROMs (their images are still held
+		// by the ROM manager) so the synth is left playable.
+		if (m_pSynth->open(*m_pControlROMImage, *m_pPCMROMImage))
+		{
+			m_pSynth->setOutputGain(m_nGain);
+			m_pSynth->setReverbOutputGain(m_nReverbGain);
+		}
+		m_Lock.Release();
+		if (m_pUI)
+			m_pUI->ShowSystemMessage("ROM switch failed!");
+		return false;
+	}
 	m_pSynth->setOutputGain(m_nGain);
 	m_pSynth->setReverbOutputGain(m_nReverbGain);
 	m_Lock.Release();
 
+	m_CurrentROMSet    = NewROMSet;
 	m_pControlROMImage = pControlROMImage;
 	m_pPCMROMImage     = pPCMROMImage;
 
