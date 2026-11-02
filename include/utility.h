@@ -132,14 +132,16 @@ namespace Utility
 		}
 	}
 
-	// Swaps two objects in-place
+	// Swaps two objects in-place, bytewise. Only valid for types that don't
+	// hold pointers to themselves (true for everything sorted here, e.g. CString).
+	// The void* casts tell GCC (-Wclass-memaccess) the raw copy is intentional.
 	template<class T>
 	inline void Swap(T& ObjectA, T& ObjectB)
 	{
 		u8 Buffer[sizeof(T)];
-		memcpy(Buffer, &ObjectA, sizeof(T));
-		memcpy(&ObjectA, &ObjectB, sizeof(T));
-		memcpy(&ObjectB, Buffer, sizeof(T));
+		memcpy(Buffer, static_cast<void*>(&ObjectA), sizeof(T));
+		memcpy(static_cast<void*>(&ObjectA), static_cast<void*>(&ObjectB), sizeof(T));
+		memcpy(static_cast<void*>(&ObjectB), Buffer, sizeof(T));
 	}
 
 	namespace

@@ -38,7 +38,7 @@
 set -o pipefail
 
 SCRIPT_VERSION=0.2.0
-GITHUB_API_URL="https://api.github.com/repos/dwhinham/mt32-pi/releases/latest"
+GITHUB_API_URL="https://api.github.com/repos/macroexp/mt32-pi/releases/latest"
 MISTER_WPA_SUPPLICANT_CFG_PATH="/media/fat/linux/wpa_supplicant.conf"
 
 DIALOG=(dialog --no-collapse --colors --backtitle "mt32-pi Installer v$SCRIPT_VERSION")
@@ -377,7 +377,10 @@ function get_latest_version {
 
 	temp_dir="$1"
 	temp_file=$(mktemp) || return 1
-	release_url=$("${CURL[@]}" -s -L $GITHUB_API_URL | jq -r ".assets[0].browser_download_url") || return 1
+	release_url=$("${CURL[@]}" -s -L "$GITHUB_API_URL" | jq -r ".assets[0].browser_download_url // empty") || return 1
+	if [ -z "$release_url" ]; then
+		die "No mt32-pi release is available for download yet."
+	fi
 
 	"${CURL[@]}" -L -o "$temp_file" "$release_url" 2>&1 | "${DIALOG[@]}" --progressbox "Downloading mt32-pi..." 30 83 || return 1
 	unzip "$temp_file" -d "$temp_dir" | "${DIALOG[@]}" --progressbox "Extracting mt32-pi..." 30 83 || return 1
@@ -619,10 +622,10 @@ It's now safe to remove the SD card from your card reader and insert it into you
 \Z1\ZuNOTE:\Zn
 MT-32 mode will be unavailable until you add MT-32 ROM files to the \Zb\Z4roms\Zn directory on the SD card.
 
-             Thankyou for using mt32-pi! \Z5<3\Zn
+             Thank you for using pim-32! \Z5<3\Zn
 
-           \Z1\Zuhttps://github.com/dwhinham/mt32-pi\Zn
-               \Z1\Zuhttps://ko-fi.com/d0pefish\Zn
+           \Z1\Zuhttps://github.com/macroexp/mt32-pi\Zn
+      Based on mt32-pi by Dale Whinham (dwhinham)
 
          Please support open source developers!
 EOF

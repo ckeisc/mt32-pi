@@ -7,9 +7,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-10-27
+
 ### Added
 
-- New EmuSC synthesizer engine based on [libEmuSC](https://github.com/skjelten/emusc) v0.7.0, emulating the Roland Sound Canvas SC-55 family. Select it with `default_synth = emusc`, by cycling synths with the control buttons, via the custom SysEx synth-switch command (parameter `2`), or from MiSTer (new status value `0xA3`). SC-55 ROM dumps are loaded from the `roms/sc55` directory on SD/USB (control/CPU/wave ROMs are identified by file size; wave ROMs load in filename order). New `[emusc]` config section with `gain` and `sound_map` (`gs`/`gs_gm`/`mt32`) options.
+- Tools for comparing compiler toolchains, in `scripts/dev/compiler-ab`: they render the same MIDI through Munt and FluidSynth built with two toolchains and compare the output sample by sample.
+
+### Changed
+
+- Release builds now use Arm GNU Toolchain 15.2.rel1 (GCC 15.2), the version the Circle framework recommends, instead of 11.3.rel1. Offline renders of Munt and FluidSynth match the 11.3 builds, and a Pi Zero 2 W soak test (repeated cold boots, Laura Bow 2, SoundFont playback, Wi-Fi/RTP MIDI) passed. To build from source, install 15.2.rel1 (see `BUILDING.md`).
+- If an MT-32 ROM file can't be read completely, or doesn't match any known ROM, the log now says so instead of the ROM silently going missing.
+
+### Fixed
+
+- SoundFont mode: memory could be corrupted when FluidSynth resized one of its buffers (for example its voice list when polyphony changes), which could crash or hang the synth.
+- MT-32 mode: MIDI and SysEx messages are now handed to Munt safely while it renders on another CPU core. Before, a SysEx message, such as a game uploading its own instruments, could occasionally be processed before all of its data had arrived.
+
+## [0.16.1] - 2026-10-27
+
+### Changed
+
+- Updated FluidSynth (SoundFont synthesizer) from 2.3.1 to 2.6.1. Reverb keeps the previous algorithm, so existing effect settings and per-SoundFont profiles still apply. Other changes come from FluidSynth itself: more accurate SoundFont modulators and envelopes, sample fine-tuning fixed for some instruments, portamento applies to all notes, better handling of GS/XG drum kit selection and NRPNs, and several crash and security fixes in SoundFont loading.
+- Building from source no longer needs `libglib2.0-dev`. In an existing build tree, run `make mrproper` before pulling this version.
+
+## [0.16.0] - 2026-10-27
+
+### Changed
+
+- Updated the Circle framework from Step 45.1 to Step 51.1.1 (circle-stdlib v21, newlib 4.5.0). This brings Circle's current drivers, including its USB, Wi-Fi, I²S and PWM audio support, and replaces all of pim-32's local Circle patches.
+- `config.txt` now sets `initial_turbo=0`, as Circle recommends. Newer Raspberry Pi firmware otherwise boosts the clock for the first 60 seconds after boot, which can disturb device setup. If you update by copying files, copy the new `config.txt` too.
+- The release package includes the `brcmfmac43430-sdio.clm_blob` Wi-Fi firmware file, which Circle now loads on the Pi 3B and Pi Zero W.
+- Building from source now needs `texinfo`. In an existing build tree, run `make mrproper` before pulling this version (see `BUILDING.md`).
+
+## [0.15.0] - 2026-10-25
+
+### Added
+
+- Tools for A/B testing Munt upgrades, in `scripts/dev/munt-ab`.
+
+### Changed
+
+- Updated the MT-32 emulation library (Munt libmt32emu) from 2.7.0 to 2.8.3. Most music sounds identical. Differences you may notice, all from Munt's changes towards real hardware behaviour:
+  - With MT-32 v1.x control ROMs, dense passages that run out of partials now steal voices the way old-generation units do.
+  - Changing a part's timbre by SysEx now makes notes already playing on that part decay, like the real hardware.
+  - Malformed MIDI messages are ignored instead of being played.
+  - Lower CPU use.
+- Updated inih (configuration file parser) from r56 to r62. Over-long lines in configuration files are now skipped cleanly.
+
+## [0.14.2] - 2026-10-25
+
+### Fixed
+
+- Builds are back on Arm GNU Toolchain 11.3.rel1. The GCC 15 builds in 0.14.0 and 0.14.1 could fail to find ROMs or start a synth at boot, crash with a "sync failure", or leave some uploaded MT-32 instruments silent. The GCC 15 compatibility fixes stay in place so the toolchain can move forward again once Circle is updated.
+
+## [0.14.1] - 2026-10-19
+
+### Fixed
+
+- GeneralUser GS's effects profile wasn't being applied in 0.14.0, because it was still named for the old v1.511 SoundFont. It's now `GeneralUser GS v2.0.3.cfg`, with the reverb and chorus settings the SoundFont's author recommends for v2.0.3. Output level is unchanged.
+
+## [0.14.0] - 2026-10-19
+
+First release of **pim-32**, a community-maintained continuation of [mt32-pi](https://github.com/dwhinham/mt32-pi) by Dale Whinham. Versions continue from mt32-pi's last release (0.13.1).
+
+### Changed
+
+- Built with Arm GNU Toolchain 15.2.rel1 (GCC 15.2), up from 11.3.rel1.
+- Bundled SoundFont is now GeneralUser GS v2.0.3 (was v1.511, which is no longer hosted).
+- The installer and updater now download releases from [macroexp/mt32-pi](https://github.com/macroexp/mt32-pi). Please manually re-download `mt32pi_updater.py` once to switch over.
+- The device still identifies itself as `mt32-pi` (boot log, FTP banner) so the updater keeps working across the rename.
+
+### Fixed
+
+- Audio output buffer was being allocated with zero length due to a missing pair of parentheses, so converted samples were written into neighbouring memory. Audio happened to work, but the buffer is now sized correctly.
+- Possible unterminated strings when parsing IP addresses from the configuration file, and in the FTP server's directory listing and `PORT` command.
+- Updater: no longer crashes when no releases are available, and ignores drafts, releases without files, and non-version tags.
+- Installer: reports a clear error instead of trying to download a missing release.
 
 ## [0.13.1] - 2023-03-18
 
@@ -546,7 +619,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Initial version.
 
-[unreleased]: https://github.com/dwhinham/mt32-pi/compare/v0.13.1..HEAD
+[unreleased]: https://github.com/macroexp/mt32-pi/compare/v0.16.1..HEAD
+[0.17.0]: https://github.com/macroexp/mt32-pi/compare/v0.16.1..v0.17.0
+[0.16.1]: https://github.com/macroexp/mt32-pi/compare/v0.16.0..v0.16.1
+[0.16.0]: https://github.com/macroexp/mt32-pi/compare/v0.15.0..v0.16.0
+[0.15.0]: https://github.com/macroexp/mt32-pi/compare/v0.14.2..v0.15.0
+[0.14.2]: https://github.com/macroexp/mt32-pi/compare/v0.14.1..v0.14.2
+[0.14.1]: https://github.com/macroexp/mt32-pi/compare/v0.14.0..v0.14.1
+[0.14.0]: https://github.com/macroexp/mt32-pi/releases/tag/v0.14.0
 [0.13.1]: https://github.com/dwhinham/mt32-pi/compare/v0.13.0..v0.13.1
 [0.13.0]: https://github.com/dwhinham/mt32-pi/compare/v0.12.1..v0.13.0
 [0.12.1]: https://github.com/dwhinham/mt32-pi/compare/v0.12.0..v0.12.1
