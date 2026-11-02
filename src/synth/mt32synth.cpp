@@ -21,7 +21,9 @@
 //
 
 #include <circle/logger.h>
+#include <circle/memory.h>
 #include <circle/timer.h>
+#include "diaglog.h"
 
 #include "config.h"
 #include "lcd/ui.h"
@@ -268,11 +270,23 @@ bool CMT32Synth::SwitchROMSet(TMT32ROMSet ROMSet)
 		return false;
 	}
 
+	// Diagnostic log (no-op unless [diagnostics] enabled = on): records
+	// the switch start (with heap free, so a later allocation failure
+	// can be correlated), the result, and any failure. Munt otherwise
+	// logs nothing to the diag log, which left ROM-switch hangs
+	// invisible in mt32pi-diag.log.
+	CDiagLog::Get().LogLine("switch romset=%d -> %d heap_free_low_kb=%u",
+	                        static_cast<unsigned>(m_CurrentROMSet), static_cast<unsigned>(NewROMSet),
+	                        static_cast<unsigned>(CMemorySystem::Get()->GetHeapFreeSpace(HEAP_LOW) / 1024));
+
 	// Reopen synth with new ROMs
 	m_Lock.Acquire();
 	m_pSynth->close();
 	if (!m_pSynth->open(*pControlROMImage, *pPCMROMImage))
 	{
+		CDiagLog::Get().LogLine("switch romset failed=%d heap_free_low_kb=%u",
+		                        static_cast<unsigned>(ROMSet),
+		                        static_cast<unsigned>(CMemorySystem::Get()->GetHeapFreeSpace(HEAP_LOW) / 1024));
 		LOGNOTE("ROM set switch to %d failed, restoring previous set", static_cast<u8>(ROMSet));
 		// Roll back to the previous ROMs (their images are still held
 		// by the ROM manager) so the synth is left playable.
@@ -293,6 +307,10 @@ bool CMT32Synth::SwitchROMSet(TMT32ROMSet ROMSet)
 	m_CurrentROMSet    = NewROMSet;
 	m_pControlROMImage = pControlROMImage;
 	m_pPCMROMImage     = pPCMROMImage;
+
+	CDiagLog::Get().LogLine("switch romset done=%d heap_free_low_kb=%u",
+	                        static_cast<unsigned>(NewROMSet),
+	                        static_cast<unsigned>(CMemorySystem::Get()->GetHeapFreeSpace(HEAP_LOW) / 1024));
 
 	return true;
 }

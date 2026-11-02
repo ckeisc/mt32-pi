@@ -1422,6 +1422,8 @@ void CMT32Pi::SwitchMT32ROMSet(TMT32ROMSet ROMSet)
 	if (m_pMT32Synth == nullptr)
 		return;
 
+	CDiagLog::Get().LogLine("switch romset event=%d", static_cast<unsigned>(ROMSet));
+
 	LOGNOTE("Switching to ROM set %d", static_cast<u8>(ROMSet));
 	if (m_pMT32Synth->SwitchROMSet(ROMSet) && m_pCurrentSynth == m_pMT32Synth)
 		m_pMT32Synth->ReportStatus();
