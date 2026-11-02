@@ -217,6 +217,8 @@ private:
 	// member list.
 	bool m_bHW1Armed;
 	unsigned m_nHW1LastPressTicks;
+	bool m_bHW2Armed;
+	unsigned m_nHW2LastPressTicks;
 
 	bool m_bLEDOn;
 	unsigned m_nLEDOnTime;
