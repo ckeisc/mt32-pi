@@ -116,6 +116,8 @@ CMT32Pi::CMT32Pi(CI2CMaster* pI2CMaster, CSPIMaster* pSPIMaster, CInterruptSyste
 	  m_nThrottleUpdateTicks(0),
 	  m_bHW1Armed(false),
 	  m_nHW1LastPressTicks(0),
+	  m_bHW2Armed(false),
+	  m_nHW2LastPressTicks(0),
 	  m_bLEDOn(false),
 	  m_nLEDOnTime(0),
 
@@ -663,7 +665,7 @@ void CMT32Pi::AudioTask()
 
 	// Extra byte so that we can write to the 24-bit buffer with overlapping 32-bit writes (efficiency)
 	float FloatBuffer[nQueueSizeFrames * nChannels];
-	s8 IntBuffer[nQueueSizeFrames * nBytesPerFrame + bI2S ? 0 : 1];
+	s8 IntBuffer[nQueueSizeFrames * nBytesPerFrame + (bI2S ? 0 : 1)];
 
 	while (m_bRunning)
 	{
@@ -1293,8 +1295,24 @@ void CMT32Pi::ProcessButtonEvent(const TButtonEvent& Event)
 	}
 	else if (Event.Button == TButton::Button2 && !Event.bRepeat)
 	{
+		// HW2 show-first (mirrors HW1): first press (or press after the
+		// 3 s label window) only shows the current selection and does
+		// NOT switch; a press within the window runs the switch logic.
+		// Applies to the engines whose HW2 switches a config (MT32 ROM
+		// set, SoundFont); EmuSC already shows only, Nuked is unbound.
+		const unsigned nNowTicks = CTimer::GetClockTicks();
+		const bool bArmed = m_bHW2Armed && (nNowTicks - m_nHW2LastPressTicks) < static_cast<unsigned>(Utility::MillisToTicks(3000));
+		m_bHW2Armed = true;
+		m_nHW2LastPressTicks = nNowTicks;
 		if (m_pCurrentSynth == m_pMT32Synth)
+		{
+			if (!bArmed && m_pMT32Synth)
+			{
+				m_pMT32Synth->ReportStatus();
+				return;
+			}
 			NextMT32ROMSet();
+		}
 		else if (m_pCurrentSynth == m_pEmuSCSynth)
 		{
 			// No ROM-set switching for EmuSC yet; a single ROM set is supported
@@ -1310,6 +1328,11 @@ void CMT32Pi::ProcessButtonEvent(const TButtonEvent& Event)
 		}
 		else
 		{
+			if (!bArmed && m_pSoundFontSynth)
+			{
+				m_pSoundFontSynth->ReportStatus();
+				return;
+			}
 			// Next SoundFont
 			const size_t nSoundFonts = m_pSoundFontSynth->GetSoundFontManager().GetSoundFontCount();
 
@@ -1398,6 +1421,8 @@ void CMT32Pi::SwitchMT32ROMSet(TMT32ROMSet ROMSet)
 {
 	if (m_pMT32Synth == nullptr)
 		return;
+
+	CDiagLog::Get().LogLine("switch romset event=%d", static_cast<unsigned>(ROMSet));
 
 	LOGNOTE("Switching to ROM set %d", static_cast<u8>(ROMSet));
 	if (m_pMT32Synth->SwitchROMSet(ROMSet) && m_pCurrentSynth == m_pMT32Synth)

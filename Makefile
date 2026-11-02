@@ -33,6 +33,7 @@ submodules:
 	@git submodule update --init --depth 1
 	@git -C external/circle-stdlib submodule update --init --depth 1 libs/circle libs/circle-newlib
 	@git -C external/circle-stdlib/libs/circle submodule update --init --depth 1 addon/wlan/hostap
+	@git -C external/fluidsynth submodule update --init --depth 1 gcem
 
 #
 # Configure circle-stdlib
@@ -41,15 +42,11 @@ $(CIRCLE_STDLIB_CONFIG) $(CIRCLE_CONFIG)&:
 	@echo "Configuring for Raspberry Pi $(RASPBERRYPI) ($(BITS) bit)"
 	$(CIRCLESTDLIBHOME)/configure --raspberrypi=$(RASPBERRYPI) --prefix=$(PREFIX)
 
-# Apply patches
-	@${APPLY_PATCH} $(CIRCLEHOME) patches/circle-45-minimal-usb-drivers.patch
-	@${APPLY_PATCH} $(CIRCLEHOME) patches/circle-45-cp210x-remove-partnum-check.patch
-	@${APPLY_PATCH} $(CIRCLEHOME) patches/circle-45-gzip-kernel.patch
-
-ifeq ($(strip $(GC_SECTIONS)),1)
-# Enable function/data sections for circle-stdlib
-	@echo "CFLAGS_FOR_TARGET += -ffunction-sections -fdata-sections" >> $(CIRCLE_STDLIB_CONFIG)
-endif
+# Leave out USB drivers we don't use (replaces the old minimal-usb-drivers patch).
+# These guards are in Circle's lib/usb/usbdevicefactory.cpp (since Step 48) but
+# aren't documented upstream. USB MIDI, mass storage, serial and network stay in.
+	@echo "DEFINE += -DEXCLUDE_USB_KEYB -DEXCLUDE_USB_MOUSE -DEXCLUDE_USB_GAMEPAD" >> $(CIRCLE_CONFIG)
+	@echo "DEFINE += -DEXCLUDE_USB_PRINTER -DEXCLUDE_USB_BLUETOOTH -DEXCLUDE_USB_TOUCHSCREEN" >> $(CIRCLE_CONFIG)
 
 # Enable multi-core
 	@echo "DEFINE += -DARM_ALLOW_MULTI_CORE" >> $(CIRCLE_CONFIG)
@@ -63,7 +60,7 @@ endif
 # The Nuked-SC55 backend pushes the kernel image past Circle's default
 # 2 MB KERNEL_MAX_SIZE, which would leave the kernel stack inside .rodata.
 # 4 MB is kept deliberately (Joe, 2026-10-23) so the image has room to grow.
-	@echo "DEFINE += -DKERNEL_MAX_SIZE=4194304" >> $(CIRCLE_CONFIG)
+	@echo "DEFINE += -DKERNEL_MAX_SIZE=0x400000" >> $(CIRCLE_CONFIG)
 
 # Enable PWM audio output on GPIO 12/13 for the Pi Zero 2 W
 	@echo "DEFINE += -DUSE_PWM_AUDIO_ON_ZERO" >> $(CIRCLE_CONFIG)
@@ -91,6 +88,7 @@ $(MT32EMUBUILDDIR)/.done: $(CIRCLESTDLIBHOME)/.done
 		 -DCMAKE_BUILD_TYPE=Release \
 		 -Dlibmt32emu_C_INTERFACE=FALSE \
 		 -Dlibmt32emu_SHARED=FALSE \
+		 -DBUILD_TESTING=OFF \
 		 $(MT32EMUHOME) \
 		 >/dev/null
 	@cmake --build $(MT32EMUBUILDDIR)
@@ -102,12 +100,15 @@ $(MT32EMUBUILDDIR)/.done: $(CIRCLESTDLIBHOME)/.done
 fluidsynth: $(FLUIDSYNTHBUILDDIR)/.done
 
 $(FLUIDSYNTHBUILDDIR)/.done: $(CIRCLESTDLIBHOME)/.done
-	@${APPLY_PATCH} $(FLUIDSYNTHHOME) patches/fluidsynth-2.3.1-circle.patch
+	@${APPLY_PATCH} $(FLUIDSYNTHHOME) patches/fluidsynth-2.6.1-circle.patch
 
 	@CFLAGS="$(CFLAGS_EXTERNAL)" \
+	CXXFLAGS="$(CFLAGS_EXTERNAL)" \
 	cmake -B $(FLUIDSYNTHBUILDDIR) \
 		 $(CMAKE_TOOLCHAIN_FLAGS) \
 		 -DCMAKE_C_FLAGS_RELEASE="-Ofast -fopenmp-simd" \
+		 -DCMAKE_CXX_FLAGS_RELEASE="-Ofast -fopenmp-simd" \
+		 -Dosal=embedded \
 		 -DCMAKE_BUILD_TYPE=Release \
 		 -DBUILD_SHARED_LIBS=OFF \
 		 -Denable-aufile=OFF \
@@ -117,9 +118,9 @@ $(FLUIDSYNTHBUILDDIR)/.done: $(CIRCLESTDLIBHOME)/.done
 		 -Denable-ipv6=OFF \
 		 -Denable-jack=OFF \
 		 -Denable-ladspa=OFF \
-		 -Denable-libinstpatch=OFF \
 		 -Denable-libsndfile=OFF \
 		 -Denable-midishare=OFF \
+		 -Denable-native-dls=OFF \
 		 -Denable-network=OFF \
 		 -Denable-oboe=OFF \
 		 -Denable-openmp=OFF \
@@ -128,8 +129,10 @@ $(FLUIDSYNTHBUILDDIR)/.done: $(CIRCLESTDLIBHOME)/.done
 		 -Denable-pipewire=OFF \
 		 -Denable-pulseaudio=OFF \
 		 -Denable-readline=OFF \
-		 -Denable-sdl2=OFF \
+		 -Denable-sdl3=OFF \
+		 -Denable-signalsmith=OFF \
 		 -Denable-threads=OFF \
+		 -Denable-wasapi=OFF \
 		 -Denable-waveout=OFF \
 		 -Denable-winmidi=OFF \
 		 $(FLUIDSYNTHHOME) \
@@ -195,17 +198,15 @@ all: circle-stdlib mt32emu fluidsynth emusc nuked
 # Clean kernel only
 #
 clean:
-	@$(MAKE) -f Kernel.mk clean
+# CHECK_DEPS=0: don't generate dependency files just to delete them
+	@$(MAKE) -f Kernel.mk clean CHECK_DEPS=0
 
 #
 # Clean kernel and all dependencies
 #
 mrproper: clean
 # Reverse patches
-	@${REVERSE_PATCH} $(CIRCLEHOME) patches/circle-45-gzip-kernel.patch
-	@${REVERSE_PATCH} $(CIRCLEHOME) patches/circle-45-cp210x-remove-partnum-check.patch
-	@${REVERSE_PATCH} $(CIRCLEHOME) patches/circle-45-minimal-usb-drivers.patch
-	@${REVERSE_PATCH} $(FLUIDSYNTHHOME) patches/fluidsynth-2.3.1-circle.patch
+	@${REVERSE_PATCH} $(FLUIDSYNTHHOME) patches/fluidsynth-2.6.1-circle.patch
 
 # Clean circle-stdlib
 	@if [ -f $(CIRCLE_STDLIB_CONFIG) ]; then $(MAKE) -C $(CIRCLESTDLIBHOME) mrproper; fi

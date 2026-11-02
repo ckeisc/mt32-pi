@@ -24,8 +24,8 @@
 #define _optional_h
 
 #include <assert.h>
-#include <circle/new.h>
 #include <circle/types.h>
+#include <new>
 
 template<typename T>
 class TOptional

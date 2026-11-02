@@ -14,8 +14,8 @@ USERBAUD?=115200
 # Enable section garbage collection
 GC_SECTIONS?=1
 
-# Compress the kernel
-GZIP_KERNEL?=1
+# Compress the kernel (Circle only compresses 64-bit kernels; 32-bit ones stay uncompressed)
+GZIP_KERNEL?=0
 
 # Toolchain setup
 ifeq ($(BOARD), pi2)

@@ -54,10 +54,15 @@ public:
 		if (!(m_pData = new MT32Emu::Bit8u[nSize]))
 			return false;
 
-		UINT nRead;
+		UINT nRead = 0;
 		Result = f_read(&m_File, m_pData, nSize, &nRead);
+		if (Result != FR_OK || nRead != nSize)
+		{
+			LOGERR("Read %u of %u bytes from '%s' (error %d)", nRead, static_cast<unsigned int>(nSize), pFileName, Result);
+			return false;
+		}
 
-		return Result == FR_OK;
+		return true;
 	}
 
 	virtual void close() override
@@ -236,6 +241,11 @@ bool CROMManager::CheckROM(const char* pPath)
 
 	// Check ROM and store if valid
 	const MT32Emu::ROMImage* pROM = MT32Emu::ROMImage::makeROMImage(pFile);
+
+	// An unrecognised file is normal (e.g. a readme), but it is also what a corrupted read looks like
+	if (!pROM->getROMInfo())
+		LOGNOTE("'%s' is not a known ROM image (%u bytes)", pPath, static_cast<unsigned int>(pFile->getSize()));
+
 	if (!StoreROM(*pROM))
 	{
 		MT32Emu::ROMImage::freeROMImage(pROM);

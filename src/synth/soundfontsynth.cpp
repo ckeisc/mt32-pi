@@ -64,9 +64,6 @@ extern "C"
 		return pFile;
 	}
 
-	void fluid_msleep(unsigned int msecs) { CTimer::SimpleMsDelay(msecs); }
-	double fluid_utime() { return static_cast<double>(CTimer::GetClockTicks()); }
-
 	// Replacements for fluid_sfont.c functions
 	// These were found to be much faster than FluidSynth's default approach of going through libc
 	void* default_fopen(const char* path)
@@ -199,6 +196,10 @@ bool CSoundFontSynth::Initialize()
 	fluid_settings_setint(m_pSettings, "synth.device-id", static_cast<int>(TDeviceID::SoundCanvasDefault));
 	fluid_settings_setnum(m_pSettings, "synth.sample-rate", static_cast<double>(m_nSampleRate));
 	fluid_settings_setint(m_pSettings, "synth.threadsafe-api", false);
+
+	// FluidSynth 2.6 made Dattorro the default reverb; keep the FDN reverb used up to 2.5 so that
+	// existing reverb settings and per-SoundFont effect profiles sound the same
+	fluid_settings_setstr(m_pSettings, "synth.reverb.engine", "fdn");
 
 	return Reinitialize(pSoundFontPath, &FXProfile);
 }

@@ -23,6 +23,10 @@
 # -----------------------------------------------------------------------------
 # Changelog
 # -----------------------------------------------------------------------------
+# 0.2.6 - 2026-10-19
+# - Point at the macroexp/mt32-pi fork.
+# - Don't crash when the repository has no releases, or releases without assets.
+#
 # 0.2.5 - 2023-03-18
 # - Fixed self-update URL after renaming main git branch.
 #
@@ -86,10 +90,10 @@ except ImportError:
     # Fall back on pkg_resources when packaging is unavailable
     from pkg_resources import parse_version
 
-GITHUB_REPO = "dwhinham/mt32-pi"
+GITHUB_REPO = "macroexp/mt32-pi"
 GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases"
 SCRIPT_URL = f"https://github.com/{GITHUB_REPO}/raw/main/scripts/mt32pi_updater.py"
-SCRIPT_VERSION = "0.2.5"
+SCRIPT_VERSION = "0.2.6"
 
 # Config keys
 K_SECTION = "updater"
@@ -395,9 +399,25 @@ def get_latest_release_info():
         print("Failed to retrieve release info from GitHub.", file=sys.stderr)
         return None
 
+    # Ignore drafts, releases without a downloadable asset, and tags that
+    # aren't version numbers (e.g. "fork-baseline")
+    candidates = []
+    for release in releases:
+        if release.get("draft") or not release.get("assets"):
+            continue
+        try:
+            version = parse_version(release["tag_name"])
+        except Exception:
+            continue
+        candidates.append((version, release))
+
+    if not candidates:
+        print(f"No releases are available from {GITHUB_REPO} yet.", file=sys.stderr)
+        return None
+
     # Sort by version number in descending order
-    releases.sort(reverse=True, key=lambda release: parse_version(release["tag_name"]))
-    return releases[0]
+    candidates.sort(reverse=True, key=lambda candidate: candidate[0])
+    return candidates[0][1]
 
 
 def download_and_extract_release(release_info, destination_path):

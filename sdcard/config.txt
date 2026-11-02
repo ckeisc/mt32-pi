@@ -5,6 +5,10 @@ force_eeprom_read=0
 gpu_mem=16
 disable_overscan=1
 
+# Newer firmware boosts the clock for the first 60 seconds by default, which can
+# disturb Circle's device initialization (recommended by Circle since Step 49)
+initial_turbo=0
+
 # Ensure stable I2C baud rate by locking the core clock
 core_freq=250
 core_freq_min=250

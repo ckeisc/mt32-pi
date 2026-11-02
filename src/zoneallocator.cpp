@@ -38,10 +38,13 @@ LOGMODULE("zoneallocator");
 // (~21 MB) through C++ new (~53 MB total for its init), and Nuked-SC55's
 // emulator state takes ~34 MB more (its ROM staging buffers are moved
 // into the backend and released after load to keep this down). 96 MB
-// covers both engines plus the kernel's own allocations, and leaves the
-// zone the same size it had before the Nuked-SC55 engine was added
-// (~840 MB on a 1 GB Pi, ~330 MB on a 512 MB Pi Zero 2 W) for SoundFonts.
-constexpr size_t MallocHeapSize = 96 * MEGABYTE;
+// covered both engines at init, but left only ~1.1 MB free at MT-32
+// ROM-switch time (diag-20), so a CM-32L reopen (1 MB PCM plus
+// timbres/reverb) exhausted it and hung inside Munt's open().
+// 128 MB leaves ~33 MB free at switch time for the reopen, and still
+// leaves the zone ~298 MB on a 512 MB Pi Zero 2 W (enough for the
+// 255 MB Kitrinx SoundFont).
+constexpr size_t MallocHeapSize = 128 * MEGABYTE;
 
 CZoneAllocator* CZoneAllocator::s_pThis = nullptr;
 
@@ -219,25 +222,47 @@ void* CZoneAllocator::Realloc(void* pPtr, size_t nSize, TZoneTag Tag)
 		// Expand in-place if next block is free and large enough
 		if (pBlock->pNext->Tag == TZoneTag::Free && pBlock->pNext->nSize >= nSizeDiff)
 		{
-			TBlock* pNewBlock = reinterpret_cast<TBlock*>(reinterpret_cast<u8*>(pBlock) + nNewSize);
+			// The new free block's header may overlap the old one's, so read what we need first
+			TBlock* const pFreeBlock  = pBlock->pNext;
+			TBlock* const pAfterBlock = pFreeBlock->pNext;
+			const size_t nLeftOver    = pFreeBlock->nSize - nSizeDiff;
 
-			pNewBlock->nSize            = pBlock->pNext->nSize - nSizeDiff;
-			pNewBlock->pNext            = pBlock->pNext->pNext;
-			pNewBlock->pNext->pPrevious = pNewBlock;
-			pNewBlock->pPrevious        = pBlock;
-			pNewBlock->Tag              = TZoneTag::Free;
-			pNewBlock->nMagic           = BlockMagic;
+			if (nLeftOver > MinFragmentSize)
+			{
+				// Keep the rest of the free block as a smaller free block
+				TBlock* pNewBlock = reinterpret_cast<TBlock*>(reinterpret_cast<u8*>(pBlock) + nNewSize);
+
+				pNewBlock->nSize      = nLeftOver;
+				pNewBlock->pNext      = pAfterBlock;
+				pNewBlock->pPrevious  = pBlock;
+				pNewBlock->Tag        = TZoneTag::Free;
+				pNewBlock->nMagic     = BlockMagic;
 #if AARCH == 32
-			memset(pNewBlock->Padding, 0xEB, Utility::ArraySize(pNewBlock->Padding));
+				memset(pNewBlock->Padding, 0xEB, Utility::ArraySize(pNewBlock->Padding));
 #endif
-			GetEndMagic(pNewBlock) = BlockMagic;
+				GetEndMagic(pNewBlock) = BlockMagic;
+				pAfterBlock->pPrevious = pNewBlock;
 
-			// Next allocations search from this new merged free block
-			if (pBlock->pNext == m_pCurrentBlock)
-				m_pCurrentBlock = pNewBlock;
+				// Next allocations search from this new merged free block
+				if (pFreeBlock == m_pCurrentBlock)
+					m_pCurrentBlock = pNewBlock;
 
-			pBlock->nSize       = nNewSize;
-			pBlock->pNext       = pNewBlock;
+				pBlock->nSize = nNewSize;
+				pBlock->pNext = pNewBlock;
+			}
+			else
+			{
+				// Too little left for a block header: take the whole free block. Writing a header
+				// here would overwrite the header of the block after it.
+				pAfterBlock->pPrevious = pBlock;
+
+				if (pFreeBlock == m_pCurrentBlock)
+					m_pCurrentBlock = pAfterBlock;
+
+				pBlock->nSize += pFreeBlock->nSize;
+				pBlock->pNext = pAfterBlock;
+			}
+
 			pBlock->Tag         = Tag;
 			GetEndMagic(pBlock) = BlockMagic;
 
@@ -313,10 +338,12 @@ void* CZoneAllocator::Realloc(void* pPtr, size_t nSize, TZoneTag Tag)
 			pNewBlock->pNext->pPrevious = pNewBlock;
 
 			pBlock->pNext = pNewBlock;
+			pBlock->nSize = nNewSize;
 		}
 
-		pBlock->nSize = nNewSize;
-		pBlock->Tag   = Tag;
+		// Otherwise the block keeps its size: shrinking it without a free block after it
+		// would leave a gap between it and the next block that no block owns
+		pBlock->Tag = Tag;
 
 		// Mark end of memory with magic number
 		GetEndMagic(pBlock) = BlockMagic;
