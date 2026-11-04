@@ -177,7 +177,7 @@ complaints reproduce on LLVM 23.1.4 (Oct 2026), ~20 months later.
   anything involving memory or branches — and never as the grading
   tool for scheduling (own cycle model from microbenchmarks, or
   hardware A/B, remains the way).
-- It answers Joe's "wrong is not binary" challenge precisely:
+- It answers the "wrong is not binary" challenge precisely:
   the failure is LOCALIZED, not global. Dispatch width (2),
   scalar dual-issue, and per-instruction resource assignment are
   right; the failure is specifically the scheduling of

@@ -14,7 +14,7 @@
   count). Total: 119,358,521,630 guest instructions.
 - **Cross-check: gprof** on the native x86-64 harness build, same workload
   (165M steps, 93 s wall). Same ranking, same top functions.
-- **Hardware anchor:** Joe's diag-11 log (read from the file):
+- **Hardware anchor:** the diag-11 log (read from the file):
   JIT steady windows `emu_pct=89-90, mcu_pct=55-63, pcm_pct=36-44,
   insn_per_sec~1.0-1.08M`.
 - **NOT measured (rig blocker, see below):** the Pi kernel under system
@@ -197,7 +197,7 @@ on AArch64 (cortex-a53 codegen) while they are on x86.
   code still executes the semantics) saves at most 6.3%. The
   hardware result already proves the point: JIT vs decoder2 vs legacy
   all cost ~90% emu (diag-11: decoder2 89.6, legacy 90.2, jit 89.6 —
-  JIT gains ~0%). The JIT was the wrong target, as Joe suspected;
+  JIT gains ~0%). The JIT was the wrong target, as suspected;
   further dispatch work is chasing 6% with a mechanism already proven
   to yield 0%. The JIT remains valuable as a second CORRECT
   implementation (differential oracle), not as a performance lever.
@@ -215,7 +215,7 @@ on AArch64 (cortex-a53 codegen) while they are on x86.
 - **JIT_NotifyWrite: 0.16%** (the JIT invalidation hook firing in
   decoder2 mode). Negligible even though it runs in the wrong mode.
 
-## Answers to Joe's 2026-10-24 01:42 questions (for the parent's reply)
+## Answers to the 2026-10-24 01:42 questions (for the parent's reply)
 
 - **Does bad sound come from high-but-not-100% CPU? NO — not by
   starvation.** Hardware shows underrun=0 in every window: the audio
@@ -233,7 +233,7 @@ on AArch64 (cortex-a53 codegen) while they are on x86.
   <=10% of the core and its resampler is a few ops per frame, so a
   wrapper-side fidelity problem would be in the resampler's MATH
   (linear interpolation dulls/aliases), not its cost. The
-  post-interpolation, post-conversion sample capture Joe ordered is
+  post-interpolation, post-conversion sample capture ordered is
   still the right next test for the sound question (separate from
   this CPU work).
 
@@ -312,7 +312,7 @@ on AArch64 (cortex-a53 codegen) while they are on x86.
   the primary interval). Where they differ slightly (e.g. timer
   14.2% x86 vs 19.4% AArch64), codegen/inlining is the cause, and
   both are reported.
-- No Pi kernel was built or delivered for Joe in this task
+- No Pi kernel was built or delivered in this task
   (measurement only, per instructions). The clone's null-sink patch
   (mt32pi.cpp AudioTask, `QEMU_PROFILE_NULL_SINK`, plus the
   Kernel.mk conditional) and the snapshot plugin are clone/scratch
