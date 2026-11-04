@@ -10,4 +10,4 @@ It adds two synth engines for Roland Sound Canvas **SC-55** emulation, alongside
 - From Mister side, you can still only toggle between Munt and Fluidsynth. When Fluidsynth is selected, you can press button 1 on MT-32pi to switch to Nuked SC-55 engine, EmuSC engine, or MU50 engine.
 - Nuked SC-55 engine only tested on 1.21 rom set
 
-It also adds a **Yamaha MU50** General MIDI synth engine: the real Yamaha firmware running on a ported H8/3003 core, driving a SWP00 tone-generator core (see `external/mu50/`). Wave and firmware ROMs are user-supplied and not included.
+It also adds a **Yamaha MU50** General MIDI synth engine: the real Yamaha firmware running on a ported H8/3003 core, driving a SWP00 tone-generator core (see `external/mu50/`), with the emulation based on **MAME 0.277**. Wave and firmware ROMs are user-supplied and not included.
