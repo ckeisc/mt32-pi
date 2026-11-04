@@ -129,7 +129,8 @@ CMT32Pi::CMT32Pi(CI2CMaster* pI2CMaster, CSPIMaster* pSPIMaster, CInterruptSyste
 	  m_pMT32Synth(nullptr),
 	  m_pSoundFontSynth(nullptr),
 	  m_pEmuSCSynth(nullptr),
-	  m_pNukedSC55Synth(nullptr)
+	  m_pNukedSC55Synth(nullptr),
+	  m_pMU50Synth(nullptr)
 {
 	s_pThis = this;
 }
@@ -297,6 +298,9 @@ bool CMT32Pi::Initialize(bool bSerialMIDIAvailable)
 	LCDLog(TLCDLogType::Startup, "Init Nuked");
 	InitNukedSC55Synth();
 
+	LCDLog(TLCDLogType::Startup, "Init MU50");
+	InitMU50Synth();
+
 	// Set initial synthesizer
 	if (m_pConfig->SystemDefaultSynth == CConfig::TSystemDefaultSynth::MT32)
 		m_pCurrentSynth = m_pMT32Synth;
@@ -306,6 +310,8 @@ bool CMT32Pi::Initialize(bool bSerialMIDIAvailable)
 		m_pCurrentSynth = m_pEmuSCSynth;
 	else if (m_pConfig->SystemDefaultSynth == CConfig::TSystemDefaultSynth::NukedSC55)
 		m_pCurrentSynth = m_pNukedSC55Synth;
+	else if (m_pConfig->SystemDefaultSynth == CConfig::TSystemDefaultSynth::MU50)
+		m_pCurrentSynth = m_pMU50Synth;
 
 	if (!m_pCurrentSynth)
 	{
@@ -320,6 +326,8 @@ bool CMT32Pi::Initialize(bool bSerialMIDIAvailable)
 			m_pCurrentSynth = m_pEmuSCSynth;
 		else if (m_pNukedSC55Synth)
 			m_pCurrentSynth = m_pNukedSC55Synth;
+		else if (m_pMU50Synth)
+			m_pCurrentSynth = m_pMU50Synth;
 		else
 		{
 			LOGPANIC("No synths available; ROMs/SoundFonts not found");
@@ -462,6 +470,24 @@ bool CMT32Pi::InitEmuSCSynth()
 	}
 
 	m_pEmuSCSynth->SetUserInterface(&m_UserInterface);
+
+	return true;
+}
+
+bool CMT32Pi::InitMU50Synth()
+{
+	assert(m_pMU50Synth == nullptr);
+
+	m_pMU50Synth = new CMU50Synth(m_pConfig->AudioSampleRate, m_pConfig->MU50Gain);
+	if (!m_pMU50Synth->Initialize())
+	{
+		LOGWARN("MU50 init failed; no complete MU50 wave ROM set present?");
+		delete m_pMU50Synth;
+		m_pMU50Synth = nullptr;
+		return false;
+	}
+
+	m_pMU50Synth->SetUserInterface(&m_UserInterface);
 
 	return true;
 }
@@ -630,6 +656,8 @@ void CMT32Pi::UITask()
 				Status.Synth = TMisterSynth::EmuSC;
 			else if (m_pCurrentSynth == m_pNukedSC55Synth)
 				Status.Synth = TMisterSynth::NukedSC55;
+			else if (m_pCurrentSynth == m_pMU50Synth)
+				Status.Synth = TMisterSynth::MU50;
 
 			if (m_pMT32Synth)
 				Status.MT32ROMSet = static_cast<u8>(m_pMT32Synth->GetROMSet());
@@ -941,6 +969,12 @@ void CMT32Pi::UpdateUSB(bool bStartup)
 					InitNukedSC55Synth();
 				}
 
+				if (!m_pMU50Synth)
+				{
+					LCDLog(TLCDLogType::Spinner, "MU50 ROM rescan");
+					InitMU50Synth();
+				}
+
 				if (m_pSoundFontSynth)
 					LCDLog(TLCDLogType::Notice, "%d SoundFonts avail", m_pSoundFontSynth->GetSoundFontManager().GetSoundFontCount());
 			}
@@ -1236,7 +1270,7 @@ void CMT32Pi::ProcessButtonEvent(const TButtonEvent& Event)
 		// set explicitly from the MiSTer side:
 		// - MiSTer set MT32: Munt only (Button1 goes to/stays on MT32)
 		// - Otherwise (SoundFont-gate or never set): NukedSC55 ->
-		//   EmuSC -> SoundFont -> NukedSC55. MT32 is not in the
+		//   EmuSC -> SoundFont -> MU50 -> NukedSC55. MT32 is not in the
 		//   Button1 cycle (reached via MiSTer instead); the old
 		//   SoundFont-gate branch is gone because it filtered MT32
 		//   out, which the new cycle already does. Unavailable
@@ -1266,10 +1300,21 @@ void CMT32Pi::ProcessButtonEvent(const TButtonEvent& Event)
 			}
 			else if (m_pCurrentSynth == m_pSoundFontSynth)
 			{
+				if (m_pMU50Synth)
+					SwitchSynth(TSynth::MU50);
+				else if (m_pNukedSC55Synth)
+					SwitchSynth(TSynth::NukedSC55);
+				else if (m_pEmuSCSynth)
+					SwitchSynth(TSynth::EmuSC);
+			}
+			else if (m_pCurrentSynth == m_pMU50Synth)
+			{
 				if (m_pNukedSC55Synth)
 					SwitchSynth(TSynth::NukedSC55);
 				else if (m_pEmuSCSynth)
 					SwitchSynth(TSynth::EmuSC);
+				else if (m_pSoundFontSynth)
+					SwitchSynth(TSynth::SoundFont);
 			}
 			else // MT32 or unexpected: back to the cycle head
 			{
@@ -1281,16 +1326,16 @@ void CMT32Pi::ProcessButtonEvent(const TButtonEvent& Event)
 					SwitchSynth(TSynth::SoundFont);
 			}
 		}
-		// Record an HW1 SC-55 selection for the MiSTer FluidSynth
+		// Record an HW1 GM selection for the MiSTer FluidSynth
 		// reinterpretation (see CMisterControl::ApplyConfig): only
 		// a Button1 switch that actually changed the synth, to
-		// Nuked/EmuSC/SoundFont, counts. MT32 switches and no-op
+		// Nuked/EmuSC/SoundFont/MU50, counts. MT32 switches and no-op
 		// presses (show-only, unavailable, already active) leave
 		// the selection untouched.
 		if (m_pCurrentSynth != pBeforeSwitch &&
-		    (m_pCurrentSynth == m_pNukedSC55Synth || m_pCurrentSynth == m_pEmuSCSynth || m_pCurrentSynth == m_pSoundFontSynth))
+		    (m_pCurrentSynth == m_pNukedSC55Synth || m_pCurrentSynth == m_pEmuSCSynth || m_pCurrentSynth == m_pSoundFontSynth || m_pCurrentSynth == m_pMU50Synth))
 		{
-			m_MisterControl.SetHW1SC55Synth(m_pCurrentSynth == m_pNukedSC55Synth ? TSynth::NukedSC55 : (m_pCurrentSynth == m_pEmuSCSynth ? TSynth::EmuSC : TSynth::SoundFont));
+			m_MisterControl.SetHW1SC55Synth(m_pCurrentSynth == m_pNukedSC55Synth ? TSynth::NukedSC55 : (m_pCurrentSynth == m_pEmuSCSynth ? TSynth::EmuSC : (m_pCurrentSynth == m_pMU50Synth ? TSynth::MU50 : TSynth::SoundFont)));
 		}
 	}
 	else if (Event.Button == TButton::Button2 && !Event.bRepeat)
@@ -1369,7 +1414,7 @@ void CMT32Pi::ProcessButtonEvent(const TButtonEvent& Event)
 
 const char* CMT32Pi::GetSynthMode(const CSynthBase* pSynth) const
 {
-	return pSynth == m_pMT32Synth ? "MT-32 mode" : (pSynth == m_pEmuSCSynth ? "EmuSC mode" : (pSynth == m_pNukedSC55Synth ? "Nuked-SC55 mode" : "SoundFont mode"));
+	return pSynth == m_pMT32Synth ? "MT-32 mode" : (pSynth == m_pEmuSCSynth ? "EmuSC mode" : (pSynth == m_pNukedSC55Synth ? "Nuked-SC55 mode" : (pSynth == m_pMU50Synth ? "MU50 mode" : "SoundFont mode")));
 }
 
 void CMT32Pi::SwitchSynth(TSynth NewSynth)
@@ -1384,6 +1429,8 @@ void CMT32Pi::SwitchSynth(TSynth NewSynth)
 		pNewSynth = m_pEmuSCSynth;
 	else if (NewSynth == TSynth::NukedSC55)
 		pNewSynth = m_pNukedSC55Synth;
+	else if (NewSynth == TSynth::MU50)
+		pNewSynth = m_pMU50Synth;
 
 	if (pNewSynth == nullptr)
 	{

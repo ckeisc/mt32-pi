@@ -34,6 +34,10 @@ enum class TMisterSynth : u8
 	SoundFont = 0xA2,
 	EmuSC     = 0xA3,
 	NukedSC55 = 0xA4,
+	// Next wire value. Stock MiSTer cores do not send it yet; the
+	// engine is reachable via Button1, SysEx, and boot default, and
+	// ApplyConfig already maps it literally for future MiSTer cores.
+	MU50      = 0xA5,
 	Unknown   = 0xFF,
 };
 

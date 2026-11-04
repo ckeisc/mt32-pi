@@ -41,7 +41,8 @@ public:
 		ENUM(MT32, mt32)                  \
 		ENUM(SoundFont, soundfont)        \
 		ENUM(EmuSC, emusc)                \
-		ENUM(NukedSC55, nuked)
+		ENUM(NukedSC55, nuked)            \
+		ENUM(MU50, mu50)
 
 	#define ENUM_AUDIOOUTPUTDEVICE(ENUM) \
 		ENUM(PWM, pwm)                   \

@@ -100,6 +100,10 @@ CFG(oversampling,	bool,			NukedOversampling,			true						)
 CFG(resampler,		CString,		NukedResampler,			"cubic"					)
 END_SECTION
 
+BEGIN_SECTION(mu50)
+CFG(gain,			float,			MU50Gain,					1.0f						)
+END_SECTION
+
 BEGIN_SECTION(lcd)
 CFG(type,			TLCDType,			LCDType,				TLCDType::None					)
 CFG(width,			int,				LCDWidth,				20						)

@@ -112,8 +112,8 @@ void CMisterControl::Update(const TMisterStatus& SystemStatus)
 TSynth CMisterControl::ResolveSC55Synth() const
 {
 	// MiSTer FluidSynth no longer means SoundFont literally: it
-	// means the current SC-55 engine -- the engine last selected
-	// via HW1 (Nuked/EmuSC/SoundFont), or Nuked if none has been
+	// means the current GM engine -- the engine last selected
+	// via HW1 (Nuked/EmuSC/SoundFont/MU50), or Nuked if none has been
 	// selected yet (runtime-only; reset on boot, untouched by
 	// MiSTer disconnect).
 	if (m_bHW1SC55Selected)
@@ -125,10 +125,10 @@ void CMisterControl::ApplyConfig(const TMisterStatus& NewStatus, const TMisterSt
 {
 	TEvent Event;
 
-	// MiSTer synth mapping: MT32/EmuSC/Nuked are literal. MiSTer
+	// MiSTer synth mapping: MT32/EmuSC/Nuked/MU50 are literal. MiSTer
 	// FluidSynth (SoundFont) no longer means SoundFont literally:
 	// MiSTer can only report Munt/FluidSynth, so FluidSynth means
-	// the current SC-55 engine (HW1-selected, or Nuked by default).
+	// the current GM engine (HW1-selected, or Nuked by default).
 	// Any other value (e.g. Unknown) keeps the old catch-all to
 	// SoundFont. The event is enqueued only when the RESOLVED
 	// target differs from the current synth, so a MiSTer report
@@ -141,6 +141,8 @@ void CMisterControl::ApplyConfig(const TMisterStatus& NewStatus, const TMisterSt
 		TargetSynth = TSynth::EmuSC;
 	else if (NewStatus.Synth == TMisterSynth::NukedSC55)
 		TargetSynth = TSynth::NukedSC55;
+	else if (NewStatus.Synth == TMisterSynth::MU50)
+		TargetSynth = TSynth::MU50;
 	else if (NewStatus.Synth == TMisterSynth::SoundFont)
 		TargetSynth = ResolveSC55Synth();
 	else
@@ -153,6 +155,8 @@ void CMisterControl::ApplyConfig(const TMisterStatus& NewStatus, const TMisterSt
 		CurrentSynth = TSynth::EmuSC;
 	else if (CurrentStatus.Synth == TMisterSynth::NukedSC55)
 		CurrentSynth = TSynth::NukedSC55;
+	else if (CurrentStatus.Synth == TMisterSynth::MU50)
+		CurrentSynth = TSynth::MU50;
 	else if (CurrentStatus.Synth == TMisterSynth::SoundFont)
 		CurrentSynth = TSynth::SoundFont;
 	else

@@ -29,6 +29,9 @@ enum class TSynth
 	SoundFont,
 	EmuSC,
 	NukedSC55,
+	// Appended last on purpose: TSynth values travel over the custom
+	// SysEx switch command, so existing values must not shift
+	MU50,
 };
 
 #endif
