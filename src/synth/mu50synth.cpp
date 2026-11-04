@@ -27,6 +27,7 @@
 #include <circle/logger.h>
 #include <circle/memory.h>
 #include <circle/timer.h>
+#include <circle/cputhrottle.h>
 #include <fatfs/ff.h>
 
 #include "config.h"
@@ -84,6 +85,13 @@ mu50h8::u8 MU50H8SwpRead(void* pCtx, mu50h8::u16 nAddr)
 {
 	return static_cast<CMU50Synth*>(pCtx)->OnH8SwpRead(nAddr);
 }
+
+// SCI1 RDR read by the firmware (see OnH8Sci1RdrRead).
+void MU50H8Sci1RdrRead(void* pCtx)
+{
+	static_cast<CMU50Synth*>(pCtx)->OnH8Sci1RdrRead();
+}
+
 }
 
 CMU50Synth::CMU50Synth(unsigned nSampleRate, float nGain)
@@ -106,6 +114,10 @@ CMU50Synth::CMU50Synth(unsigned nSampleRate, float nGain)
 	  m_nDiagSwpUs(0),
 	  m_nDiagH8Insns(0),
 	  m_nDiagOutputFrames(0),
+	  m_nDiagMidiQueued(0),
+	  m_nDiagSciRead(0),
+	  m_nDiagSwpWrites(0),
+	  m_nDiagNativePeak(0),
 	  m_nGain(nGain),
 	  m_nVolume(100),
 	  m_dResampleRatio(44100.0 / static_cast<double>(nSampleRate)),
@@ -342,6 +354,7 @@ bool CMU50Synth::Initialize()
 	H8Hooks.ctx       = this;
 	H8Hooks.swp_write = MU50H8SwpWrite;
 	H8Hooks.swp_read  = MU50H8SwpRead;
+	H8Hooks.sci1_rdr_read = MU50H8Sci1RdrRead;
 	H8Hooks.midi_tx   = nullptr; // firmware MIDI out is unused by the engine
 	H8Hooks.log       = nullptr; // null in the engine (harness prints it)
 	m_pH8 = new mu50h8::Mu50H8(m_FirmwareROM.data(), H8Hooks);
@@ -366,7 +379,10 @@ void CMU50Synth::OnH8SwpWrite(u16 nAddr, u8 nData)
 	// register core rejects are ignored (should not happen once the
 	// wave ROM is loaded).
 	if (m_pSynth)
+	{
 		m_pSynth->write_register(nAddr, nData);
+		++m_nDiagSwpWrites;
+	}
 }
 
 u8 CMU50Synth::OnH8SwpRead(u16 nAddr)
@@ -376,6 +392,14 @@ u8 CMU50Synth::OnH8SwpRead(u16 nAddr)
 	if (m_pSynth)
 		m_pSynth->read_register(nAddr, nValue);
 	return nValue;
+}
+
+void CMU50Synth::OnH8Sci1RdrRead()
+{
+	// Called from the H8's sci_read under m_Lock (inside AdvanceH8
+	// during Render). Counts SCI1 RDR reads, normally one per MIDI
+	// byte the firmware consumes.
+	++m_nDiagSciRead;
 }
 
 void CMU50Synth::AdvanceH8(size_t nNativeFrames)
@@ -425,7 +449,8 @@ void CMU50Synth::QueueMIDIMessageBytes(u8 nStatus, u8 nData1, u8 nData2)
 		nBytes = 1;
 
 	for (size_t i = 0; i < nBytes; ++i)
-		m_pH8->queue_midi_byte(Bytes[i]);
+		if (m_pH8->queue_midi_byte(Bytes[i]))
+			++m_nDiagMidiQueued;
 }
 
 // Front end: the real Yamaha firmware on the H8 CPU port. Channel and
@@ -514,7 +539,8 @@ void CMU50Synth::HandleMIDISysExMessage(const u8* pData, size_t nSize)
 	// 0xF0 and trailing 0xF7, and parses the stream itself.
 	m_Lock.Acquire();
 	for (size_t i = 0; i < nSize; ++i)
-		m_pH8->queue_midi_byte(pData[i]);
+		if (m_pH8->queue_midi_byte(pData[i]))
+			++m_nDiagMidiQueued;
 	m_Lock.Release();
 }
 
@@ -613,7 +639,9 @@ void CMU50Synth::RenderResampled(float* pOutBuffer, size_t nFrames)
 		const u64 nSwpStartUs = bDiag ? CTimer::Get()->GetClockTicks() : 0;
 		const libmu50::Status RenderStatus = m_pSynth->render(m_NativeScratch, nNativeRender);
 		if (bDiag)
+		{
 			m_nDiagSwpUs += CTimer::Get()->GetClockTicks() - nSwpStartUs;
+		}
 		if (!RenderStatus)
 		{
 			// Should not happen after a successful Initialize();
@@ -631,6 +659,19 @@ void CMU50Synth::RenderResampled(float* pOutBuffer, size_t nFrames)
 				m_nLastActiveNativeFrame = m_nWrittenNativeFrames + nNativeRender;
 				break;
 			}
+		}
+		// Window peak of the native SWP output, before resampling
+		// and before gain: proves whether the SWP renders non-zero
+		// audio independent of the resampler and volume scale.
+		// Observe-only: this scan reads m_NativeScratch and changes
+		// no audio state.
+		for (size_t i = 0; i < nNativeRender * 2; ++i)
+		{
+			int nSample = m_NativeScratch[i];
+			if (nSample < 0)
+				nSample = -nSample;
+			if (nSample > m_nDiagNativePeak)
+				m_nDiagNativePeak = nSample;
 		}
 		m_nWrittenNativeFrames += nNativeRender;
 
@@ -812,6 +853,8 @@ void CMU50Synth::UpdateLCD(CLCD& LCD, unsigned int nTicks)
 			nNowUs - m_nDiagWindowStartUs >= static_cast<u64>(DiagLog.IntervalSeconds()) * 1000000ULL;
 		u64 nWindowUs = 0, nCalls = 0, nTotalUs = 0, nMaxUs = 0;
 		u64 nH8Us = 0, nSwpUs = 0, nH8Insns = 0, nOutputFrames = 0;
+		u64 nMidiQueued = 0, nSciRead = 0, nSwpWrites = 0;
+		int nNativePeak = 0;
 		if (bDue)
 		{
 			nWindowUs     = nNowUs - m_nDiagWindowStartUs;
@@ -822,6 +865,10 @@ void CMU50Synth::UpdateLCD(CLCD& LCD, unsigned int nTicks)
 			nSwpUs        = m_nDiagSwpUs;
 			nH8Insns      = m_nDiagH8Insns;
 			nOutputFrames = m_nDiagOutputFrames;
+			nMidiQueued   = m_nDiagMidiQueued;
+			nSciRead      = m_nDiagSciRead;
+			nSwpWrites    = m_nDiagSwpWrites;
+			nNativePeak   = m_nDiagNativePeak;
 			m_nDiagWindowStartUs = 0;
 			m_nDiagCalls         = 0;
 			m_nDiagTotalUs       = 0;
@@ -830,6 +877,10 @@ void CMU50Synth::UpdateLCD(CLCD& LCD, unsigned int nTicks)
 			m_nDiagSwpUs         = 0;
 			m_nDiagH8Insns       = 0;
 			m_nDiagOutputFrames  = 0;
+			m_nDiagMidiQueued    = 0;
+			m_nDiagSciRead       = 0;
+			m_nDiagSwpWrites     = 0;
+			m_nDiagNativePeak    = 0;
 		}
 		const bool bHalted = m_bH8Halted;
 		m_Lock.Release();
@@ -854,6 +905,21 @@ void CMU50Synth::UpdateLCD(CLCD& LCD, unsigned int nTicks)
 			                static_cast<unsigned long long>(nSwpUs),
 			                static_cast<unsigned long long>(nH8Insns),
 			                static_cast<unsigned>(bHalted ? 1 : 0));
+			// Second diag line (new counters only; the window line
+			// above is unchanged): per-window MIDI bytes accepted
+			// into the SCI1 queue, SCI1 RDR reads by the firmware,
+			// SWP00 register writes, and the peak native SWP sample
+			// before resampling/gain. Read against the window line,
+			// it separates "MIDI never reaches the firmware"
+			// (midi_queued=0) from "firmware reads nothing"
+			// (sci_read=0) from "firmware writes no notes"
+			// (swp_writes small) from "SWP renders silence"
+			// (native_peak=0).
+			DiagLog.LogLine("window synth=mu50 diag midi_queued=%llu sci_read=%llu swp_writes=%llu native_peak=%d",
+			                static_cast<unsigned long long>(nMidiQueued),
+			                static_cast<unsigned long long>(nSciRead),
+			                static_cast<unsigned long long>(nSwpWrites),
+			                static_cast<int>(nNativePeak));
 		}
 	}
 }

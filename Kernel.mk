@@ -38,7 +38,7 @@ OBJS		:=	src/config.o \
 			src/synth/mu50h8.o \
 			external/mu50/src/synth.o \
 			external/mu50/src/swp00_meg.o \
-			external/mu50/src/swp00_voice.o \
+			external/mu50/src/swp00_0277.o \
 			src/zoneallocator.o
 
 EXTRACLEAN	+=	src/*.d src/*.o \
@@ -67,7 +67,7 @@ src/synth/mu50synth.o: STANDARD = -std=c++17 -Wno-aligned-new
 # The MU50 H8 CPU port is C++17, like the libmu50 wrapper above
 src/synth/mu50h8.o: STANDARD = -std=c++17 -Wno-aligned-new
 external/mu50/src/synth.o: STANDARD = -std=c++17 -Wno-aligned-new
-external/mu50/src/swp00_voice.o: STANDARD = -std=c++17 -Wno-aligned-new
+external/mu50/src/swp00_0277.o: STANDARD = -std=c++17 -Wno-aligned-new
 external/mu50/src/swp00_meg.o: STANDARD = -std=c++17 -Wno-aligned-new
 
 # The Nuked-SC55 backend headers require C++20 (the backend library
@@ -134,8 +134,8 @@ src/synth/mu50synth.o: CPPFLAGS += -I external/mu50/include
 src/synth/mu50synth.d: CPPFLAGS += -I external/mu50/include
 external/mu50/src/synth.o: CPPFLAGS += -I external/mu50/include
 external/mu50/src/synth.d: CPPFLAGS += -I external/mu50/include
-external/mu50/src/swp00_voice.o: CPPFLAGS += -I external/mu50/include
-external/mu50/src/swp00_voice.d: CPPFLAGS += -I external/mu50/include
+external/mu50/src/swp00_0277.o: CPPFLAGS += -I external/mu50/include
+external/mu50/src/swp00_0277.d: CPPFLAGS += -I external/mu50/include
 external/mu50/src/swp00_meg.o: CPPFLAGS += -I external/mu50/include
 external/mu50/src/swp00_meg.d: CPPFLAGS += -I external/mu50/include
 

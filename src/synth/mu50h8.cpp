@@ -47,10 +47,14 @@ Mu50H8::Mu50H8(const u8 *rom, const Hooks &hooks)
       sleeping_(false), halted_(false), illegal_pc_(0), instr_count_(0),
       instr_start_pc_(0), rom_(rom), hooks_(hooks),
       intc_pending_(0), intc_ier_(0), intc_isr_(0), intc_icr_(0),
-      intc_iscr_(0), irq_vector_(0), irq_filter_(2),
+      intc_iscr_(0), intc_irq_input_(0), irq_vector_(0), irq_filter_(2),
       midi_q_head_(0), midi_q_tail_(0), midi_bit_(-2), midi_byte_(0),
       midi_edge_(0), tstr_(0), tsyr_(0), tmdr_(0), tfcr_(0), toer_(0),
       tocr_(0), adcsr_(0), adcr_(0), adc_done_(0), lcd_rs_(0), p6_cur_(0xff) {
+  // H1: decoded-instruction cache (heap: 4 MiB, one 16-byte slot per
+  // ROM word). Null on allocation failure -> execute_one falls back
+  // to the table scan, so the engine still runs, just slower.
+  decode_cache_ = new DecodeCacheEntry[kDecodeCacheSize]();
   std::memset(r_, 0, sizeof r_);
   std::memset(ir_, 0, sizeof ir_);
   std::memset(ram_, 0, sizeof ram_);
@@ -94,11 +98,20 @@ void Mu50H8::logf(const char *fmt, u32 a, u32 v) {
   hooks_.log(hooks_.ctx, buf);
 }
 
+Mu50H8::~Mu50H8() { delete[] decode_cache_; }
+
 void Mu50H8::reset() {
   std::memset(r_, 0, sizeof r_);
   std::memset(ram_, 0, sizeof ram_);
   std::memset(iram_, 0, sizeof iram_);
   std::memset(ir_, 0, sizeof ir_);
+  // H1/H2: decode cache entries are validated by PC + words, so a
+  // stale entry is harmless, but reset to a clean slate anyway (once
+  // per engine start, not per instruction). Event cache: dirty, so
+  // the next next_event_cycle call recomputes from live state.
+  if (decode_cache_)
+    for (int i = 0; i < kDecodeCacheSize; i++) decode_cache_[i] = DecodeCacheEntry();
+  next_event_dirty_ = true;
   // MAME reset state: CCR |= F_I (has_hc), EXR = EXR_I | EXR_NC,
   // PC = 32-bit vector at address 0 (advanced mode).
   ccr_ |= F_I;
@@ -115,6 +128,15 @@ void Mu50H8::reset() {
   intc_isr_ = 0;
   intc_icr_ = 0;
   intc_iscr_ = 0;
+  // MU50 PCB ties IRQ0 to ground (MAME ymmu50.cpp machine_reset:
+  // set_input_line(0, ASSERT_LINE), "Active-low, wired to gnd").
+  // Model it as a permanently asserted level-low input: like MAME's
+  // check_level_irqs, it latches ISR bit 0 at reset (ISCR default 0 =
+  // level-low) and re-latches it whenever cleared. IER is still 0, so
+  // nothing is pending until the firmware enables IRQ0.
+  intc_irq_input_ = 0x01;
+  intc_isr_ |= 0x01;
+  intc_update();
   midi_q_head_ = midi_q_tail_ = 0;
   midi_bit_ = -2;
   midi_edge_ = 0;
@@ -132,7 +154,10 @@ void Mu50H8::reset() {
     t.running = 0;
     t.next_inc = 0;
     t.divider = 1;
+    t.edge_packed = Timer::kEdgeDirty;
+    due_order_[i] = (u8)i;
   }
+  last_tick_cycles_ = 0;
   // Ports reset to their configured DDR/DR values.
   const u8 ddr[16] = {0, 0, 0, 0, 0x00, 0x0f, 0x80, 0x00,
                       0xf0, 0x00, 0x00, 0x00, 0x00, 0, 0, 0};
@@ -192,11 +217,14 @@ int Mu50H8::intc_slot(int vector) {
 }
 
 void Mu50H8::intc_update() {
-  // External IRQ inputs are inactive, so ISR bits only reflect what the
-  // firmware wrote (edge-latched) -- but with no input edges, external
-  // pending bits come from ISR & IER only if firmware set them; MAME
-  // latches ISR on input edges, which never happen here. Keep the
-  // general form: pending |= (ISR & IER) mapped to vectors 12-19.
+  // MAME h8_intc.cpp check_level_irqs: an asserted level-low input
+  // re-latches its ISR bit (ISCR bit i = 0 selects level-low). IRQ0 is
+  // permanently asserted on the MU50, so its ISR bit sticks once
+  // latched; IRQ1-7 inputs are inactive, so their bits only reflect
+  // what the firmware wrote. Pending = (ISR & IER) -> vectors 12-19.
+  for (int i = 0; i < 8; i++)
+    if ((intc_irq_input_ & (1 << i)) && !((intc_iscr_ >> i) & 1))
+      intc_isr_ |= (u8)(1 << i);
   u64 pending = intc_pending_;
   u8 ext = intc_isr_ & intc_ier_;
   for (int i = 0; i < 8; i++)
@@ -242,8 +270,13 @@ void Mu50H8::interrupt_taken() {
   int v = taken_vector_;
   intc_pending_ &= ~((u64)1 << v);
   if (v >= 12 && v < 20) {
-    // External IRQ: clear ISR unless the (inactive) input still holds it.
-    intc_isr_ &= ~(1 << (v - 12));
+    // MAME h8_intc.cpp interrupt_taken: a level-low IRQ whose input is
+    // still asserted keeps its ISR bit (it stays pending and re-fires
+    // when unmasked); edge-triggered or deasserted lines clear on take.
+    int i = v - 12;
+    bool level_low = ((intc_iscr_ >> i) & 1) == 0;
+    bool asserted = (intc_irq_input_ >> i) & 1;
+    if (!level_low || !asserted) intc_isr_ &= ~(1 << i);
   }
   intc_update();
 }
@@ -388,7 +421,20 @@ u8 Mu50H8::bus_read8_per(u32 a) {
   if (a == 0xffff91) return tocr_;
   for (int ch = 0; ch < 5; ch++) {
     u32 b = kTimerBase[ch];
-    if (a >= b && a <= b + 3) return timer_read(ch, a - b);
+    if (a >= b && a <= b + 3) {
+      // Lazy-ch3: only ch3's TSR flags can be stale at read time
+      // (other channels' skipped spans contain no edges by the guard
+      // invariant, so their flags are already current). Catch ch3 up
+      // first so the flags are exact. Covers 16-bit reads too: they
+      // funnel through these byte reads.
+      if (ch == 3 && a - b == 3) timer_catch_up(3);
+      return timer_read(ch, a - b);
+    }
+    if (a == b + 4 || a == b + 5) {
+      // TCNT read: catch up to the last tick boundary (eager state
+      // at read time). TGRA/TGRB reads below need none (config).
+      timer_catch_up(ch);
+    }
     if (a == b + 4) return (u8)(timer_[ch].tcnt >> 8);
     if (a == b + 5) return (u8)timer_[ch].tcnt;
     if (a == b + 6) return (u8)(timer_[ch].tgra >> 8);
@@ -452,7 +498,11 @@ u16 Mu50H8::bus_read16_per(u32 a) {
   if (a == 0xfffff4) return intc_iscr_;
   for (int ch = 0; ch < 5; ch++) {
     u32 b = kTimerBase[ch];
-    if (a == b + 4) return timer_[ch].tcnt;
+    if (a == b + 4) {
+      // TCNT read: catch up to the last tick boundary (see 8-bit path).
+      timer_catch_up(ch);
+      return timer_[ch].tcnt;
+    }
     if (a == b + 6) return timer_[ch].tgra;
     if (a == b + 8) return timer_[ch].tgrb;
   }
@@ -466,12 +516,23 @@ u16 Mu50H8::bus_read16_per(u32 a) {
 }
 
 void Mu50H8::bus_write8_per(u32 a, u8 v) {
+  // H2 Part A: every firmware peripheral write funnels through here
+  // (or bus_write16_per below), so marking the event cache dirty here
+  // covers every firmware-side event-time mutation (timer TCR/TSTR,
+  // SCI config/TX start, ADC start, and all no-op writes) by
+  // construction. Peripheral writes are rare vs instructions, so the
+  // recompute this forces is cheap.
+  next_event_dirty_ = true;
   if (a >= 0xfffd20 && a <= 0xfffd5f) {
     if (v) logf("DMA write %06x=%02x (DMA not implemented)", a, v);
     dma_[a - 0xfffd20] = v;
     return;
   }
   if (a == 0xffff60) {
+    // Timer-guard: bring every channel to the last tick boundary
+    // (eager state) before changing running bits, then invalidate
+    // their edge caches (the running/next_inc changes below do).
+    for (int ch = 0; ch < 5; ch++) timer_touch(ch);
     u8 changed = tstr_ ^ v;
     tstr_ = v;
     logf("TSTR=%02x", 0, (u32)v);  // TEMP-DEBUG
@@ -498,6 +559,10 @@ void Mu50H8::bus_write8_per(u32 a, u8 v) {
   if (a == 0xffff91) { tocr_ = v; return; }
   for (int ch = 0; ch < 5; ch++) {
     u32 b = kTimerBase[ch];
+    // Timer-guard: any write into a channel's block first brings it
+    // to the last tick boundary (eager state) and invalidates its
+    // edge cache; the write below then applies on current state.
+    if (a >= b && a <= b + 9) timer_touch(ch);
     if (a >= b && a <= b + 3) {
       timer_write(ch, a - b, v);
       return;
@@ -574,6 +639,10 @@ void Mu50H8::bus_write8_per(u32 a, u8 v) {
 }
 
 void Mu50H8::bus_write16_per(u32 a, u16 v) {
+  // H2 Part A: see bus_write8_per -- same funnel argument. (The
+  // default path below calls bus_write8_per twice, which re-marks an
+  // already-dirty flag; harmless.)
+  next_event_dirty_ = true;
   if (a == 0xfffff8) {
     intc_icr_ = v;
     intc_update();
@@ -586,6 +655,9 @@ void Mu50H8::bus_write16_per(u32 a, u16 v) {
   }
   for (int ch = 0; ch < 5; ch++) {
     u32 b = kTimerBase[ch];
+    // Timer-guard: as in the 8-bit path, bring the channel to the
+    // last tick boundary and invalidate its edge cache first.
+    if (a == b + 4 || a == b + 6 || a == b + 8) timer_touch(ch);
     if (a == b + 4) { timer_[ch].tcnt = v; return; }
     if (a == b + 6) { timer_[ch].tgra = v; return; }
     if (a == b + 8) { timer_[ch].tgrb = v; return; }
@@ -818,7 +890,13 @@ u8 Mu50H8::sci_read(Sci &s, u32 off) {
     case kSciSsr:
       s.ssr_read = s.ssr;
       return s.ssr;
-    case kSciRdr: return s.rdr; // CPU read does NOT clear RDRF (SSR-write does)
+    case kSciRdr:
+      // Diagnostic: the firmware reads a received byte from SCI1's
+      // RDR (normally one read per received MIDI byte). SCI0 has no
+      // MIDI input, so only SCI1 fires the hook.
+      if (&s == &sci_[1] && hooks_.sci1_rdr_read)
+        hooks_.sci1_rdr_read(hooks_.ctx);
+      return s.rdr; // CPU read does NOT clear RDRF (SSR-write does)
     default: return 0xff;
   }
 }
@@ -1001,11 +1079,11 @@ void Mu50H8::sci_rx_line(int id, int level) {
 
 // ---------------- MIDI line driver ----------------
 
-void Mu50H8::queue_midi_byte(u8 b) {
+bool Mu50H8::queue_midi_byte(u8 b) {
   int next = (midi_q_tail_ + 1) & 255;
   if (next == midi_q_head_) {
     logf("MIDI queue overrun, dropping %02x", 0, b);
-    return;
+    return false;
   }
   midi_queue_[midi_q_tail_] = b;
   midi_q_tail_ = next;
@@ -1015,8 +1093,13 @@ void Mu50H8::queue_midi_byte(u8 b) {
     midi_q_head_ = (midi_q_head_ + 1) & 255;
     midi_bit_ = -1;
     midi_edge_ = cycles_ + 320;
+    // H2 Part A: host-side event-time mutation (the only one outside
+    // the firmware-write funnel and the tick loop): the MIDI edge
+    // time just changed, so the cached event minimum is stale.
+    next_event_dirty_ = true;
     sci_rx_line(1, 0);
   }
+  return true;
 }
 
 void Mu50H8::midi_line_tick(u64 now) {
@@ -1058,41 +1141,247 @@ void Mu50H8::midi_line_tick(u64 now) {
 
 // ---------------- peripheral event loop ----------------
 
-u64 Mu50H8::next_event_cycle(u64 limit) const {
+// H2 Part A: cached minimum over all pending peripheral event times.
+// Recomputed only when dirty (see the dirty-mark points: firmware
+// peripheral-write funnel, host MIDI queueing, tick firing, guard,
+// reset). Timer contributions now come from the per-channel
+// next-edge cache, NOT next_inc: next_inc goes stale for
+// guard-skipped channels (a tick time in the past), while edge_packed
+// stays a valid future edge time -- using next_inc here could move
+// cycles_ backward in the sleeping path. Result is identical to the
+// uncached scan over edge times: stopped channels contribute INF
+// (skipped), and with no source pending the minimum is the limit
+// itself. A dirty timer channel forces an immediate tick (return
+// cycles_): the caller then advances it instead of sleeping past an
+// unknown edge. Used by the sleeping path in run_until; the hot tick
+// path does not consult it (see tick_peripherals).
+u64 Mu50H8::next_event_cycle(u64 limit) {
+  if (next_event_dirty_) {
+    for (int ch = 0; ch < 5; ch++)
+      if (timer_[ch].edge_packed == Timer::kEdgeDirty) return cycles_;
+    u64 best = ~u64(0);
+    for (int i = 0; i < 2; i++) {
+      if (sci_[i].next_tick && sci_[i].next_tick < best) best = sci_[i].next_tick;
+    }
+    if (midi_bit_ != -2 && midi_edge_ < best) best = midi_edge_;
+    for (int ch = 0; ch < 5; ch++) {
+      u64 te = timer_[ch].edge_packed;
+      if (te && te < best) best = te;
+    }
+    if (adc_done_ && adc_done_ < best) best = adc_done_;
+    next_event_cache_ = best;
+    next_event_dirty_ = false;
+  }
+  return next_event_cache_ < limit ? next_event_cache_ : limit;
+}
+
+// Minimum over the non-timer sources only, always freshly scanned.
+// Timers are bulk-advanced before this is consulted (see
+// tick_peripherals), so their next_inc values are all > cycles_ or 0
+// and cannot win the minimum anyway; scanning only 4 sources keeps
+// the hot tick loop cheap without any cache staleness question.
+u64 Mu50H8::next_nontimer_event_cycle(u64 limit) const {
   u64 best = limit;
   for (int i = 0; i < 2; i++) {
     if (sci_[i].next_tick && sci_[i].next_tick < best) best = sci_[i].next_tick;
   }
   if (midi_bit_ != -2 && midi_edge_ < best) best = midi_edge_;
-  for (int ch = 0; ch < 5; ch++) {
-    if (timer_[ch].next_inc && timer_[ch].next_inc < best)
-      best = timer_[ch].next_inc;
-  }
   if (adc_done_ && adc_done_ < best) best = adc_done_;
   return best;
 }
 
+// Due-list deadline for channel ch: dirty sorts first (0 = due now),
+// a real edge time sorts by time, INF (no edge) sorts last.
+u64 Mu50H8::edge_deadline(int ch) const {
+  u64 p = timer_[ch].edge_packed;
+  return p == Timer::kEdgeDirty ? 0 : p;
+}
+
+// Restore due_order_ sorted order after channel ch's deadline changed.
+// due_order_ is always a permutation of {0..4}; linear insertion over
+// at most 4 remaining entries. Called only when a deadline changes
+// (advance/touch), never in the hot skip path.
+void Mu50H8::due_reinsert(int ch) {
+  int pos = 0;
+  while (pos < 5 && due_order_[pos] != ch) pos++;
+  // pos < 5 always: due_order_ is a permutation.
+  for (int i = pos; i < 4; i++) due_order_[i] = due_order_[i + 1];
+  u64 d = edge_deadline(ch);
+  int ins = 0;
+  while (ins < 4 && edge_deadline(due_order_[ins]) <= d) ins++;
+  for (int i = 4; i > ins; i--) due_order_[i] = due_order_[i - 1];
+  due_order_[ins] = (u8)ch;
+}
+
+// Timer-guard: next observable edge time from current state. Uses the
+// exact distance construction of timer_advance (distance to the first
+// match/wrap; before that edge no clear can have happened). Valid
+// only while the channel's state is unchanged since the last advance
+// (writes set kEdgeDirty; the guard never consults a dirty cache).
+// Stale-state values are still correct as absolute times: ticks fall
+// at next_inc + k*divider, so the d-th tick from next_inc is the edge
+// even when next_inc is behind cycles_.
+u64 Mu50H8::timer_next_edge(int ch) const {
+  const Timer &t = timer_[ch];
+  if (!t.running || !t.divider || !t.next_inc) return ~u64(0);
+  u32 dA = (u32)(((int)t.tgra - (int)t.tcnt - 1) & 0xffff) + 1;
+  u32 dB = (u32)(((int)t.tgrb - (int)t.tcnt - 1) & 0xffff) + 1;
+  u32 dw = (u32)(0xffff - t.tcnt + 1);
+  u32 d = dA;
+  if (dB < d) d = dB;
+  if (dw < d) d = dw;
+  return t.next_inc + (u64)(d - 1) * t.divider;
+}
+
+// Bring a channel to the last tick boundary (eager state at any
+// mid-instruction read/write). By the guard invariant no edge falls
+// in a skipped span, so this advance is arithmetic-only: it fires
+// nothing, it only makes tcnt/next_inc current.
+void Mu50H8::timer_catch_up(int ch) {
+  timer_advance(ch, last_tick_cycles_);
+}
+
+// Catch-up plus edge-cache invalidation, for writes: the write that
+// follows changes counter/compare/divider/running, so the recomputed
+// edge is stale before it is used.
+void Mu50H8::timer_touch(int ch) {
+  timer_advance(ch, last_tick_cycles_);
+  timer_[ch].edge_packed = Timer::kEdgeDirty;
+  due_reinsert(ch);
+}
+
+// H2 Part B: bulk/lazy timer advance. Advances channel ch's counter
+// to time `now`, executing the original per-edge body (timer_inc)
+// ONLY at observable edges -- compare matches and overflows, which
+// set TSR flags and possibly raise interrupts. Quiet stretches are
+// advanced arithmetically. This is exact, not approximate: the
+// distance to the next observable edge is computed exactly (before
+// the first event no clear can have happened, so the counter runs
+// straight: distance to a TGRA/TGRB match is ((tgr - tcnt - 1) &
+// 0xffff) + 1 edges, distance to a wrap is 0xffff - tcnt + 1 edges),
+// and every observable edge still runs the original body at its exact
+// edge time (cycles_ is set to the edge time, as the old loop did),
+// so flags, raises, clears, and next_inc rescheduling are identical.
+// If the distance ever undershot, the only cost would be an extra
+// original-edge execution (still correct); overshoot is impossible
+// by the distance construction. Each loop iteration either finishes
+// the channel or fires exactly one observable event, so the edge
+// clock strictly advances and the loop terminates.
+void Mu50H8::timer_advance(int ch, u64 now) {
+  Timer &t = timer_[ch];
+  if (!t.running || !t.divider || !t.next_inc) {
+    t.edge_packed = Timer::kEdgeNone;
+    due_reinsert(ch);
+    return;
+  }
+  int guard = 0;
+  while (t.next_inc <= now) {
+    u64 remaining = (now - t.next_inc) / t.divider + 1;  // edges up to now
+    u32 dA = (u32)(((int)t.tgra - (int)t.tcnt - 1) & 0xffff) + 1;
+    u32 dB = (u32)(((int)t.tgrb - (int)t.tcnt - 1) & 0xffff) + 1;
+    u32 dw = (u32)(0xffff - t.tcnt + 1);
+    u32 d = dA;
+    if (dB < d) d = dB;
+    if (dw < d) d = dw;
+    if (d > remaining) {
+      // No observable event in the window: advance arithmetically.
+      // No wrap can occur (dw >= d > remaining), so the u16 cast is
+      // exact, and next_inc lands on the first edge after the window.
+      t.tcnt = (u16)(t.tcnt + remaining);
+      t.next_inc += remaining * t.divider;
+      break;
+    }
+    if (d > 1) {
+      // Advance the (d-1) quiet edges before the event edge (no
+      // event and no wrap among them, by minimality of d).
+      t.tcnt = (u16)(t.tcnt + (d - 1));
+      t.next_inc += (u64)(d - 1) * t.divider;
+    }
+    // Fire exactly one original edge at its exact edge time.
+    u64 saved = cycles_;
+    cycles_ = t.next_inc;
+    timer_inc(ch);
+    cycles_ = saved;
+    if (++guard > 100000) {
+      logf("timer_advance: guard tripped ch%d", (u32)ch, 0);
+      next_event_dirty_ = true;
+      break;
+    }
+  }
+  // Every exit recomputes the next-edge cache from post-advance state
+  // (on the guard-break path the next unprocessed edge may already be
+  // due, which correctly forces an advance at the next tick).
+  // Lazy-ch3 (milestone-1 verdict: ch3's TSR/TCNT are never read and
+  // its TIER is never enabled in boot + E1M1, and its output pins are
+  // unmodeled): while tier == 0, ch3's edges are unobservable, so it
+  // stays lazy (packed INF = never due, excluded from the sleep min
+  // by the same INF). Exactness is preserved, not approximated: any
+  // ch3 TCNT/TSR read catches ch3 up first (firing all missed edges
+  // at exact times, setting flags correctly), any ch3 write touches
+  // (advance + dirty), and a TIER write with bits set re-arms eager
+  // advance via this same rule (tier != 0 takes the computed edge).
+  // TSR flags are sticky until firmware clears them, so skipping
+  // further edge firings while they are already set changes nothing
+  // observable. If a future song/game ever reads ch3 or enables its
+  // interrupts, the catch-up/touch/re-arm paths keep this exact.
+  t.edge_packed = (ch == 3 && t.tier == 0) ? Timer::kEdgeNone : timer_next_edge(ch);
+  due_reinsert(ch);
+}
+
 void Mu50H8::tick_peripherals() {
-  // Process every peripheral event due at or before cycles_, in order.
-  // Note: with no events pending, next_event_cycle returns cycles_
-  // itself, so "no event fired" is the termination condition, not
-  // e == cycles_. A same-cycle re-fire is always a bug (every event
-  // either clears itself or reschedules strictly in the future);
-  // guard against it rather than spinning forever. Legitimate
-  // catch-up is bounded by (max instruction cycles / min divider) x
-  // channels, a few hundred at most, so 10000 is a safe backstop.
+  // Last tick boundary for timer catch-up/touch (eager state at any
+  // mid-instruction read/write is the state as of this boundary).
+  last_tick_cycles_ = cycles_;
+  // Process every peripheral event due at or before cycles_.
+  //
+  // H2 restructure. Timers are bulk-advanced to cycles_ FIRST
+  // (timer_advance). Timer handlers never read SCI/MIDI/ADC state,
+  // and interrupt pending is a pure OR-accumulation resolved only
+  // after the tick (takes happen at instruction boundaries), so
+  // firing timer events before same-tick SCI/MIDI/ADC events cannot
+  // change the outcome. After the bulk advance every timer next_inc
+  // is > cycles_ or 0, so the non-timer loop below cannot miss a
+  // timer event, and the cached full minimum is stale (timer times
+  // changed) -- marked dirty. The remaining loop then handles only
+  // the rare non-timer events (SCI/MIDI/ADC: 2,010 events in the 3 s
+  // reference window vs 71M timer edges) in time order, exactly as
+  // the old loop did.
+  //
+  // Timer-guard (per-channel lazy advance) + due-list. The tick loop
+  // advances only the due-list head while it is due; skipped channels
+  // are never visited (their old per-channel skip counts are therefore
+  // no longer tallied -- subsumed by the heavy-diag removal). Channel 3
+  // is lazy by construction while its TIER is 0 (see timer_advance):
+  // it sits at INF in the due-list and is never advanced by this loop;
+  // reads/writes/TIER-enables re-engage it through catch-up/touch. The mask
+  // keeps old semantics exactly (each channel advances at most once
+  // per tick); a still-due head after its advance (guard-break path
+  // only, unreachable for single-instruction tick windows) waits for
+  // the next tick, as before. Skipping is exact, not approximate: no
+  // edge falls in a skipped span (the cache is the next edge), no
+  // state is dirty (writes force an advance), and bulk advance from
+  // stale state processes edges in order, so a later advance
+  // reproduces exactly the per-tick advances it replaces.
+  u32 advanced = 0;
+  for (;;) {
+    int ch = due_order_[0];
+    if (edge_deadline(ch) > cycles_) break;
+    if (advanced & (1u << ch)) break;
+    advanced |= (1u << ch);
+    timer_advance(ch, cycles_);
+  }
+  next_event_dirty_ = true;
   int guard = 0;
   for (;;) {
-    u64 e = next_event_cycle(cycles_);
+    u64 e = next_nontimer_event_cycle(cycles_);
     if (e > cycles_) break;
     if (++guard > 10000) {
       logf("tick_peripherals: zero-progress event %06x pc %06x", (u32)e, pc_);
       if (midi_bit_ != -2 && midi_edge_ <= cycles_) midi_bit_ = -2;
       for (int i = 0; i < 2; i++)
         if (sci_[i].next_tick <= cycles_) sci_[i].next_tick = 0;
-      for (int ch = 0; ch < 5; ch++)
-        if (timer_[ch].next_inc <= cycles_) timer_[ch].next_inc = 0;
       if (adc_done_ && adc_done_ <= cycles_) adc_done_ = 0;
+      next_event_dirty_ = true;
       break;
     }
     // Advance the event clock to e (events observe cycles_ == e).
@@ -1102,20 +1391,21 @@ void Mu50H8::tick_peripherals() {
     if (midi_bit_ != -2 && midi_edge_ == e) { midi_line_tick(e); fired = true; }
     for (int i = 0; i < 2; i++)
       if (sci_[i].next_tick == e) { sci_tick(sci_[i]); fired = true; }
-    for (int ch = 0; ch < 5; ch++)
-      if (timer_[ch].next_inc == e) { timer_inc(ch); fired = true; }
     if (adc_done_ && adc_done_ == e) {
       fired = true;
       adc_done_ = 0;
-      // Fixed panel values (MAME ymmu50 driver).
-      addr_[0] = 0x3ff;
-      addr_[1] = 0x000;
-      addr_[2] = 0x3ff;
-      addr_[3] = 0x000;
-      addr_[4] = 0x000; // MIDI selector: pure MIDI
-      addr_[5] = 0x000;
-      addr_[6] = 0x200; // battery
-      addr_[7] = 0x000;
+      // Fixed panel values (MAME ymmu50 driver), stored MAME-style:
+      // only the converted channel's value lands in the masked
+      // result register (4 registers: channel & 3), so a ch4
+      // conversion wraps to register 0 instead of ch0's value
+      // overwriting it. ADDRA then reads the ch4 value (0x000),
+      // matching MAME's commit_value (reg &= m_register_mask).
+      // (ADC fix -- moved verbatim from the old loop body.)
+      static const u16 kAdcChannelValues[8] = {
+        0x3ff, 0x000, 0x3ff, 0x000, 0x000, 0x000, 0x200, 0x000,
+      }; // ch4: MIDI selector, pure MIDI; ch6: battery
+      const int adc_channel = adcsr_ & 0x07;
+      addr_[adc_channel & 3] = kAdcChannelValues[adc_channel];
       adcsr_ |= 0x80; // ADF
       adcsr_ &= ~0x20; // ADST clears on completion
       if (adcsr_ & 0x40) intc_raise(kAdcVector);
@@ -1135,63 +1425,118 @@ const Mu50H8::ExecFn Mu50H8::kExecFns[] = {
 
 void Mu50H8::execute_one() {
   instr_start_pc_ = pc_;
-  // TEMP-DEBUG: trace handler-B callees (remove after MIDI diagnosis).
-  if (pc_ == 0x11bf6) {
-    u32 sp = r32_r(7);
-    u32 ret = ((u32)bus_read16(sp) << 16) | bus_read16(sp + 2);
-    logf("DEQ ret=%06x", ret, 0);
-  }
-  if (pc_ == 0x11720 || pc_ == 0x116b2 || pc_ == 0x116e0 || pc_ == 0x112e4 || pc_ == 0x11560 || pc_ == 0x117cc || pc_ == 0x11838)
-    logf("CALL %06x R0=%04x", pc_, r16_r(0));
   // Fetch opcode words on demand (2 cycles each, via the bus). MAME's
   // dispatch guarantees the enabled set is collision-free, so filtering
   // by successive words leaves exactly one entry at each length.
   u16 w[3] = {0, 0, 0};
   w[0] = bus_read16(pc_);
   const Mu50H8Opcode *match = nullptr;
-  bool any_long = false;
-  for (const auto &op : kMu50H8Opcodes) {
-    if ((w[0] & op.mask[0]) != op.val[0]) continue;
-    if (op.nwords == 1) { match = &op; break; }
-    any_long = true;
-  }
-  if (match == nullptr && any_long) {
-    w[1] = bus_read16(pc_ + 2);
-    bool any_longer = false;
-    for (const auto &op : kMu50H8Opcodes) {
-      if (op.nwords < 2) continue;
-      if ((w[0] & op.mask[0]) != op.val[0]) continue;
-      if ((w[1] & op.mask[1]) != op.val[1]) continue;
-      if (op.nwords == 2) { match = &op; break; }
-      any_longer = true;
-    }
-    if (match == nullptr && any_longer) {
-      w[2] = bus_read16(pc_ + 4);
-      for (const auto &op : kMu50H8Opcodes) {
-        if (op.nwords < 3) continue;
-        if ((w[0] & op.mask[0]) != op.val[0]) continue;
-        if ((w[1] & op.mask[1]) != op.val[1]) continue;
-        if ((w[2] & op.mask[2]) != op.val[2]) continue;
-        match = &op;
-        break;
+  u16 fn = 0;
+  u8 nwords = 0, extra = 0;
+  // Words already fetched by a failed cache validation below. The scan
+  // must not refetch them: each bus fetch charges 2 cycles, and a
+  // double fetch would break cycle-count parity with the scan path.
+  // Memory cannot change between the validation fetch and the scan
+  // fetch (no firmware executes between them), so skipping the
+  // refetch is observably identical.
+  bool w1_fetched = false, w2_fetched = false;
+  // H1: decoded-instruction cache (see the header). The slot is
+  // indexed by word address; it is used only if the full PC tag and
+  // every opcode word the match depends on still match the freshly
+  // fetched words. On a hit only the table scan is skipped, never a
+  // bus fetch: w[0] always, w[1] iff nwords >= 2, w[2] iff
+  // nwords >= 3 -- exactly the scan path's fetch sequence -- so cycle
+  // counts are unchanged. (The TEMP-DEBUG PC comparisons that used to
+  // sit here were removed: they ran on every instruction, and the
+  // 0x11bf6 DEQ block additionally charged 2 bus reads whenever that
+  // PC executed. Neither executes in the 9-12 s verification window,
+  // so their removal cannot change its cycle counts; see the report.)
+  bool hit = false;
+  DecodeCacheEntry *slot = nullptr;
+  if (decode_cache_) {
+    slot = &decode_cache_[(pc_ >> 1) & (kDecodeCacheSize - 1)];
+    if (slot->valid && slot->pc == pc_ && slot->w0 == w[0]) {
+      if (slot->nwords == 1) {
+        hit = true;
+      } else {
+        w[1] = bus_read16(pc_ + 2);
+        w1_fetched = true;
+        if (slot->w1 == w[1]) {
+          if (slot->nwords == 2) {
+            hit = true;
+          } else {
+            w[2] = bus_read16(pc_ + 4);
+            w2_fetched = true;
+            if (slot->w2 == w[2]) hit = true;
+          }
+        }
+      }
+      if (hit) {
+        fn = slot->fn;
+        nwords = slot->nwords;
+        extra = slot->extra;
       }
     }
   }
-  if (match == nullptr) {
-    illegal();
-    logf("illegal opcode %04x at %06x", w[0], instr_start_pc_);
-    return;
+  if (!hit) {
+    bool any_long = false;
+    for (const auto &op : kMu50H8Opcodes) {
+      if ((w[0] & op.mask[0]) != op.val[0]) continue;
+      if (op.nwords == 1) { match = &op; break; }
+      any_long = true;
+    }
+    if (match == nullptr && any_long) {
+      if (!w1_fetched) { w[1] = bus_read16(pc_ + 2); w1_fetched = true; }
+      bool any_longer = false;
+      for (const auto &op : kMu50H8Opcodes) {
+        if (op.nwords < 2) continue;
+        if ((w[0] & op.mask[0]) != op.val[0]) continue;
+        if ((w[1] & op.mask[1]) != op.val[1]) continue;
+        if (op.nwords == 2) { match = &op; break; }
+        any_longer = true;
+      }
+      if (match == nullptr && any_longer) {
+        if (!w2_fetched) { w[2] = bus_read16(pc_ + 4); w2_fetched = true; }
+        for (const auto &op : kMu50H8Opcodes) {
+          if (op.nwords < 3) continue;
+          if ((w[0] & op.mask[0]) != op.val[0]) continue;
+          if ((w[1] & op.mask[1]) != op.val[1]) continue;
+          if ((w[2] & op.mask[2]) != op.val[2]) continue;
+          match = &op;
+          break;
+        }
+      }
+    }
+    if (match == nullptr) {
+      illegal();
+      logf("illegal opcode %04x at %06x", w[0], instr_start_pc_);
+      return;
+    }
+    fn = match->fn;
+    nwords = match->nwords;
+    extra = match->extra;
+    if (slot) {
+      slot->pc = pc_;
+      slot->w0 = w[0];
+      slot->w1 = w[1];
+      slot->w2 = w[2];
+      slot->fn = fn;
+      slot->nwords = nwords;
+      slot->extra = extra;
+      slot->skip = match->skip;
+      slot->valid = 1;
+    }
   }
-  int total = match->nwords + match->extra;
-  for (int i = match->nwords; i < total; i++) {
+  int total = nwords + extra;
+  for (int i = nwords; i < total; i++) {
     ir_[i] = bus_read16(pc_ + 2 * i);
   }
   ir_[0] = w[0];
-  if (match->nwords >= 2) ir_[1] = w[1];
-  if (match->nwords >= 3) ir_[2] = w[2];
+  if (nwords >= 2) ir_[1] = w[1];
+  if (nwords >= 3) ir_[2] = w[2];
   // Upfront fetch complete: pc points past the instruction (== MAME NPC).
   pc_ = (pc_ + 2 * total) & 0xffffff;
-  (this->*kExecFns[match->fn])();
+  (this->*kExecFns[fn])();
   instr_count_++;
   // No discarded-prefetch charge: MAME's fall-through/target fetches are
   // already accounted for — bxx semantics read the target word (read16i)

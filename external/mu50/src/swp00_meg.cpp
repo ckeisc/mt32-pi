@@ -81,16 +81,19 @@ std::array<std::int32_t,2> MegState::process(const VoiceMix& in) noexcept {
   vflp1_=m9v(m9(vflp1_,0x89)+m9(vflp2_,0x8a)+wl,amp)+m9(vflp1_,0x8b);vflp2_=m9v(vflp1_,amp)+m9(vflp2_,0x8d);vfrp1_=m9v(m9(vfrp1_,0x96)+m9(vfrp2_,0x97)+wr,amp)+m9(vfrp1_,0x98);vfrp2_=m9v(vfrp1_,amp)+m9(vfrp2_,0x9a);
   vo_l=m9(y,0xb9)+m9(vflp1_,0xba)+m9(ol,0xbb);vo_r=m9(q,0xab)+m9(vr,0xac)+m9(vfrp1_,0xad)+m9(oor,0xae);break;}
  }
- cho_vol_=m9(cho_vol_,0x58)+constants_[0x57];cl=m7(cl,0x02);cr=m7(cr,0x05);cl+=m9v(m7(vo_l,0x03),var_vol_);cr+=m9v(m7(vo_r,0x06),var_vol_);lfo_step(cho_lfo_phase_,0x09);
+ cho_vol_=m9(cho_vol_,0x58)+constants_[0x57];cl=m7(cl,0x02);cr=m7(cr,0x05);if(!no_variation_){cl+=m9v(m7(vo_l,0x03),var_vol_);cr+=m9v(m7(vo_r,0x06),var_vol_);}lfo_step(cho_lfo_phase_,0x09);
  s32 c1=bc.lfo(0x1b,cho_lfo_phase_,0,0x1a),c2=bc.lfo(0x2a,cho_lfo_phase_,constants_[0x25],0x28),c3=bc.lfo(0x39,cho_lfo_phase_,constants_[0x34],0x37);
  s32 cr2=m7(cfr1_,0x3c)+m7(cr,0x3d)+m9(cfr2_,0x3e),crf=m7(cfr2_,0x3f)+m7(cr2,0x40)+m9(cfr3_,0x41);cfr1_=cr;cfr2_=cr2;cfr3_=crf;
  s32 cl2=m7(cfl1_,0x49)+m7(cl,0x4a)+m9(cfl2_,0x4b),clf=m7(cfl2_,0x4c)+m7(cl2,0x4d)+m9(cfl3_,0x4e);cfl1_=cl;cfl2_=cl2;cfl3_=clf;bc.put(0x42,m9(c2,0x42)+crf);bc.put(0x51,m9(c1,0x4f)+clf+m9(crf,0x50));s32 co_l=m9(c1,0x60)+m9(c3,0x61),co_r=m9(c2,0x69)+m9(c3,0x6a);
- rev_vol_=m9(rev_vol_,0x0c)+constants_[0x0b];rev=m7(rev,0x11);rev+=m9v(m7(co_l,0x12)+m7(co_r,0x13),cho_vol_);rev+=m9v(m7(vo_l,0x14)+m7(vo_r,0x15),var_vol_);
+ rev_vol_=m9(rev_vol_,0x0c)+constants_[0x0b];rev=m7(rev,0x11);if(!no_chorus_){rev+=m9v(m7(co_l,0x12)+m7(co_r,0x13),cho_vol_);}if(!no_variation_){rev+=m9v(m7(vo_l,0x14)+m7(vo_r,0x15),var_vol_);}
  s32 rf2=m7(rf1_,0x2d)+m7(rev,0x2e)+m9(rf2_,0x2f),rf=m7(rf2_,0x30)+m7(rf2,0x31)+m9(rf3_,0x32);rf1_=rev;rf2_=rf2;rf3_=rf;
  br.put(0x30,m9(br.get(0x21),0x29)+m9(br.get(0x18),0x2a));br.put(0x33,m9(br.get(0x1b),0x33)+rf);s32 r1=m7(br.get(0x33),0x2b)+m7(br.get(0x18),0x2c),r2=m7(br.get(0x27),0x3a)+m7(r1,0x3b);br.put(0x3f,m9(br.get(0x39),0x38)+m9(r1,0x39));
  br.put(0x5d,m9(rha_,0x59)+m9(br.get(0x24),0x5a)+m9(r2,0x5b));rha_=br.get(0x24);br.put(0x63,m9(rhb_,0x5c)+m9(br.get(0x54),0x5d)+m9(r2,0x5e));rhb_=br.get(0x54);br.put(0x69,m9(rhc_,0x62)+m9(br.get(0x5a),0x63)+m9(r2,0x64));rhc_=br.get(0x63);br.put(0x6c,m9(rhd_,0x65)+m9(br.get(0x60),0x66)+m9(r2,0x67));rhd_=br.get(0x66);
  s32 bl=m9(br.get(0x00)+br.get(0x03)+br.get(0x06)+br.get(0x09),0x1c)+m9(br.get(0xbd),0x1b);br.put(0x48,m9(br.get(0x36),0x45)+m9(bl,0x46));s32 rol=m7(br.get(0x36),0x47)+m7(bl,0x48);s32 rr=m9(br.get(0x0c)+br.get(0x0f)+br.get(0x12)+br.get(0x15),0x21)+m9(br.get(0xbd),0x20);br.put(0x48,m9(br.get(0x36),0x51)+m9(rr,0x52));s32 ror=m7(br.get(0x36),0x53)+m7(rr,0x54);
- dl=m7(dl,0xbe);dr=m7(dr,0x01);dl+=m9v(rol,rev_vol_)+m9v(m9(co_l,0x17),cho_vol_)+m9v(m9(vo_l,0x18),var_vol_);dr+=m9v(ror,rev_vol_)+m9v(m9(co_r,0x0e),cho_vol_)+m9v(m9(vo_r,0x0f),var_vol_);buffer_offset_--;
- return {std::clamp<s32>(dl>>6,-0x20000,0x1ffff),std::clamp<s32>(dr>>6,-0x20000,0x1ffff)};
+ dl=m7(dl,0xbe);dr=m7(dr,0x01);if(!no_reverb_){dl+=m9v(rol,rev_vol_);dr+=m9v(ror,rev_vol_);}if(!no_chorus_){dl+=m9v(m9(co_l,0x17),cho_vol_);dr+=m9v(m9(co_r,0x0e),cho_vol_);}if(!no_variation_){dl+=m9v(m9(vo_l,0x18),var_vol_);dr+=m9v(m9(vo_r,0x0f),var_vol_);}buffer_offset_--;
+ // 0.277 output staging: put_int(i, dry, 32768) delivers int16 = clamp(dry)
+ // directly, so the full-domain dry is returned (the host clamps). The HEAD
+ // port's >>6 here would lose 6 bits against a 0.277 golden.
+ return {dl,dr};
 }
 } // namespace libmu50::detail

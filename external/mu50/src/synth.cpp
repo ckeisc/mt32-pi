@@ -1,5 +1,9 @@
+// license:BSD-3-Clause
+// SWP00 register shell for the MAME 0.277-based voice core. Address
+// decoding mirrors MAME 0.277's rchan/rctrl maps; the voice semantics
+// live in Swp0277Core and the MEG tail in MegState.
 #include "libmu50/synth.hpp"
-#include "swp00_voice.hpp"
+#include "swp00_0277.hpp"
 #include "swp00_meg.hpp"
 
 #include <algorithm>
@@ -18,59 +22,61 @@ std::int16_t clamp_s16(std::int64_t value) noexcept {
 }
 
 struct Synth::Impl {
-    explicit Impl(Config cfg) : config(cfg) { reset(); }
+    explicit Impl(Config cfg) : config(cfg) {
+        reset();
+        meg.set_ablation(cfg.no_reverb, cfg.no_chorus, cfg.no_variation);
+    }
 
     Config config;
     std::vector<std::uint8_t> wave_rom;
-    detail::Awm2Core awm2;
+    detail::Swp0277Core core;
     std::array<std::array<std::uint8_t, 0x40>, 32> channel_regs{};
     detail::MegState meg;
     std::array<std::uint8_t, 0x10> control_regs{};
-    std::uint32_t sample_counter = 0;
 
     void reset() {
-        awm2.clear();
+        core.reset();
         for (auto& r : channel_regs) r.fill(0);
         meg.reset();
         control_regs.fill(0);
-        sample_counter = 0;
     }
 
     void write_channel(std::uint8_t reg, std::uint8_t channel, std::uint8_t value) {
         auto& shadow = channel_regs[channel][reg];
         shadow = value;
-        auto& v = awm2.voice(channel);
+        auto& c = core;
         auto pair = [&](std::uint8_t lo_reg, std::uint8_t hi_reg) {
             return std::uint16_t(channel_regs[channel][lo_reg]) |
                    (std::uint16_t(channel_regs[channel][hi_reg]) << 8);
         };
         switch (reg) {
-        case 0x08: case 0x09: v.set_phase(pair(0x09, 0x08)); break;
-        case 0x0a: case 0x0b: v.set_start(pair(0x0b, 0x0a)); break;
-        case 0x20: v.set_filter_info_high(value); break;
-        case 0x21: v.set_filter_info_low(value); break;
-        case 0x22: v.set_filter_speed(value); break;
-        case 0x23: v.set_lfo_lamod(value); break;
-        case 0x24: v.set_lfo_speed(value); break;
-        case 0x25: v.set_lfo_fmod(value); break;
-        case 0x26: v.set_attack_speed(value); break;
-        case 0x27: v.set_attack_level(value); break;
-        case 0x28: v.set_decay_speed(value); break;
-        case 0x29: v.set_decay_level(value); break;
-        case 0x2a: v.set_reverb(value); break;
-        case 0x2b: v.set_dry(value); break;
-        case 0x2c: v.set_chorus(value); break;
-        case 0x2d: v.set_variation(value); break;
-        case 0x2e: v.set_global(value); break;
-        case 0x2f: v.set_pan(value); break;
-        case 0x30: v.set_format(value); break;
+        // 0x08/0x09 are the HEAD phase registers; 0.277 has no phase
+        // register, so these writes are shadow-only (ignored by the core).
+        case 0x08: case 0x09: break;
+        case 0x0a: case 0x0b: c.set_start(channel, pair(0x0b, 0x0a)); break;
+        case 0x20: case 0x21: c.set_lpf_info(channel, pair(0x21, 0x20)); break;
+        case 0x22: c.set_lpf_speed(channel, value); break;
+        case 0x23: c.set_lfo_famod_depth(channel, value); break;
+        case 0x24: c.set_lfo_step(channel, value); break;
+        case 0x25: c.set_lfo_pmod_depth(channel, value); break;
+        case 0x26: c.set_attack_speed(channel, value); break;
+        case 0x27: c.set_attack_level(channel, value); break;
+        case 0x28: c.set_decay_speed(channel, value); break;
+        case 0x29: c.set_decay_level(channel, value); break;
+        case 0x2a: c.set_reverb_level(channel, value); break;
+        case 0x2b: c.set_dry_level(channel, value); break;
+        case 0x2c: c.set_chorus_level(channel, value); break;
+        case 0x2d: c.set_variation_level(channel, value); break;
+        case 0x2e: c.set_glo_level(channel, value); break;
+        case 0x2f: c.set_panning(channel, value); break;
+        case 0x30: c.set_format(channel, value); break;
         case 0x31: case 0x32: case 0x33:
-            v.set_address(std::uint32_t(channel_regs[channel][0x33]) |
+            c.set_address(channel, std::uint32_t(channel_regs[channel][0x33]) |
                           (std::uint32_t(channel_regs[channel][0x32]) << 8) |
                           (std::uint32_t(channel_regs[channel][0x31]) << 16));
             break;
-        case 0x34: case 0x35: v.set_pitch(pair(0x35, 0x34)); break;
-        case 0x36: case 0x37: v.set_loop(pair(0x37, 0x36)); break;
+        case 0x34: case 0x35: c.set_pitch(channel, pair(0x35, 0x34)); break;
+        case 0x36: case 0x37: c.set_end(channel, pair(0x37, 0x36)); break;
         default: break;
         }
     }
@@ -102,7 +108,7 @@ Status Synth::write_register(std::uint16_t address, std::uint8_t value) {
             const unsigned group = 0x0b - address;
             for (unsigned bit = 0; bit < 8; ++bit)
                 if (value & (1u << bit))
-                    impl_->awm2.voice(group * 8 + bit).keyon();
+                    impl_->core.keyon(static_cast<int>(group * 8 + bit));
         }
         return {};
     }
@@ -134,6 +140,25 @@ Status Synth::write_register(std::uint16_t address, std::uint8_t value) {
 
 Status Synth::read_register(std::uint16_t address, std::uint8_t& value) const {
     if (address <= 0x0e) {
+        // MAME 0.277: waverom_access_r always returns 0x00 (busy flag),
+        // and waverom_val_r returns the byte at voice-31's address and
+        // auto-increments that address (24-bit wrap).
+        if (address == 0x02) {
+            value = 0x00;
+            return {};
+        }
+        if (address == 0x03) {
+            const auto& rom = impl_->wave_rom;
+            const std::uint32_t adr = impl_->core.address(31);
+            value = rom.empty() ? std::uint8_t(0)
+                                : rom[adr & static_cast<std::uint32_t>(rom.size() - 1)];
+            const std::uint32_t next = (adr + 1) & 0xffffff;
+            impl_->core.set_address(31, next);
+            impl_->channel_regs[31][0x31] = static_cast<std::uint8_t>((next >> 16) & 0xff);
+            impl_->channel_regs[31][0x32] = static_cast<std::uint8_t>((next >> 8) & 0xff);
+            impl_->channel_regs[31][0x33] = static_cast<std::uint8_t>(next & 0xff);
+            return {};
+        }
         value = impl_->control_regs[address];
         return {};
     }
@@ -172,13 +197,18 @@ Status Synth::render(std::int16_t* output, std::size_t frames) {
     if (impl_->wave_rom.empty())
         return {Error::rom_not_loaded, "Load the MU50 waveform ROM before rendering"};
 
+    // Voice registers are frozen for this whole call (all H8 writes
+    // landed before render); derive per-voice constants once here
+    // instead of once per frame in render_one.
+    impl_->core.precompute_voices();
     for (std::size_t i = 0; i < frames; ++i) {
-        const auto mix = impl_->awm2.render_one(impl_->wave_rom.data(), impl_->wave_rom.size(), impl_->sample_counter++);
+        const auto mix = impl_->core.render_one(impl_->wave_rom.data(), impl_->wave_rom.size());
         const auto routed = impl_->meg.process(mix);
-        // MAME presents the MEG result as signed 18-bit ADC samples. Convert
-        // that normalized range to host signed 16-bit PCM.
-        output[2 * i] = clamp_s16(std::int64_t(routed[0]) >> 2);
-        output[2 * i + 1] = clamp_s16(std::int64_t(routed[1]) >> 2);
+        // MAME 0.277 output staging: put_int(i, dry, 32768) delivers
+        // int16 = clamp(dry) directly. No >>2 (that was HEAD's
+        // put_int_clamp staging, which does not apply here).
+        output[2 * i] = clamp_s16(routed[0]);
+        output[2 * i + 1] = clamp_s16(routed[1]);
     }
     return {};
 }
@@ -186,6 +216,12 @@ Status Synth::render(std::int16_t* output, std::size_t frames) {
 void Synth::reset() { impl_->reset(); }
 const Config& Synth::config() const noexcept { return impl_->config; }
 bool Synth::wave_rom_loaded() const noexcept { return !impl_->wave_rom.empty(); }
-const char* version() noexcept { return "0.2.0-dev"; }
+unsigned Synth::active_voices() const noexcept {
+    unsigned n = 0;
+    for (std::size_t ch = 0; ch < impl_->core.kChannels; ++ch)
+        if (impl_->core.active(static_cast<int>(ch))) ++n;
+    return n;
+}
+const char* version() noexcept { return "0.277.0"; }
 
 } // namespace libmu50

@@ -8,9 +8,22 @@
 
 namespace libmu50 {
 
+// Voice pipeline ported from MAME 0.277's swp00_device (pre-overhaul
+// synthesis). The HEAD-based toggles (bypass_filter, nearest_interp,
+// wrap_decode) do NOT exist here: 0.277's filter and interpolation are
+// integral to its voice loop, and its sequential-by-address DPCM decode
+// has no loop-byte skip to work around.
 struct Config {
     std::uint32_t sample_rate = 44100;
     std::uint32_t chip_clock_hz = 33868800;
+    // Ablation toggles for differential diagnosis ONLY (default off =
+    // normal behavior). Each silences one MEG subsystem's output
+    // contribution so a broken subsystem can be identified by
+    // elimination: if disabling X moves the output closer to the
+    // golden, X's rendering (not its absence) is the error source.
+    bool no_reverb = false;
+    bool no_chorus = false;
+    bool no_variation = false;
 };
 
 enum class Error {
@@ -54,12 +67,16 @@ public:
     Status sysex(const std::uint8_t* data, std::size_t size);
 
     // Render stereo interleaved signed 16-bit PCM at 44.1 kHz. The current
-    // register-level path renders AWM2 voices through the four MAME-derived MEG variation programs, chorus and reverb networks.
+    // register-level path renders 0.277-style AWM2 voices through the four
+    // MAME-derived MEG variation programs, chorus and reverb networks.
     Status render(std::int16_t* interleaved_stereo, std::size_t frames);
 
     void reset();
     const Config& config() const noexcept;
     bool wave_rom_loaded() const noexcept;
+    // Number of voices currently active (read-only split-diag probe;
+    // sums the core's per-voice active flags, no behavior change).
+    unsigned active_voices() const noexcept;
 
 private:
     struct Impl;

@@ -45,6 +45,9 @@ struct Hooks {
   // Diagnostic log (unhandled accesses, enabled DMA/watchdog, ...).
   // Null in the engine; the Linux harness prints it.
   void (*log)(void *ctx, const char *msg) = nullptr;
+  // SCI1 RDR read by the firmware (a received MIDI byte delivered
+  // to the firmware). Fires only for SCI1, never SCI0. May be null.
+  void (*sci1_rdr_read)(void *ctx) = nullptr;
 };
 
 class Mu50H8 {
@@ -52,10 +55,12 @@ public:
   // rom: 512 KB raw firmware file bytes (the bus applies MAME's
   // word-swap view: region[A] = rom[A^1]).
   Mu50H8(const u8 *rom, const Hooks &hooks);
+  ~Mu50H8();
   void reset();
   // Host MIDI byte in (SCI1 RX). Queued; the line driver sends it at
-  // 31250 baud as soon as the line is idle.
-  void queue_midi_byte(u8 b);
+  // 31250 baud as soon as the line is idle. Returns false if the
+  // 256-byte queue overruns and the byte is dropped.
+  bool queue_midi_byte(u8 b);
   // Test hook: write one byte through the bus (peripheral dispatch).
   void dbg_write8(u32 a, u8 v) { bus_write8(a, v); }
   // Advance until cycles() >= target (or halted). Returns false if the
@@ -181,14 +186,62 @@ private:
   void take_irq();
   bool pending_irq() const { return irq_vector_ != 0; }
 
+  // ---- decoded-instruction cache (H1) ----
+  // Direct-mapped cache, one slot per ROM word address: index =
+  // (pc >> 1) & 0x3FFFF. An entry is used only if the full PC tag and
+  // every opcode word the match depends on still match the freshly
+  // fetched words, so a hit yields exactly the table scan's result
+  // even if code in RAM ever executed (RAM words are re-validated on
+  // every hit; ROM words can never change). The match is a pure
+  // function of the opcode words, so a validated hit is exact. On a
+  // hit only the scan is skipped, never a bus fetch: w[0] always,
+  // w[1] iff nwords >= 2, w[2] iff nwords >= 3, exactly as the scan
+  // path fetches -- so cycle counts are unchanged. Null when the
+  // allocation failed, in which case execute_one falls back to the
+  // scan path. All 28.2M traced instructions (boot + steady state +
+  // MAME reference) execute from ROM, so ROM slots never collide.
+  struct DecodeCacheEntry {
+    u32 pc = 0;      // instruction-start PC (tag)
+    u16 w0 = 0, w1 = 0, w2 = 0;  // opcode words the match depends on
+    u16 fn = 0;      // index into kExecFns
+    u8 nwords = 0;   // opcode words (matched)
+    u8 extra = 0;    // extra words (immediates/displacements/addresses)
+    u8 skip = 0;     // words skipped between opcode and extra words
+    u8 valid = 0;    // entry populated
+  };
+  static constexpr int kDecodeCacheSize = 262144;  // one slot per ROM word
+  DecodeCacheEntry *decode_cache_ = nullptr;
+
+  // ---- lazy event time cache (H2 Part A) ----
+  // Cached minimum over all pending peripheral event times (see
+  // next_event_cycle). Recomputed only when dirty: any firmware
+  // peripheral write (funneled through bus_write8_per /
+  // bus_write16_per), host MIDI queueing, event firing, the guard
+  // fallback, or reset marks it dirty. ~u64(0) when no event is
+  // pending. In steady state the hot tick path does not consult this
+  // cache at all (see tick_peripherals); it serves the sleeping path
+  // in run_until, where event sparsity makes the cache pay.
+  u64 next_event_cache_ = 0;
+  bool next_event_dirty_ = true;
+  // Cycles at the most recent tick_peripherals entry (= end of the
+  // most recently completed instruction, or the last sleep jump).
+  // Timer catch-up/touch targets this, never current cycles_: the
+  // eager model advances channels only at instruction boundaries,
+  // so eager state at any mid-instruction read/write is exactly the
+  // state as of the last tick boundary.
+  u64 last_tick_cycles_ = 0;
+
   // ---- INTC (H8H) ----
-  // pending IRQ bitmap, vectors 0-63. External IRQ inputs are inactive
-  // (no pins connected); internal sources set bits directly.
+  // pending IRQ bitmap, vectors 0-63. External IRQ inputs: IRQ0 is
+  // permanently asserted on the MU50 (PCB ties it to ground; MAME
+  // ymmu50.cpp machine_reset: set_input_line(0, ASSERT_LINE));
+  // IRQ1-7 inputs are inactive. Internal sources set bits directly.
   u64 intc_pending_;
   u8 intc_ier_; // external IRQ enables (vectors 12-19)
   u8 intc_isr_; // external IRQ status (vectors 12-19)
   u16 intc_icr_; // priority bits: slot s -> bit (s ^ 7)
   u16 intc_iscr_; // per-IRQ level-low (0) vs falling-edge (1) select
+  u8 intc_irq_input_; // asserted external input levels (bit i = IRQ i)
   int irq_vector_; // selected vector (0 = none), recomputed on any change
   int irq_filter_; // 0/1/2 from CCR + SYSCR (see update_irq_filter)
   void intc_update();
@@ -237,6 +290,21 @@ private:
     int base; // irq base: TGIA=base, TGIB=base+1, OVI=base+2
     u64 next_inc; // next TCNT increment cycle (0 = stopped)
     u32 divider; // cycles per count (1/2/4/8 or 0 = external input)
+    // Timer-guard (per-channel lazy advance) state, packed into ONE
+    // u64 so the hot tick check is a single load + compare.
+    // edge_packed is either a real next-edge cycle time, kEdgeNone
+    // (~u64(0): no future edge -- stopped), or kEdgeDirty (~u64(0)-1:
+    // stale -- a write changed counter/compare/divider/running since
+    // the last advance, and the channel must be advanced, never
+    // skipped). Collision proof: real edge times are cycle counts;
+    // reaching 2^64-1 at 10 MHz takes ~58,000 years, and the distance
+    // construction adds at most 65535*8 cycles to a real next_inc,
+    // so no computed edge can land on either sentinel in any
+    // feasible run. timer_advance is the only writer of edge_packed
+    // (plus timer_touch, which forces kEdgeDirty, and reset).
+    static constexpr u64 kEdgeNone = ~u64(0);
+    static constexpr u64 kEdgeDirty = ~u64(0) - 1;
+    u64 edge_packed = kEdgeDirty;
   };
   Timer timer_[5];
   u8 tstr_, tsyr_, tmdr_, tfcr_, toer_, tocr_;
@@ -244,6 +312,27 @@ private:
   u8 timer_read(int ch, u32 off);
   void timer_inc(int ch);
   void timer_update_dividers(int ch);
+  // Timer-guard helpers. timer_next_edge computes the next observable
+  // edge time from current state (same distance construction as
+  // timer_advance). timer_catch_up advances a channel to the last tick
+  // boundary (for TCNT reads: eager state at read time). timer_touch
+  // does the same advance and then marks the edge cache dirty (for
+  // writes: the write that follows invalidates the cache).
+  // Due-list: due_order_ is a permutation of {0..4} sorted ascending
+  // by edge deadline (dirty = 0 = due now, INF = last). The tick loop
+  // advances only the head while it is due; due_reinsert restores
+  // sorted order after any deadline change. Order-independence proof:
+  // per-channel timer state is disjoint, shared outputs are
+  // OR-accumulated IRQ pending bits and per-channel TSR flags, and
+  // IRQ takes happen only at instruction boundaries after the full
+  // tick -- so advancing due channels in deadline order is
+  // observationally identical to fixed 0..4 order.
+  u8 due_order_[5] = {0, 1, 2, 3, 4};
+  u64 edge_deadline(int ch) const;
+  void due_reinsert(int ch);
+  u64 timer_next_edge(int ch) const;
+  void timer_catch_up(int ch);
+  void timer_touch(int ch);
 
   // ---- ADC ----
   u8 adcsr_, adcr_;
@@ -268,7 +357,9 @@ private:
 
   // ---- peripheral event loop ----
   void tick_peripherals(); // process all events with cycle <= cycles_
-  u64 next_event_cycle(u64 limit) const;
+  u64 next_event_cycle(u64 limit); // cached full minimum (sleep path)
+  u64 next_nontimer_event_cycle(u64 limit) const; // SCI/MIDI/ADC only
+  void timer_advance(int ch, u64 now); // bulk/lazy timer advance (H2B)
 
   // ---- transpiled instruction semantics + arithmetic helpers ----
 #include "mu50h8_helpers.inc"

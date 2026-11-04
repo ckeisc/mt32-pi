@@ -69,6 +69,8 @@ public:
 	// the file-local hooks cannot call private methods.
 	void OnH8SwpWrite(u16 nAddr, u8 nData);
 	u8 OnH8SwpRead(u16 nAddr);
+	// SCI1 RDR read by the firmware (see OnH8Sci1RdrRead).
+	void OnH8Sci1RdrRead();
 
 private:
 	struct TROMPaths
@@ -129,6 +131,15 @@ private:
 	u64 m_nDiagSwpUs;
 	u64 m_nDiagH8Insns;
 	u64 m_nDiagOutputFrames;
+	// Per-window MIDI/SWP diagnostic counters, flushed in UpdateLCD
+	// alongside the timing stats (see the second diag line): bytes
+	// accepted into the SCI1 queue, SCI1 RDR reads by the firmware,
+	// SWP00 register writes, and the peak native SWP sample before
+	// resampling (proves non-zero SWP output independent of gain).
+	u64 m_nDiagMidiQueued;
+	u64 m_nDiagSciRead;
+	u64 m_nDiagSwpWrites;
+	int m_nDiagNativePeak;
 
 	float m_nGain;
 	u8 m_nVolume;
