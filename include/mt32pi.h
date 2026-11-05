@@ -60,6 +60,7 @@
 #include "power.h"
 #include "ringbuffer.h"
 #include "synth/emuscsynth.h"
+#include "synth/limiter.h"
 #include "synth/mt32romset.h"
 #include "synth/mu50synth.h"
 #include "synth/nukedsc55synth.h"
@@ -227,6 +228,14 @@ private:
 
 	// Audio output
 	CSoundBaseDevice* m_pSound;
+
+	// Shared output limiter (AudioTask only, Core 2): see
+	// include/synth/limiter.h. Its state persists across AudioTask
+	// calls so chunk boundaries are seamless; it is never reset on
+	// synth switches (resetting would inject a lookahead of silence).
+	CLimiter m_Limiter;
+	u64 m_nLimiterWindowStartUs = 0;
+	u64 m_nLimiterLastLimitedFrames = 0;
 
 
 	// Extra devices

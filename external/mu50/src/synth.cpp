@@ -207,8 +207,19 @@ Status Synth::render(std::int16_t* output, std::size_t frames) {
         // MAME 0.277 output staging: put_int(i, dry, 32768) delivers
         // int16 = clamp(dry) directly. No >>2 (that was HEAD's
         // put_int_clamp staging, which does not apply here).
-        output[2 * i] = clamp_s16(routed[0]);
-        output[2 * i + 1] = clamp_s16(routed[1]);
+        // Mix headroom (2026-11-04, Silpheed forensics): the s32
+        // voice+MEG sum peaked at 49031 on Silpheed's first 120 s
+        // (1.496x the int16 rail) and 40828 on E1M1, so the clamp
+        // below flattened loud passages at gain 1.0. Scale the sum
+        // by H = (32768 / 49031) * 0.95 ~= 0.6349 BEFORE the clamp,
+        // same factor both channels, so the loudest measured
+        // material peaks at ~95% of full scale unclamped.
+        // Downstream [mu50] gain restores full loudness cleanly.
+        // routed is s32, exactly representable in double, so the
+        // multiply loses no precision on large sums.
+        constexpr double kMixHeadroom = (32768.0 / 49031.0) * 0.95;
+        output[2 * i] = clamp_s16(static_cast<std::int64_t>(routed[0] * kMixHeadroom));
+        output[2 * i + 1] = clamp_s16(static_cast<std::int64_t>(routed[1] * kMixHeadroom));
     }
     return {};
 }
