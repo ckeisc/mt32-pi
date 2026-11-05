@@ -27,6 +27,7 @@
 #include <circle/logger.h>
 #include <circle/memory.h>
 #include <circle/timer.h>
+#include <circle/sched/scheduler.h>
 #include <circle/cputhrottle.h>
 #include <fatfs/ff.h>
 
@@ -76,9 +77,11 @@ constexpr double H8CyclesPerNativeFrame = 10000000.0 / 44100.0;
 
 // H8 hook targets: the hook address is the SWP00 window offset
 // (0x0000-0x07ff), which is exactly libmu50's register address.
-void MU50H8SwpWrite(void* pCtx, mu50h8::u64, mu50h8::u16 nAddr, mu50h8::u8 nData)
+// The write hook's cycle is the 10 MHz H8 cycle domain timestamp
+// for the W-event FIFO (M1).
+void MU50H8SwpWrite(void* pCtx, mu50h8::u64 nCycle, mu50h8::u16 nAddr, mu50h8::u8 nData)
 {
-	static_cast<CMU50Synth*>(pCtx)->OnH8SwpWrite(nAddr, nData);
+	static_cast<CMU50Synth*>(pCtx)->OnH8SwpWrite(nCycle, nAddr, nData);
 }
 
 mu50h8::u8 MU50H8SwpRead(void* pCtx, mu50h8::u16 nAddr)
@@ -118,6 +121,9 @@ CMU50Synth::CMU50Synth(unsigned nSampleRate, float nGain)
 	  m_nDiagSciRead(0),
 	  m_nDiagSwpWrites(0),
 	  m_nDiagNativePeak(0),
+	  m_nDiagWaitUs(0),
+	  m_nDiagLastUnderrunFrames(0),
+	  m_nDiagLastSwpRenderUs(0),
 	  m_nGain(nGain),
 	  m_nVolume(100),
 	  m_dResampleRatio(44100.0 / static_cast<double>(nSampleRate)),
@@ -126,7 +132,34 @@ CMU50Synth::CMU50Synth(unsigned nSampleRate, float nGain)
 	  m_PrevSample{},
 	  m_LeftoverSample{},
 	  m_NativeScratch{},
-	  m_FloatScratch{}
+	  m_FloatScratch{},
+	  m_WEventFifo{},
+	  m_nWEventFifoCap(kWEventFifoSize - 1),
+	  m_SwpShadow{},
+	  m_NativeRing{},
+	  m_PublishedBlocks{},
+	  m_MidiStage{},
+	  m_nRingDrops(0),
+	  m_nWqFullWaits(0),
+	  m_nBlockWaits(0),
+	  m_nStageDrops(0),
+	  m_nRenderedEnqueued(0),
+	  m_nConsumed(0),
+	  m_nPublishedCycles(0),
+	  m_nUnderrunFrames(0),
+	  m_nSwpRenderUs(0),
+	  m_nRingHighWater(0),
+	  m_nAbortSeq(0),
+	  m_nNextPublishSeq(0),
+	  m_nLastPublishedSeq(0),
+	  m_bLastPublishOk(false),
+	  m_bSplitMode(false),
+	  m_bSwpActive(true),
+	  m_bSwpParkAck(false),
+	  m_bAudioBusy(false),
+	  m_SwpScratch{},
+	  m_Pending{},
+	  m_nPendingCount(0)
 {
 }
 
@@ -373,62 +406,254 @@ bool CMU50Synth::Initialize()
 	return true;
 }
 
-void CMU50Synth::OnH8SwpWrite(u16 nAddr, u8 nData)
+void CMU50Synth::OnH8SwpWrite(u64 nCycle, u16 nAddr, u8 nData)
 {
-	// Called from AdvanceH8 under m_Lock. Firmware writes that the
-	// register core rejects are ignored (should not happen once the
-	// wave ROM is loaded).
+	// Called from AdvanceH8 (audio thread). Push the event into the
+	// W-event FIFO in firmware order; the shadow always tracks the
+	// last-written value (split-mode read fallback). Firmware writes
+	// that the register core rejects are ignored at drain time
+	// (should not happen once the wave ROM is loaded).
+	// Single-core: a full FIFO drains synchronously (M1 behavior);
+	// the drain count is the M2 wq_full_waits counter's M1 form and
+	// must stay 0 at E1M1 load (M0 worst block burst 602 < 4095
+	// usable). Split: a full FIFO makes the H8 thread WAIT
+	// (backpressure, counted once per episode) -- W events are
+	// synthesis events, never dropped (unlike Nuked's latch stores).
 	if (m_pSynth)
 	{
-		m_pSynth->write_register(nAddr, nData);
+		const TWEvent Event{ nCycle, nAddr, nData };
+		if (nAddr < sizeof(m_SwpShadow))
+			m_SwpShadow[nAddr] = nData;
+		if (m_bSplitMode)
+		{
+			// Cap-gated backpressure (cap <= 4095 usable; the
+			// TryPush full check below is the backstop). Single
+			// producer: pending cannot grow between the wait exit
+			// and the push, so the push must succeed.
+			if (m_WEventFifo.PendingForProducer() >= m_nWEventFifoCap)
+			{
+				__atomic_add_fetch(&m_nWqFullWaits, 1, __ATOMIC_RELAXED);
+				while (m_WEventFifo.PendingForProducer() >= m_nWEventFifoCap)
+					mu50spsc::CpuRelax();
+			}
+			m_WEventFifo.TryPush(Event);
+		}
+		else
+		{
+			if (!m_WEventFifo.TryPush(Event))
+			{
+				DrainWEvents();
+				__atomic_add_fetch(&m_nWqFullWaits, 1, __ATOMIC_RELAXED);
+				m_WEventFifo.TryPush(Event); // must succeed: drained empty
+			}
+		}
 		++m_nDiagSwpWrites;
 	}
 }
 
+void CMU50Synth::DrainWEventsUpTo(size_t nSnap)
+{
+	// Applies pending events in firmware order up to the producer
+	// in-index snapshot nSnap. Single-core DrainWEvents() passes the
+	// current in-index (drain everything); the SWP thread passes the
+	// published block's snapshot (drain exactly that block's writes).
+	// Never called concurrently: single-core mode drains on the
+	// audio thread, split mode on the SWP thread, modes exclusive.
+	while (m_WEventFifo.OutIndex() != nSnap)
+	{
+		TWEvent Event;
+		if (!m_WEventFifo.TryPeek(Event))
+			break; // cannot happen: snap is behind in-index
+		if (m_pSynth)
+			m_pSynth->write_register(Event.nAddr, Event.nData);
+		m_WEventFifo.Pop();
+	}
+}
+
+void CMU50Synth::DrainWEvents()
+{
+	// Caller must hold m_Lock (single-core, synchronous).
+	// Applies every pending event in firmware order. Runs before
+	// each block render and before each SWP read, so no read ever
+	// observes a stale register.
+	DrainWEventsUpTo(m_WEventFifo.InIndex());
+}
+
 u8 CMU50Synth::OnH8SwpRead(u16 nAddr)
 {
-	// A failed read returns 0, matching the M2 harness stub behavior.
-	u8 nValue = 0;
-	if (m_pSynth)
-		m_pSynth->read_register(nAddr, nValue);
-	return nValue;
+	// Single-core (M1): drain first, then read live register state.
+	if (!m_bSplitMode)
+	{
+		DrainWEvents();
+		u8 nValue = 0;
+		if (m_pSynth)
+			m_pSynth->read_register(nAddr, nValue);
+		return nValue;
+	}
+	// Split: the SWP thread owns live register state, so the audio
+	// thread must never read it. Pending-scan newest-wins first
+	// (M0: reads are cold, single-address 0x001, always
+	// read-your-own-write); the audio-side shadow covers the case
+	// where the newest write was already drained (shadow == last
+	// written == live for side-effect-free control registers, and
+	// the firmware never reads any other address, M0). A failed
+	// read returns 0, matching the M2 harness stub behavior.
+	TWEvent Event;
+	if (m_WEventFifo.FindNewest([nAddr](const TWEvent& E) { return E.nAddr == nAddr; }, Event))
+		return Event.nData;
+	if (nAddr < sizeof(m_SwpShadow))
+		return m_SwpShadow[nAddr];
+	return 0;
 }
 
 void CMU50Synth::OnH8Sci1RdrRead()
 {
-	// Called from the H8's sci_read under m_Lock (inside AdvanceH8
-	// during Render). Counts SCI1 RDR reads, normally one per MIDI
-	// byte the firmware consumes.
+	// Called from the H8's sci_read (inside AdvanceH8 during
+	// Render, audio thread). Counts SCI1 RDR reads, normally one
+	// per MIDI byte the firmware consumes.
 	++m_nDiagSciRead;
+}
+
+void CMU50Synth::DrainMidiStage()
+{
+	// Split mode, audio thread only, called at each AdvanceH8.
+	// Bytes staged by the MIDI thread land in SCI1 exactly as if
+	// the MIDI handler had queued them directly: cycles_ is
+	// unchanged since the last advance, so the line-driver edge
+	// times (cycles_+320) are identical to single-core timing.
+	// Note tracking and the MIDI monitor move to the drain too, so
+	// all note state stays on the audio thread.
+	TMidiStage Stage;
+	while (m_MidiStage.TryPop(Stage))
+	{
+		if (Stage.nKind == 0)
+		{
+			if (m_pH8->queue_midi_byte(Stage.nB0))
+				++m_nDiagMidiQueued;
+		}
+		else if (Stage.nKind == 1)
+		{
+			const u8 nStatus = Stage.nB0;
+			const u8 nData1  = Stage.nB1;
+			const u8 nData2  = Stage.nB2;
+			if (nStatus < 0xF0)
+			{
+				const u8 nType = nStatus & 0xF0;
+				if (nType == 0x90 && nData2 > 0)
+					++m_nHeldNotes;
+				else if (nType == 0x80 || (nType == 0x90 && nData2 == 0))
+				{
+					if (m_bSustain && m_nHeldNotes > 0)
+					{
+						--m_nHeldNotes;
+						m_bSustainedNotes = true;
+					}
+					else if (m_nHeldNotes > 0)
+						--m_nHeldNotes;
+				}
+				else if (nType == 0xB0 && nData1 == 64)
+				{
+					m_bSustain = nData2 >= 64;
+					if (!m_bSustain)
+						m_bSustainedNotes = false;
+				}
+			}
+			QueueMIDIMessageBytes(nStatus, nData1, nData2);
+			CSynthBase::HandleMIDIShortMessage(
+				static_cast<u32>(nStatus) | (static_cast<u32>(nData1) << 8) |
+				(static_cast<u32>(nData2) << 16));
+		}
+		else if (Stage.nKind == 2)
+		{
+			// AllSoundOff: CC 120 + CC 123 on every channel.
+			for (u8 nChannel = 0; nChannel < 16; ++nChannel)
+			{
+				QueueMIDIMessageBytes(static_cast<u8>(0xB0 | nChannel), 120, 0);
+				QueueMIDIMessageBytes(static_cast<u8>(0xB0 | nChannel), 123, 0);
+			}
+			m_nHeldNotes      = 0;
+			m_bSustain        = false;
+			m_bSustainedNotes = false;
+			CSynthBase::AllSoundOff();
+		}
+	}
 }
 
 void CMU50Synth::AdvanceH8(size_t nNativeFrames)
 {
-	if (!m_pH8 || m_bH8Halted || nNativeFrames == 0)
+	// Split mode: staged MIDI lands before any stepping, even when
+	// halted or when this block is empty -- matching single-core,
+	// where MIDI handlers queue regardless of halt state.
+	if (m_bSplitMode)
+		DrainMidiStage();
+
+	if (!m_pH8 || nNativeFrames == 0)
 		return;
 
-	m_dH8CycleCarry += static_cast<double>(nNativeFrames) * H8CyclesPerNativeFrame;
-	const u64 nAdvance = static_cast<u64>(m_dH8CycleCarry);
-	m_dH8CycleCarry -= static_cast<double>(nAdvance);
-	if (nAdvance == 0)
-		return;
-
-	const bool bDiag      = CDiagLog::Get().IsEnabled();
-	const u64 nStartUs    = bDiag ? CTimer::Get()->GetClockTicks() : 0;
-	const u64 nStartInsns = m_pH8->instr_count();
-	if (!m_pH8->run_until(m_pH8->cycles() + nAdvance))
+	if (!m_bH8Halted)
 	{
-		// Sticky: a halted CPU stays halted until a system reset
-		// (0xFF) revives it. Should not happen: M2 ran 23.7M
-		// instructions through boot with no halt.
-		m_bH8Halted = true;
-		LOGWARN("MU50 H8 halted at pc=0x%08x (illegal opcode); firmware stopped",
-		        m_pH8->illegal_pc());
+		m_dH8CycleCarry += static_cast<double>(nNativeFrames) * H8CyclesPerNativeFrame;
+		const u64 nAdvance = static_cast<u64>(m_dH8CycleCarry);
+		m_dH8CycleCarry -= static_cast<double>(nAdvance);
+		if (nAdvance > 0)
+		{
+			const bool bDiag      = CDiagLog::Get().IsEnabled();
+			const u64 nStartUs    = bDiag ? CTimer::Get()->GetClockTicks() : 0;
+			const u64 nStartInsns = m_pH8->instr_count();
+			if (!m_pH8->run_until(m_pH8->cycles() + nAdvance))
+			{
+				// Sticky: a halted CPU stays halted until a system
+				// reset (0xFF) revives it. Should not happen: M2
+				// ran 23.7M instructions through boot with no halt.
+				m_bH8Halted = true;
+				LOGWARN("MU50 H8 halted at pc=0x%08x (illegal opcode); firmware stopped",
+				        m_pH8->illegal_pc());
+			}
+			if (bDiag)
+			{
+				m_nDiagH8Us += CTimer::Get()->GetClockTicks() - nStartUs;
+				m_nDiagH8Insns += m_pH8->instr_count() - nStartInsns;
+			}
+		}
 	}
-	if (bDiag)
+	// Split mode: publish the block (RELEASE) even when halted --
+	// M1 still renders every block after a halt (decay/silence),
+	// so the SWP thread must still render it, or the audio thread
+	// would wait forever. The snapshot bound makes the SWP drain
+	// exact even when the audio core has run ahead: only writes
+	// pushed before this publish are applied to this block's
+	// render. A full block queue waits (counted); with 16 slots
+	// and the SWP core faster than the H8, it never fills in
+	// steady state.
+	if (m_bSplitMode)
 	{
-		m_nDiagH8Us += CTimer::Get()->GetClockTicks() - nStartUs;
-		m_nDiagH8Insns += m_pH8->instr_count() - nStartInsns;
+		const u64 nSeq = ++m_nNextPublishSeq;
+		const TPublishedBlock Block{ m_WEventFifo.InIndex(), nNativeFrames, nSeq };
+		m_bLastPublishOk = true;
+		if (!m_PublishedBlocks.TryPush(Block))
+		{
+			__atomic_add_fetch(&m_nBlockWaits, 1, __ATOMIC_RELAXED);
+			while (!m_PublishedBlocks.TryPush(Block))
+			{
+				// M3: parked mid-publish (sustained parked
+				// rendering, e.g. the starve test): skip the
+				// publish rather than wedging. The block's W
+				// events stay queued (SWP drains them later, so
+				// SWP state stays correct); the pull sees
+				// bPublished=false and silence-fills without
+				// waiting. Never skip for any other reason: a
+				// skipped publish while SWP is live would lose
+				// the block's audio.
+				if (!__atomic_load_n(&m_bSwpActive, __ATOMIC_ACQUIRE))
+				{
+					m_bLastPublishOk = false;
+					break;
+				}
+				mu50spsc::CpuRelax();
+			}
+		}
+		m_nLastPublishedSeq = nSeq;
+		__atomic_store_n(&m_nPublishedCycles, m_pH8->cycles(), __ATOMIC_RELEASE);
 	}
 }
 
@@ -476,6 +701,57 @@ void CMU50Synth::HandleMIDIShortMessage(u32 nMessage)
 	// rather than forwarding the byte to the firmware parser.
 	if (nStatus == 0xFF)
 	{
+		if (m_bSplitMode)
+		{
+			// Split: the reset touches audio-owned (H8, resampler)
+			// and SWP-owned (registers, ring) state, so it needs
+			// both threads quiescent. Park the SWP thread, wait
+			// for the audio thread to leave RenderResampledSplit
+			// (bounded; a Render call is ~10 ms), then reset with
+			// both threads out. On timeout the reset is dropped
+			// (logged) rather than racing the audio thread.
+			if (!ParkSwp())
+			{
+				LOGWARN("MU50 split reset dropped: SWP park timeout");
+				return;
+			}
+			unsigned nSpins = 0;
+			while (__atomic_load_n(&m_bAudioBusy, __ATOMIC_ACQUIRE) && nSpins < 10000000U)
+			{
+				mu50spsc::CpuRelax();
+				++nSpins;
+			}
+			if (__atomic_load_n(&m_bAudioBusy, __ATOMIC_ACQUIRE))
+			{
+				LOGWARN("MU50 split reset dropped: audio busy timeout");
+				UnparkSwp();
+				return;
+			}
+			m_pH8->reset();
+			if (m_pSynth)
+				m_pSynth->reset();
+			m_dResampleCarry  = 0.0;
+			m_bResamplePrimed = false;
+			m_PrevSample[0] = m_PrevSample[1] = 0;
+			m_LeftoverSample[0][0] = m_LeftoverSample[0][1] = 0;
+			m_LeftoverSample[1][0] = m_LeftoverSample[1][1] = 0;
+			m_dH8CycleCarry = 0.0;
+			m_bH8Halted     = false;
+			m_WEventFifo.Clear();
+			m_PublishedBlocks.Clear();
+			m_MidiStage.Clear();
+			// Drain the ring (SWP parked, audio idle: safe).
+			{
+				TNativeFrame Dropped;
+				while (m_NativeRing.Dequeue(Dropped))
+					;
+			}
+			m_nHeldNotes      = 0;
+			m_bSustain        = false;
+			m_bSustainedNotes = false;
+			UnparkSwp();
+			return;
+		}
 		m_Lock.Acquire();
 		m_pH8->reset();
 		if (m_pSynth)
@@ -487,10 +763,26 @@ void CMU50Synth::HandleMIDIShortMessage(u32 nMessage)
 		m_LeftoverSample[1][0] = m_LeftoverSample[1][1] = 0;
 		m_dH8CycleCarry = 0.0;
 		m_bH8Halted     = false;
+		// FIFO is empty at every Render return by construction
+		// (pushes happen only inside AdvanceH8, drained before
+		// the block render), but a reset must never leave stale
+		// events for the fresh boot; cleared for M2-readiness.
+		m_WEventFifo.Clear();
 		m_nHeldNotes      = 0;
 		m_bSustain        = false;
 		m_bSustainedNotes = false;
 		m_Lock.Release();
+		return;
+	}
+
+	if (m_bSplitMode)
+	{
+		// Stage the message; the audio thread drains it at the next
+		// AdvanceH8 (note tracking + monitor update happen there).
+		// No m_Lock: the MIDI thread never touches H8 state.
+		const TMidiStage Stage{ 1, nStatus, nData1, nData2 };
+		if (!m_MidiStage.TryPush(Stage))
+			__atomic_add_fetch(&m_nStageDrops, 1, __ATOMIC_RELAXED);
 		return;
 	}
 
@@ -537,6 +829,17 @@ void CMU50Synth::HandleMIDISysExMessage(const u8* pData, size_t nSize)
 
 	// The firmware expects the complete message including the leading
 	// 0xF0 and trailing 0xF7, and parses the stream itself.
+	if (m_bSplitMode)
+	{
+		// Stage byte by byte; the audio thread drains them in order.
+		for (size_t i = 0; i < nSize; ++i)
+		{
+			const TMidiStage Stage{ 0, pData[i], 0, 0 };
+			if (!m_MidiStage.TryPush(Stage))
+				__atomic_add_fetch(&m_nStageDrops, 1, __ATOMIC_RELAXED);
+		}
+		return;
+	}
 	m_Lock.Acquire();
 	for (size_t i = 0; i < nSize; ++i)
 		if (m_pH8->queue_midi_byte(pData[i]))
@@ -560,29 +863,47 @@ void CMU50Synth::AllSoundOff()
 {
 	if (m_pH8)
 	{
-		// CC 120 (All Sound Off) and CC 123 (All Notes Off) on every
-		// channel; the firmware handles them like real hardware. The
-		// H8 and register core are NOT reset here: the firmware owns
-		// the voice state.
-		m_Lock.Acquire();
-		for (u8 nChannel = 0; nChannel < 16; ++nChannel)
+		if (m_bSplitMode)
 		{
-			const u8 SoundOff[3] = { static_cast<u8>(0xB0 | nChannel), 120, 0 };
-			const u8 NotesOff[3] = { static_cast<u8>(0xB0 | nChannel), 123, 0 };
-			QueueMIDIMessageBytes(SoundOff[0], SoundOff[1], SoundOff[2]);
-			QueueMIDIMessageBytes(NotesOff[0], NotesOff[1], NotesOff[2]);
+			// Stage the control entry; the drain queues the 32
+			// messages, clears note tracking, and resets the
+			// monitor, all on the audio thread.
+			const TMidiStage Stage{ 2, 0, 0, 0 };
+			if (!m_MidiStage.TryPush(Stage))
+				__atomic_add_fetch(&m_nStageDrops, 1, __ATOMIC_RELAXED);
 		}
-		m_Lock.Release();
+		else
+		{
+			// CC 120 (All Sound Off) and CC 123 (All Notes Off) on
+			// every channel; the firmware handles them like real
+			// hardware. The H8 and register core are NOT reset
+			// here: the firmware owns the voice state.
+			m_Lock.Acquire();
+			for (u8 nChannel = 0; nChannel < 16; ++nChannel)
+			{
+				const u8 SoundOff[3] = { static_cast<u8>(0xB0 | nChannel), 120, 0 };
+				const u8 NotesOff[3] = { static_cast<u8>(0xB0 | nChannel), 123, 0 };
+				QueueMIDIMessageBytes(SoundOff[0], SoundOff[1], SoundOff[2]);
+				QueueMIDIMessageBytes(NotesOff[0], NotesOff[1], NotesOff[2]);
+			}
+			m_Lock.Release();
+		}
 	}
 
 	// Sounding-note tracking (see IsActive): an All Sound Off
-	// clears every held/sustained note.
-	m_nHeldNotes      = 0;
-	m_bSustain        = false;
-	m_bSustainedNotes = false;
+	// clears every held/sustained note. Split mode: the drain does
+	// this (audio thread); doing it here would race the drain.
+	// (Without an H8 there is no drain, so clear directly.)
+	if (!m_bSplitMode || !m_pH8)
+	{
+		m_nHeldNotes      = 0;
+		m_bSustain        = false;
+		m_bSustainedNotes = false;
+	}
 
-	// Reset MIDI monitor
-	CSynthBase::AllSoundOff();
+	// Reset MIDI monitor. Split mode: the drain does this.
+	if (!m_bSplitMode || !m_pH8)
+		CSynthBase::AllSoundOff();
 }
 
 void CMU50Synth::SetMasterVolume(u8 nVolume)
@@ -592,15 +913,128 @@ void CMU50Synth::SetMasterVolume(u8 nVolume)
 	// in RenderResampled(), together with the per-engine gain.
 }
 
-void CMU50Synth::RenderResampled(float* pOutBuffer, size_t nFrames)
+// Resample one pulled native block (see the header). Extracted
+// verbatim from M1's RenderResampled body; the M1 loop and the
+// split loop both call it, so the math cannot drift apart.
+double CMU50Synth::ResamplePulledBlock(float* pOutBuffer, size_t nOutDone,
+                                       size_t nBlockOut, double dBlockStart,
+                                       size_t nNativeRender)
 {
-	// Caller must hold m_Lock. Cubic Catmull-Rom resampler (same
-	// 4-tap weights as Nuked's cubic): native 44.1 kHz frames are
-	// rendered block by block and interpolated to the output rate.
-	// Three native frames carry across blocks: the frame before the
-	// boundary (the cubic's prev tap) plus the pair straddling it.
 	const double dRatio = m_dResampleRatio;
 	const float fScale  = m_nGain * (static_cast<float>(m_nVolume) / 100.0f);
+	// Activity for IsActive(): any non-zero native sample in this
+	// block marks the block's end as the last active frame.
+	for (size_t i = 0; i < nNativeRender * 2; ++i)
+	{
+		if (m_NativeScratch[i] != 0)
+		{
+			m_nLastActiveNativeFrame = m_nWrittenNativeFrames + nNativeRender;
+			break;
+		}
+	}
+	// Window peak of the native SWP output, before resampling
+	// and before gain: proves whether the SWP renders non-zero
+	// audio independent of the resampler and volume scale.
+	// Observe-only: this scan reads m_NativeScratch and changes
+	// no audio state.
+	for (size_t i = 0; i < nNativeRender * 2; ++i)
+	{
+		int nSample = m_NativeScratch[i];
+		if (nSample < 0)
+			nSample = -nSample;
+		if (nSample > m_nDiagNativePeak)
+			m_nDiagNativePeak = nSample;
+	}
+	m_nWrittenNativeFrames += nNativeRender;
+
+	// Effective native frame k: primed blocks start with the two
+	// carried frames, then the freshly rendered scratch frames;
+	// the first block has no carried frames
+	auto NativeFrame = [&](size_t nIndex) -> const s16*
+	{
+		if (m_bResamplePrimed)
+		{
+			if (nIndex < 2)
+				return m_LeftoverSample[nIndex];
+			return &m_NativeScratch[(nIndex - 2) * 2];
+		}
+		return &m_NativeScratch[nIndex * 2];
+	};
+
+	// Cubic's prev tap: the frame before nIndex. Primed blocks
+	// take it from the carried prev frame; the first block has
+	// no previous frame, so it duplicates frame 0 (Nuked's prime
+	// behavior — at t = 0 the output is exactly frame 0 anyway).
+	auto PrevFrame = [&](size_t nIndex) -> const s16*
+	{
+		if (nIndex == 0)
+			return m_bResamplePrimed ? m_PrevSample : NativeFrame(0);
+		return NativeFrame(nIndex - 1);
+	};
+
+	for (size_t i = 0; i < nBlockOut; ++i)
+	{
+		const double dPos = dBlockStart + static_cast<double>(i) * dRatio;
+		const size_t nIndex = static_cast<size_t>(dPos);
+		const double dFrac  = dPos - static_cast<double>(nIndex);
+		const s16* pFrameM1 = PrevFrame(nIndex);
+		const s16* pFrame0 = NativeFrame(nIndex);
+		const s16* pFrame1 = NativeFrame(nIndex + 1);
+		const s16* pFrame2 = NativeFrame(nIndex + 2);
+		// Catmull-Rom weights (identical to Nuked's cubic)
+		const float t = static_cast<float>(dFrac);
+		const float t2 = t * t;
+		const float t3 = t2 * t;
+		const float w0 = -0.5f * t + t2 - 0.5f * t3;
+		const float w1 = 1.0f - 2.5f * t2 + 1.5f * t3;
+		const float w2 = 0.5f * t + 2.0f * t2 - 1.5f * t3;
+		const float w3 = -0.5f * t2 + 0.5f * t3;
+		const float fLeft  = (w0 * pFrameM1[0] + w1 * pFrame0[0] + w2 * pFrame1[0] + w3 * pFrame2[0]) / 32768.0f;
+		const float fRight = (w0 * pFrameM1[1] + w1 * pFrame0[1] + w2 * pFrame1[1] + w3 * pFrame2[1]) / 32768.0f;
+		pOutBuffer[(nOutDone + i) * 2]     = fLeft * fScale;
+		pOutBuffer[(nOutDone + i) * 2 + 1] = fRight * fScale;
+	}
+
+	// Carry three frames into the next block: the frame before
+	// the boundary (cubic's prev tap) plus the pair straddling
+	// it. The prev frame is read first: for small nConsumed it
+	// comes from the current leftover pair, which the lines
+	// below overwrite.
+	const double dEndPos = dBlockStart + static_cast<double>(nBlockOut) * dRatio;
+	const size_t nConsumed = static_cast<size_t>(dEndPos);
+	const s16* pPrev = NativeFrame(nConsumed > 0 ? nConsumed - 1 : 0);
+	const s16 nPrev0 = pPrev[0];
+	const s16 nPrev1 = pPrev[1];
+	const s16* pLeftover0 = NativeFrame(nConsumed);
+	const s16* pLeftover1 = NativeFrame(nConsumed + 1);
+	m_PrevSample[0] = nPrev0;
+	m_PrevSample[1] = nPrev1;
+	m_LeftoverSample[0][0] = pLeftover0[0];
+	m_LeftoverSample[0][1] = pLeftover0[1];
+	m_LeftoverSample[1][0] = pLeftover1[0];
+	m_LeftoverSample[1][1] = pLeftover1[1];
+	m_bResamplePrimed = true;
+	return dEndPos - static_cast<double>(nConsumed);
+
+}
+
+void CMU50Synth::RenderResampled(float* pOutBuffer, size_t nFrames)
+{
+	// Split mode: the lag-2 pipeline (no m_Lock; see
+	// RenderResampledSplit).
+	if (m_bSplitMode)
+	{
+		RenderResampledSplit(pOutBuffer, nFrames);
+		return;
+	}
+
+	// Single-core mode, caller must hold m_Lock. Cubic Catmull-Rom
+	// resampler (same 4-tap weights as Nuked's cubic): native
+	// 44.1 kHz frames are rendered block by block and interpolated
+	// to the output rate. Three native frames carry across blocks:
+	// the frame before the boundary (the cubic's prev tap) plus the
+	// pair straddling it.
+	const double dRatio = m_dResampleRatio;
 
 	size_t nOutDone = 0;
 	while (nOutDone < nFrames)
@@ -635,6 +1069,11 @@ void CMU50Synth::RenderResampled(float* pOutBuffer, size_t nFrames)
 		// hardware.
 		AdvanceH8(nNativeRender);
 
+		// M1: apply this block's W events before rendering it
+		// (identity mode: exactly today's advance-then-render
+		// semantics, with the FIFO as the only new step).
+		DrainWEvents();
+
 		const bool bDiag = CDiagLog::Get().IsEnabled();
 		const u64 nSwpStartUs = bDiag ? CTimer::Get()->GetClockTicks() : 0;
 		const libmu50::Status RenderStatus = m_pSynth->render(m_NativeScratch, nNativeRender);
@@ -650,101 +1089,408 @@ void CMU50Synth::RenderResampled(float* pOutBuffer, size_t nFrames)
 			return;
 		}
 
-		// Activity for IsActive(): any non-zero native sample in this
-		// block marks the block's end as the last active frame.
-		for (size_t i = 0; i < nNativeRender * 2; ++i)
+		// M1: native sample ring round-trip, mirroring Nuked's
+		// per-frame Enqueue/Dequeue. The block is enqueued then
+		// dequeued back into the scratch buffer before any use,
+		// so the resampler below consumes ring output; any ring
+		// error changes PCM and fails the gate. Fill never exceeds
+		// one block (<= 1024 frames) against 16384 capacity.
+		for (size_t i = 0; i < nNativeRender; ++i)
 		{
-			if (m_NativeScratch[i] != 0)
+			const TNativeFrame Frame{ m_NativeScratch[i * 2], m_NativeScratch[i * 2 + 1] };
+			if (!m_NativeRing.Enqueue(Frame))
+				__atomic_add_fetch(&m_nRingDrops, 1, __ATOMIC_RELAXED);
+		}
+		for (size_t i = 0; i < nNativeRender; ++i)
+		{
+			TNativeFrame Frame;
+			if (m_NativeRing.Dequeue(Frame))
 			{
-				m_nLastActiveNativeFrame = m_nWrittenNativeFrames + nNativeRender;
-				break;
+				m_NativeScratch[i * 2]     = Frame.nLeft;
+				m_NativeScratch[i * 2 + 1] = Frame.nRight;
+			}
+			else
+			{
+				// Short pull in single-core mode: the block was
+				// just enqueued, so this cannot happen without a
+				// ring bug -- but if it ever does, it is an
+				// underrun (silence inserted at pull), not a ring
+				// drop (drops are enqueue-side only). Counted as
+				// such since M3; M1 mislabeled it a drop.
+				__atomic_add_fetch(&m_nUnderrunFrames, 1, __ATOMIC_RELAXED);
+				m_NativeScratch[i * 2]     = 0;
+				m_NativeScratch[i * 2 + 1] = 0;
 			}
 		}
-		// Window peak of the native SWP output, before resampling
-		// and before gain: proves whether the SWP renders non-zero
-		// audio independent of the resampler and volume scale.
-		// Observe-only: this scan reads m_NativeScratch and changes
-		// no audio state.
-		for (size_t i = 0; i < nNativeRender * 2; ++i)
-		{
-			int nSample = m_NativeScratch[i];
-			if (nSample < 0)
-				nSample = -nSample;
-			if (nSample > m_nDiagNativePeak)
-				m_nDiagNativePeak = nSample;
-		}
-		m_nWrittenNativeFrames += nNativeRender;
 
-		// Effective native frame k: primed blocks start with the two
-		// carried frames, then the freshly rendered scratch frames;
-		// the first block has no carried frames
-		auto NativeFrame = [&](size_t nIndex) -> const s16*
-		{
-			if (m_bResamplePrimed)
-			{
-				if (nIndex < 2)
-					return m_LeftoverSample[nIndex];
-				return &m_NativeScratch[(nIndex - 2) * 2];
-			}
-			return &m_NativeScratch[nIndex * 2];
-		};
-
-		// Cubic's prev tap: the frame before nIndex. Primed blocks
-		// take it from the carried prev frame; the first block has
-		// no previous frame, so it duplicates frame 0 (Nuked's prime
-		// behavior — at t = 0 the output is exactly frame 0 anyway).
-		auto PrevFrame = [&](size_t nIndex) -> const s16*
-		{
-			if (nIndex == 0)
-				return m_bResamplePrimed ? m_PrevSample : NativeFrame(0);
-			return NativeFrame(nIndex - 1);
-		};
-
-		for (size_t i = 0; i < nBlockOut; ++i)
-		{
-			const double dPos = dBlockStart + static_cast<double>(i) * dRatio;
-			const size_t nIndex = static_cast<size_t>(dPos);
-			const double dFrac  = dPos - static_cast<double>(nIndex);
-			const s16* pFrameM1 = PrevFrame(nIndex);
-			const s16* pFrame0 = NativeFrame(nIndex);
-			const s16* pFrame1 = NativeFrame(nIndex + 1);
-			const s16* pFrame2 = NativeFrame(nIndex + 2);
-			// Catmull-Rom weights (identical to Nuked's cubic)
-			const float t = static_cast<float>(dFrac);
-			const float t2 = t * t;
-			const float t3 = t2 * t;
-			const float w0 = -0.5f * t + t2 - 0.5f * t3;
-			const float w1 = 1.0f - 2.5f * t2 + 1.5f * t3;
-			const float w2 = 0.5f * t + 2.0f * t2 - 1.5f * t3;
-			const float w3 = -0.5f * t2 + 0.5f * t3;
-			const float fLeft  = (w0 * pFrameM1[0] + w1 * pFrame0[0] + w2 * pFrame1[0] + w3 * pFrame2[0]) / 32768.0f;
-			const float fRight = (w0 * pFrameM1[1] + w1 * pFrame0[1] + w2 * pFrame1[1] + w3 * pFrame2[1]) / 32768.0f;
-			pOutBuffer[(nOutDone + i) * 2]     = fLeft * fScale;
-			pOutBuffer[(nOutDone + i) * 2 + 1] = fRight * fScale;
-		}
-
-		// Carry three frames into the next block: the frame before
-		// the boundary (cubic's prev tap) plus the pair straddling
-		// it. The prev frame is read first: for small nConsumed it
-		// comes from the current leftover pair, which the lines
-		// below overwrite.
-		const double dEndPos = dBlockStart + static_cast<double>(nBlockOut) * dRatio;
-		const size_t nConsumed = static_cast<size_t>(dEndPos);
-		const s16* pPrev = NativeFrame(nConsumed > 0 ? nConsumed - 1 : 0);
-		const s16 nPrev0 = pPrev[0];
-		const s16 nPrev1 = pPrev[1];
-		const s16* pLeftover0 = NativeFrame(nConsumed);
-		const s16* pLeftover1 = NativeFrame(nConsumed + 1);
-		m_PrevSample[0] = nPrev0;
-		m_PrevSample[1] = nPrev1;
-		m_LeftoverSample[0][0] = pLeftover0[0];
-		m_LeftoverSample[0][1] = pLeftover0[1];
-		m_LeftoverSample[1][0] = pLeftover1[0];
-		m_LeftoverSample[1][1] = pLeftover1[1];
-		m_dResampleCarry  = dEndPos - static_cast<double>(nConsumed);
-		m_bResamplePrimed = true;
+		m_dResampleCarry = ResamplePulledBlock(pOutBuffer, nOutDone, nBlockOut, dBlockStart, nNativeRender);
 		nOutDone += nBlockOut;
 	}
+}
+
+void CMU50Synth::ResamplePendingFront(float* pOutBuffer)
+{
+	const TPendingBlock Entry = m_Pending[0];
+	// Wait for the SWP thread to enqueue this block's frames.
+	// Enqueued counts only successfully enqueued frames, and
+	// consumed is stable on this thread during the wait, so the
+	// difference cannot overstate the ring fill: the wait succeeds
+	// only when the frames are really there. Drops (counted at
+	// enqueue) would fail the gate, not hang the wait -- and the
+	// consumed count below tracks actual dequeues, so a short pull
+	// cannot wedge the next block's wait either.
+	// M3: the wait also breaks when the SWP worker parks mid-wait
+	// (switch-away race, or 0xFF park before its audio-idle wait):
+	// without this, a parked SWP would wedge the audio thread
+	// forever. The abort records Entry.nSeq, so the SWP core skips
+	// this block's remaining frames on unpark (see
+	// EnqueueSwpFrame); the pull below then fills silence for the
+	// missing frames and counts them as underruns -- a true
+	// ring-empty-at-pull event, and the M3 forced-starvation test
+	// exercises exactly this path (park, then Render).
+	const bool bDiag = CDiagLog::Get().IsEnabled();
+	size_t nGot = 0;
+	if (!Entry.bPublished)
+	{
+		// Never published (publish skipped while parked): no
+		// frames will ever arrive for this block, so waiting
+		// would wedge. Fill silence + count, no wait. (No abort
+		// record needed: the block was never queued, so the SWP
+		// core has nothing to skip.)
+		for (size_t i = 0; i < Entry.nNativeRender; ++i)
+		{
+			__atomic_add_fetch(&m_nUnderrunFrames, 1, __ATOMIC_RELAXED);
+			m_NativeScratch[i * 2]     = 0;
+			m_NativeScratch[i * 2 + 1] = 0;
+		}
+	}
+	else
+	{
+		const u64 nWaitStartUs = bDiag ? CTimer::Get()->GetClockTicks() : 0;
+		while (__atomic_load_n(&m_nRenderedEnqueued, __ATOMIC_ACQUIRE) -
+		       __atomic_load_n(&m_nConsumed, __ATOMIC_ACQUIRE) < Entry.nNativeRender)
+		{
+			if (!__atomic_load_n(&m_bSwpActive, __ATOMIC_ACQUIRE))
+			{
+				__atomic_store_n(&m_nAbortSeq, Entry.nSeq, __ATOMIC_RELEASE);
+				break;
+			}
+			mu50spsc::CpuRelax();
+		}
+		if (bDiag)
+			m_nDiagWaitUs += CTimer::Get()->GetClockTicks() - nWaitStartUs;
+		for (size_t i = 0; i < Entry.nNativeRender; ++i)
+		{
+			TNativeFrame Frame;
+			if (m_NativeRing.Dequeue(Frame))
+			{
+				m_NativeScratch[i * 2]     = Frame.nLeft;
+				m_NativeScratch[i * 2 + 1] = Frame.nRight;
+				++nGot;
+			}
+			else
+			{
+				// Ring-empty at pull (park-abort shortfall, or the
+				// defensive case the wait above was meant to exclude):
+				// silence + count. This retires the hardcoded
+				// underrun_frames=0 -- every silence insertion here
+				// is a counted, real underrun.
+				__atomic_add_fetch(&m_nUnderrunFrames, 1, __ATOMIC_RELAXED);
+				m_NativeScratch[i * 2]     = 0;
+				m_NativeScratch[i * 2 + 1] = 0;
+			}
+		}
+	}
+	__atomic_add_fetch(&m_nConsumed, nGot, __ATOMIC_RELAXED);
+	// Resample in order (helper updates the frame carry state).
+	// Its carry return is discarded: the loop's virtual carry was
+	// already advanced analytically with the identical formula.
+	ResamplePulledBlock(pOutBuffer, Entry.nOutDone, Entry.nBlockOut,
+	                    Entry.dBlockStart, Entry.nNativeRender);
+	m_Pending[0] = m_Pending[1];
+	--m_nPendingCount;
+}
+
+void CMU50Synth::RenderResampledSplit(float* pOutBuffer, size_t nFrames)
+{
+	// Audio thread, no m_Lock. Lag-2 pipeline: each iteration
+	// computes the next block from VIRTUAL resampler state
+	// (dCarry/bPrimedVirt -- the real carry member is only written
+	// back at the end, and the primed member only by
+	// ResamplePulledBlock in resample order), advances the H8 and
+	// publishes, then resamples the oldest pending block once two
+	// are pending. The SWP thread therefore renders block N while
+	// the audio thread advances block N+1: true overlap, with block
+	// boundaries identical to single-core (same formulas, same
+	// order), so output is bit-identical. At call return every
+	// block is resampled and the ring is drained (same invariant
+	// as M1's FIFO-empty-at-Render-return).
+	__atomic_store_n(&m_bAudioBusy, true, __ATOMIC_RELEASE);
+	const double dRatio = m_dResampleRatio;
+	double dCarry = m_dResampleCarry;
+	bool bPrimedVirt = m_bResamplePrimed;
+	size_t nOutDone = 0;
+	m_nPendingCount = 0;
+	while (nOutDone < nFrames)
+	{
+		const size_t nMaxBlockOut = static_cast<size_t>((kNativeScratchFrames - 3) / dRatio);
+		const size_t nBlockOut = Utility::Min(nFrames - nOutDone,
+		                                      Utility::Max(static_cast<size_t>(1), nMaxBlockOut));
+		double dBlockStart;
+		size_t nNativeRender;
+		if (bPrimedVirt)
+		{
+			dBlockStart   = dCarry;
+			nNativeRender = static_cast<size_t>(dBlockStart + nBlockOut * dRatio) + 1;
+		}
+		else
+		{
+			dBlockStart   = 0.0;
+			nNativeRender = static_cast<size_t>(nBlockOut * dRatio) + 3;
+		}
+		// Advance + publish (drains staging, steps H8, publishes).
+		AdvanceH8(nNativeRender);
+		m_Pending[m_nPendingCount].nBlockOut     = nBlockOut;
+		m_Pending[m_nPendingCount].dBlockStart   = dBlockStart;
+		m_Pending[m_nPendingCount].nNativeRender = nNativeRender;
+		m_Pending[m_nPendingCount].nOutDone      = nOutDone;
+		m_Pending[m_nPendingCount].nSeq          = m_nLastPublishedSeq;
+		m_Pending[m_nPendingCount].bPublished   = m_bLastPublishOk;
+		++m_nPendingCount;
+		// Advance the virtual state analytically (identical formula
+		// to ResamplePulledBlock's carry update).
+		const double dEndPos = dBlockStart + static_cast<double>(nBlockOut) * dRatio;
+		dCarry = dEndPos - static_cast<double>(static_cast<size_t>(dEndPos));
+		bPrimedVirt = true;
+		nOutDone += nBlockOut;
+		if (m_nPendingCount == 2)
+			ResamplePendingFront(pOutBuffer);
+	}
+	while (m_nPendingCount > 0)
+		ResamplePendingFront(pOutBuffer);
+	m_dResampleCarry = dCarry;
+	__atomic_store_n(&m_bAudioBusy, false, __ATOMIC_RELEASE);
+}
+
+void CMU50Synth::SetSplitMode(bool bSplit)
+{
+	// Contract: call before the SWP thread starts; afterwards the
+	// flag is read-only (thread-creation happens-before covers it).
+	m_bSplitMode = bSplit;
+}
+
+void CMU50Synth::PCMTaskIteration()
+{
+	// Unconditional-call discipline: the worker loop calls this
+	// every iteration; gating is inside. If the call itself were
+	// gated on m_bSwpActive, the park ack below would never run
+	// and ParkSwp would deadlock (the Nuked wedge).
+	if (!m_bSplitMode || !m_pSynth)
+		return;
+	if (!__atomic_load_n(&m_bSwpActive, __ATOMIC_ACQUIRE))
+	{
+		__atomic_store_n(&m_bSwpParkAck, true, __ATOMIC_RELEASE);
+		// M4: parked branch yields (Nuked precedent) so the core-3
+		// loop is scheduler-paced even when the Nuked synth does
+		// not exist to pace it.
+		CScheduler::Get()->Yield();
+		return;
+	}
+	TPublishedBlock Block;
+	if (!m_PublishedBlocks.TryPop(Block))
+	{
+		// Idle drain: no published block, but the audio thread may
+		// be mid-block with a full W FIFO (tiny-FIFO stress, or a
+		// pathological block burst over 4095 writes). Draining all
+		// pending events here relieves the backpressure -- and it
+		// cannot change output: the audio core is at most one block
+		// ahead (lag-2), so idle-drained writes always belong to
+		// the immediately-next block, whose render happens after
+		// its publish anyway; the snapshot drain at pop time then
+		// finds nothing new. Without this, a mid-block full FIFO
+		// would deadlock (the SWP core could only drain up to a
+		// snapshot that does not exist yet).
+		DrainWEventsUpTo(m_WEventFifo.InIndex());
+		// M4: idle backoff (Nuked precedent: 64 yield hints, then
+		// a scheduler yield). The SWP thread spends most of its
+		// time here while the audio thread steps the next block;
+		// the Yield keeps the core-3 loop from spinning hot, and
+		// on a single-task core it returns immediately, so publish
+		// latency is unaffected.
+		for (unsigned i = 0; i < 64; ++i)
+			mu50spsc::CpuRelax();
+		CScheduler::Get()->Yield();
+		return;
+	}
+	DrainWEventsUpTo(Block.nFifoSnap);
+	const u64 nSwpStartUs = CTimer::Get()->GetClockTicks();
+	size_t nDone = 0;
+	while (nDone < Block.nFrames)
+	{
+		const size_t nChunk = Utility::Min(Block.nFrames - nDone, kNativeScratchFrames);
+		const libmu50::Status RenderStatus = m_pSynth->render(&m_SwpScratch[0], nChunk);
+		if (!RenderStatus)
+		{
+			// Should not happen after a successful Initialize();
+			// fail safe: enqueue silence for the remainder.
+			for (size_t i = nDone; i < Block.nFrames; ++i)
+			{
+				const TNativeFrame Frame{ 0, 0 };
+				EnqueueSwpFrame(Block.nSeq, Frame);
+			}
+			__atomic_add_fetch(&m_nSwpRenderUs, CTimer::Get()->GetClockTicks() - nSwpStartUs, __ATOMIC_RELAXED);
+			UpdateRingHighWater();
+			return;
+		}
+		for (size_t i = 0; i < nChunk; ++i)
+		{
+			const TNativeFrame Frame{ m_SwpScratch[i * 2], m_SwpScratch[i * 2 + 1] };
+			EnqueueSwpFrame(Block.nSeq, Frame);
+		}
+		nDone += nChunk;
+	}
+	__atomic_add_fetch(&m_nSwpRenderUs, CTimer::Get()->GetClockTicks() - nSwpStartUs, __ATOMIC_RELAXED);
+	UpdateRingHighWater();
+}
+
+bool CMU50Synth::EnqueueSwpFrame(u64 nSeq, const TNativeFrame& Frame)
+{
+	// Skip frames of blocks the audio thread aborted (parked
+	// mid-wait): the audio thread already consumed silence for
+	// them, so enqueuing their tail now would poison the next
+	// block's pull (the counters are the sync mechanism, and a
+	// skipped frame is never counted as enqueued).
+	if (nSeq <= __atomic_load_n(&m_nAbortSeq, __ATOMIC_ACQUIRE))
+		return false;
+	if (m_NativeRing.Enqueue(Frame))
+	{
+		__atomic_add_fetch(&m_nRenderedEnqueued, 1, __ATOMIC_RELAXED);
+		return true;
+	}
+	__atomic_add_fetch(&m_nRingDrops, 1, __ATOMIC_RELAXED);
+	return false;
+}
+
+void CMU50Synth::UpdateRingHighWater()
+{
+	// SWP-thread only (single writer): sample the ring fill after
+	// each rendered block; the max over the window is the split
+	// line's max-lag figure. A concurrent UpdateLCD reset just
+	// starts a fresh window (diag-grade).
+	const u64 nFill = __atomic_load_n(&m_nRenderedEnqueued, __ATOMIC_ACQUIRE) -
+	                  __atomic_load_n(&m_nConsumed, __ATOMIC_ACQUIRE);
+	if (nFill > __atomic_load_n(&m_nRingHighWater, __ATOMIC_ACQUIRE))
+		__atomic_store_n(&m_nRingHighWater, nFill, __ATOMIC_RELAXED);
+}
+
+bool CMU50Synth::ParkSwp()
+{
+	__atomic_store_n(&m_bSwpParkAck, false, __ATOMIC_RELEASE);
+	__atomic_store_n(&m_bSwpActive, false, __ATOMIC_RELEASE);
+	// The worker loop calls PCMTaskIteration continuously (yielding
+	// on idle), so the ack arrives within microseconds; the bound
+	// below is a wedge guard, not a timing assumption. Park must be
+	// called while the worker thread is running -- parking a joined
+	// thread can never ack, and correctly times out.
+	for (unsigned nSpins = 0; nSpins < 10000000U; ++nSpins)
+	{
+		if (__atomic_load_n(&m_bSwpParkAck, __ATOMIC_ACQUIRE))
+			return true;
+		mu50spsc::CpuRelax();
+	}
+	return false;
+}
+
+void CMU50Synth::UnparkSwp()
+{
+	__atomic_store_n(&m_bSwpActive, true, __ATOMIC_RELEASE);
+}
+
+u64 CMU50Synth::GetWqFullWaits()
+{
+	return __atomic_load_n(&m_nWqFullWaits, __ATOMIC_ACQUIRE);
+}
+
+u64 CMU50Synth::GetRingDrops()
+{
+	return __atomic_load_n(&m_nRingDrops, __ATOMIC_ACQUIRE);
+}
+
+u64 CMU50Synth::GetBlockWaits()
+{
+	return __atomic_load_n(&m_nBlockWaits, __ATOMIC_ACQUIRE);
+}
+
+u64 CMU50Synth::GetStageDrops()
+{
+	return __atomic_load_n(&m_nStageDrops, __ATOMIC_ACQUIRE);
+}
+
+u64 CMU50Synth::GetRenderedEnqueued()
+{
+	return __atomic_load_n(&m_nRenderedEnqueued, __ATOMIC_ACQUIRE);
+}
+
+u64 CMU50Synth::GetConsumed()
+{
+	return __atomic_load_n(&m_nConsumed, __ATOMIC_ACQUIRE);
+}
+
+u64 CMU50Synth::GetUnderrunFrames()
+{
+	return __atomic_load_n(&m_nUnderrunFrames, __ATOMIC_ACQUIRE);
+}
+
+void CMU50Synth::SplitActivate()
+{
+	if (!m_bSplitMode || !m_pSynth)
+		return;
+	UnparkSwp();
+}
+
+void CMU50Synth::SplitDeactivate()
+{
+	if (!m_bSplitMode || !m_pSynth)
+		return;
+	// Called on switch-from-MU50 (core 0, after m_pCurrentSynth
+	// already moved: no NEW MU50 Render can start after this
+	// call, only a pre-switch load can still be in flight). Park
+	// first, then wait for the audio thread to leave Render: an
+	// in-flight Render completes promptly because the park-abort
+	// in ResamplePendingFront breaks its wait with silence
+	// instead of wedging on a parked SWP core. On timeout, unpark
+	// and proceed -- the worker stays live but idle-draining
+	// (harmless: no MU50 blocks are published while another synth
+	// plays), and the in-flight Render completes normally.
+	if (!ParkSwp())
+	{
+		LOGWARN("MU50 split deactivate: SWP park timeout");
+		return;
+	}
+	unsigned nSpins = 0;
+	while (__atomic_load_n(&m_bAudioBusy, __ATOMIC_ACQUIRE) && nSpins < 10000000U)
+	{
+		mu50spsc::CpuRelax();
+		++nSpins;
+	}
+	if (__atomic_load_n(&m_bAudioBusy, __ATOMIC_ACQUIRE))
+	{
+		LOGWARN("MU50 split deactivate: audio busy timeout, leaving SWP live");
+		UnparkSwp();
+	}
+}
+
+bool CMU50Synth::SplitQueuesQuiescent()
+{
+	return m_WEventFifo.EmptyForConsumer() &&
+	       m_PublishedBlocks.EmptyForConsumer() &&
+	       __atomic_load_n(&m_nRenderedEnqueued, __ATOMIC_ACQUIRE) ==
+	           __atomic_load_n(&m_nConsumed, __ATOMIC_ACQUIRE);
+}
+
+void CMU50Synth::SetWEventFifoCapForTest(size_t nCap)
+{
+	m_nWEventFifoCap = nCap > 0 ? Utility::Min(nCap, kWEventFifoSize - 1) : 1;
 }
 
 size_t CMU50Synth::Render(float* pOutBuffer, size_t nFrames)
@@ -758,7 +1504,12 @@ size_t CMU50Synth::Render(float* pOutBuffer, size_t nFrames)
 	const bool bDiag = CDiagLog::Get().IsEnabled();
 	const u64 nStartUs = bDiag ? CTimer::Get()->GetClockTicks() : 0;
 
-	m_Lock.Acquire();
+	// Split mode: m_Lock narrows to switch/park/diag only (see the
+	// header). The audio thread owns H8 + resampler here; diag
+	// counters are audio-thread-written and read by UpdateLCD
+	// between Render calls, as in Nuked's lock-free pattern.
+	if (!m_bSplitMode)
+		m_Lock.Acquire();
 	if (bDiag)
 	{
 		if (m_nDiagWindowStartUs == 0)
@@ -774,7 +1525,8 @@ size_t CMU50Synth::Render(float* pOutBuffer, size_t nFrames)
 		if (nElapsedUs > m_nDiagMaxUs)
 			m_nDiagMaxUs = nElapsedUs;
 	}
-	m_Lock.Release();
+	if (!m_bSplitMode)
+		m_Lock.Release();
 
 	return nFrames;
 }
@@ -790,7 +1542,10 @@ size_t CMU50Synth::Render(s16* pOutBuffer, size_t nFrames)
 	const bool bDiag = CDiagLog::Get().IsEnabled();
 	const u64 nStartUs = bDiag ? CTimer::Get()->GetClockTicks() : 0;
 
-	m_Lock.Acquire();
+	// Split mode: m_Lock narrows to switch/park/diag only (see the
+	// float overload).
+	if (!m_bSplitMode)
+		m_Lock.Acquire();
 	if (bDiag)
 	{
 		if (m_nDiagWindowStartUs == 0)
@@ -818,7 +1573,8 @@ size_t CMU50Synth::Render(s16* pOutBuffer, size_t nFrames)
 		if (nElapsedUs > m_nDiagMaxUs)
 			m_nDiagMaxUs = nElapsedUs;
 	}
-	m_Lock.Release();
+	if (!m_bSplitMode)
+		m_Lock.Release();
 
 	return nFrames;
 }
@@ -839,10 +1595,13 @@ void CMU50Synth::UpdateLCD(CLCD& LCD, unsigned int nTicks)
 	// Flush accumulated render timing statistics to the diagnostic
 	// log (mirrors the Nuked window line). The stats copy happens
 	// under m_Lock, but the log write itself happens after the lock
-	// is released, so it never nests under m_Lock. MU50 renders
-	// synchronously (no FIFO/ring), so underrun_frames is
-	// structurally 0; halted sticks at 1 if the H8 ever stops on an
-	// illegal opcode (cleared only by a system reset).
+	// is released, so it never nests under m_Lock. M3: the window
+	// line's underrun_frames is now the counted ring-empty pulls
+	// (window delta of the cumulative atomic -- the hardcoded 0 is
+	// gone); in split mode swp_us is the SWP core's render time
+	// delta, and a third split line carries the split counters.
+	// halted sticks at 1 if the H8 ever stops on an illegal opcode
+	// (cleared only by a system reset).
 	CDiagLog& DiagLog = CDiagLog::Get();
 	if (DiagLog.IsEnabled())
 	{
@@ -854,6 +1613,7 @@ void CMU50Synth::UpdateLCD(CLCD& LCD, unsigned int nTicks)
 		u64 nWindowUs = 0, nCalls = 0, nTotalUs = 0, nMaxUs = 0;
 		u64 nH8Us = 0, nSwpUs = 0, nH8Insns = 0, nOutputFrames = 0;
 		u64 nMidiQueued = 0, nSciRead = 0, nSwpWrites = 0;
+		u64 nWaitUs = 0, nUnderrunDelta = 0, nRingHw = 0;
 		int nNativePeak = 0;
 		if (bDue)
 		{
@@ -869,6 +1629,21 @@ void CMU50Synth::UpdateLCD(CLCD& LCD, unsigned int nTicks)
 			nSciRead      = m_nDiagSciRead;
 			nSwpWrites    = m_nDiagSwpWrites;
 			nNativePeak   = m_nDiagNativePeak;
+			nWaitUs       = m_nDiagWaitUs;
+			// Split mode: SWP render time lives in the SWP
+			// thread's cumulative atomic (m_nDiagSwpUs is never
+			// written by the split Render path); report the
+			// window delta, like the other windowed fields.
+			if (m_bSplitMode)
+			{
+				const u64 nSwpNow = __atomic_load_n(&m_nSwpRenderUs, __ATOMIC_ACQUIRE);
+				nSwpUs = nSwpNow - m_nDiagLastSwpRenderUs;
+				m_nDiagLastSwpRenderUs = nSwpNow;
+			}
+			const u64 nUnderrunNow = __atomic_load_n(&m_nUnderrunFrames, __ATOMIC_ACQUIRE);
+			nUnderrunDelta = nUnderrunNow - m_nDiagLastUnderrunFrames;
+			m_nDiagLastUnderrunFrames = nUnderrunNow;
+			nRingHw = __atomic_exchange_n(&m_nRingHighWater, 0, __ATOMIC_ACQ_REL);
 			m_nDiagWindowStartUs = 0;
 			m_nDiagCalls         = 0;
 			m_nDiagTotalUs       = 0;
@@ -881,6 +1656,7 @@ void CMU50Synth::UpdateLCD(CLCD& LCD, unsigned int nTicks)
 			m_nDiagSciRead       = 0;
 			m_nDiagSwpWrites     = 0;
 			m_nDiagNativePeak    = 0;
+			m_nDiagWaitUs        = 0;
 		}
 		const bool bHalted = m_bH8Halted;
 		m_Lock.Release();
@@ -897,13 +1673,14 @@ void CMU50Synth::UpdateLCD(CLCD& LCD, unsigned int nTicks)
 				if (nDueFrames > 0)
 					nPct = nOutputFrames * 100 / nDueFrames;
 			}
-			DiagLog.LogLine("window synth=mu50 pct=%llu avg_us=%llu max_us=%llu h8_us=%llu swp_us=%llu h8_insn=%llu underrun_frames=0 halted=%u",
+			DiagLog.LogLine("window synth=mu50 pct=%llu avg_us=%llu max_us=%llu h8_us=%llu swp_us=%llu h8_insn=%llu underrun_frames=%llu halted=%u",
 			                static_cast<unsigned long long>(nPct),
 			                static_cast<unsigned long long>(nAvgUs),
 			                static_cast<unsigned long long>(nMaxUs),
 			                static_cast<unsigned long long>(nH8Us),
 			                static_cast<unsigned long long>(nSwpUs),
 			                static_cast<unsigned long long>(nH8Insns),
+			                static_cast<unsigned long long>(nUnderrunDelta),
 			                static_cast<unsigned>(bHalted ? 1 : 0));
 			// Second diag line (new counters only; the window line
 			// above is unchanged): per-window MIDI bytes accepted
@@ -920,6 +1697,40 @@ void CMU50Synth::UpdateLCD(CLCD& LCD, unsigned int nTicks)
 			                static_cast<unsigned long long>(nSciRead),
 			                static_cast<unsigned long long>(nSwpWrites),
 			                static_cast<int>(nNativePeak));
+			// Third diag line, split mode only (M3): the split
+			// counters (cumulative, never reset -- wq_full_waits
+			// and ring_drops must stay 0 for the whole run),
+			// current ring fill + per-window max lag in frames
+			// (max fill observed at block-enqueue time), audio
+			// wait time, and per-core duty cycles: audio_pct is
+			// Render wall time minus SWP-wait spins over the
+			// window (the H8 + resample load on core 2), swp_pct
+			// is SWP render time over the window (core 3).
+			if (m_bSplitMode)
+			{
+				const u64 nRendered = GetRenderedEnqueued();
+				const u64 nConsumed = GetConsumed();
+				u64 nAudioPct = 0, nSwpPct = 0;
+				if (nWindowUs > 0)
+				{
+					const u64 nBusy = nTotalUs > nWaitUs ? nTotalUs - nWaitUs : 0;
+					nAudioPct = nBusy * 100 / nWindowUs;
+					nSwpPct = nSwpUs * 100 / nWindowUs;
+				}
+				DiagLog.LogLine("window synth=mu50 split wq_full_waits=%llu ring_drops=%llu block_waits=%llu stage_drops=%llu rendered=%llu consumed=%llu quiescent=%u ring_fill=%llu max_lag_frames=%llu wait_us=%llu audio_pct=%llu swp_pct=%llu",
+				                static_cast<unsigned long long>(GetWqFullWaits()),
+				                static_cast<unsigned long long>(GetRingDrops()),
+				                static_cast<unsigned long long>(GetBlockWaits()),
+				                static_cast<unsigned long long>(GetStageDrops()),
+				                static_cast<unsigned long long>(nRendered),
+				                static_cast<unsigned long long>(nConsumed),
+				                static_cast<unsigned>(SplitQueuesQuiescent() ? 1 : 0),
+				                static_cast<unsigned long long>(nRendered - nConsumed),
+				                static_cast<unsigned long long>(nRingHw),
+				                static_cast<unsigned long long>(nWaitUs),
+				                static_cast<unsigned long long>(nAudioPct),
+				                static_cast<unsigned long long>(nSwpPct));
+			}
 		}
 	}
 }

@@ -487,6 +487,13 @@ bool CMT32Pi::InitMU50Synth()
 		return false;
 	}
 
+	// M4: MU50 always runs split on Pi (H8 on core 2, SWP on core
+	// 3 via PCMTask). Set before any Render; PCMTaskIteration
+	// early-returns until this is set, so core 3 starting first
+	// is harmless. m_bSwpActive defaults true, so a boot-default
+	// MU50 needs no SplitActivate; switch-to-MU50 unparks.
+	m_pMU50Synth->SetSplitMode(true);
+
 	m_pMU50Synth->SetUserInterface(&m_UserInterface);
 
 	return true;
@@ -702,6 +709,40 @@ void CMT32Pi::AudioTask()
 
 		m_pCurrentSynth->Render(FloatBuffer, nFrames);
 
+		// Shared lookahead limiter: the single choke point for
+		// every engine. The synth float paths and this conversion
+		// are unclamped, so without it an over-full-scale float
+		// hits the 24-bit stage raw (overflow/wrap pops). The
+		// limiter guarantees the stream never exceeds 0.99, is
+		// bit-transparent below its ceiling, and needs no
+		// per-song tuning.
+		m_Limiter.Process(FloatBuffer, nFrames);
+
+		// Periodic limiter diag, same interval style as the synth
+		// window lines: limited frames in the interval, and the
+		// minimum gain applied (milli-gain, 1000 = untouched).
+		CDiagLog& DiagLog = CDiagLog::Get();
+		if (DiagLog.IsEnabled())
+		{
+			const u64 nNowUs = CTimer::Get()->GetClockTicks();
+			if (m_nLimiterWindowStartUs == 0)
+			{
+				m_nLimiterWindowStartUs = nNowUs;
+			}
+			else if (nNowUs - m_nLimiterWindowStartUs >=
+			         static_cast<u64>(DiagLog.IntervalSeconds()) * 1000000ULL)
+			{
+				const u64 nLimited = m_Limiter.GetLimitedFrames() - m_nLimiterLastLimitedFrames;
+				m_nLimiterLastLimitedFrames = m_Limiter.GetLimitedFrames();
+				const unsigned nMinGainMilli = m_Limiter.GetMinGainMilli();
+				m_Limiter.ResetWindowStats();
+				m_nLimiterWindowStartUs = nNowUs;
+				DiagLog.LogLine("window limiter limited=%llu min_gain_milli=%u",
+				                static_cast<unsigned long long>(nLimited),
+				                nMinGainMilli);
+			}
+		}
+
 		if (bReversedStereo)
 		{
 			// Convert to signed 24-bit integers with channel swap
@@ -748,11 +789,18 @@ void CMT32Pi::PCMTask()
 	// inactive, and backs off and yields when idle, so this loop
 	// is also the idle path for every other synth -- no work is
 	// ever done here unless the Nuked split is live.
+	// MU50 split (M4) follows the same discipline: its iteration
+	// is called unconditionally whenever the MU50 synth exists,
+	// gating + park ack inside, yielding when parked or idle. Both
+	// iterations run each loop pass when both synths exist (only
+	// the current one does work; the other parks/yields).
 	while (m_bRunning)
 	{
 		if (m_pNukedSC55Synth)
 			m_pNukedSC55Synth->PCMTaskIteration();
-		else
+		if (m_pMU50Synth)
+			m_pMU50Synth->PCMTaskIteration();
+		if (!m_pNukedSC55Synth && !m_pMU50Synth)
 			CScheduler::Get()->Yield();
 	}
 }
@@ -1462,6 +1510,16 @@ void CMT32Pi::SwitchSynth(TSynth NewSynth)
 		m_pNukedSC55Synth->SplitDeactivate();
 	if (pNewSynth == m_pNukedSC55Synth && m_pNukedSC55Synth != nullptr)
 		m_pNukedSC55Synth->SplitActivate();
+	// MU50 split park/reactivate (M4, same shape as Nuked above).
+	// SplitDeactivate is safe against a pre-switch MU50 Render
+	// still in flight: it parks, then waits for audio-idle, and
+	// the park-abort in ResamplePendingFront breaks any Render
+	// wait with counted silence instead of wedging on the parked
+	// worker (on timeout it unparks and proceeds).
+	if (pOldSynth == m_pMU50Synth && m_pMU50Synth != nullptr)
+		m_pMU50Synth->SplitDeactivate();
+	if (pNewSynth == m_pMU50Synth && m_pMU50Synth != nullptr)
+		m_pMU50Synth->SplitActivate();
 }
 
 void CMT32Pi::SwitchMT32ROMSet(TMT32ROMSet ROMSet)
