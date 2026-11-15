@@ -15,6 +15,10 @@
 
 #include "config.h"
 
+#ifndef MT32_PI_VERSION
+#define MT32_PI_VERSION "<unknown>"
+#endif
+
 CDiagLog::CDiagLog()
 	: m_bEnabled(false),
 	  m_nIntervalSeconds(5),
@@ -41,7 +45,11 @@ void CDiagLog::Initialize()
 		return;
 
 	m_bEnabled = true;
-	LogLine("==== diag session start (interval %u s) ====", m_nIntervalSeconds);
+	// Identify the kernel in the log: version (git describe), build
+	// date/time and compiler, so a log can always be traced back to
+	// the exact binary that produced it.
+	LogLine("==== diag session start (interval %u s) ==== kernel=%s built=%s %s gcc=%s",
+	        m_nIntervalSeconds, MT32_PI_VERSION, __DATE__, __TIME__, __VERSION__);
 }
 
 void CDiagLog::LogLine(const char* pFormat, ...)
