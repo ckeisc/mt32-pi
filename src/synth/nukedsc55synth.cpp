@@ -721,42 +721,22 @@ void CNukedSC55Synth::HandleMIDIShortMessage(u32 nMessage)
 	if (!m_pEmulator)
 		return;
 
-	// Handle system reset (0xFF) like the other synths: a full reset of
-	// the emulated module, followed by a GS reset once it has booted
+	// System Reset (0xFF): forward the byte to the emulated UART
+	// like stock Nuked-SC55 does (R_PostEvent -> PostMIDI). The
+	// SC-55 firmware handles System Reset itself as a quick
+	// parameter reset, not a reboot — the stock renderer plays a
+	// file carrying a stray 0xFF from the first note, with no hole.
+	// A host-side ResetForRestart() here reboots the firmware
+	// (seconds of silence) on every stray 0xFF: DOSMID sends the
+	// illegal CC110=255 value raw, so every Descent 2 song opened
+	// with a 2-3 s hole. Clear the held-note tracking to match the
+	// firmware's voices-off, then fall through: the normal path
+	// below posts the single byte (nBytes == 1 for 0xFF).
 	if (nStatus == 0xFF)
 	{
-		m_Lock.Acquire();
-		// Split path: park the PCM task first (it may be mid-render
-		// on core 3, outside m_Lock), then reset, then reactivate
-		// from the fresh pcm_t with a cleared sample ring. The MCU
-		// thread cannot be stepping here: RenderFrames needs the
-		// same m_Lock this handler holds. A park timeout leaves the
-		// split wedged: the reset is skipped entirely (resetting
-		// under a possibly-live core 3 would corrupt the backend)
-		// and the synth keeps running on its old state.
-		const bool bWasSplit = m_bSplitActive;
-		bool bParked = true;
-		if (bWasSplit)
-			bParked = StopSplitPCM();
-		if (bParked)
-		{
-			if (bWasSplit)
-				m_pEmulator->ResetForRestart();
-			else
-				m_pEmulator->Reset();
-			m_pEmulator->PostSystemReset(EMU_SystemReset::GS_RESET);
-			if (bWasSplit)
-				InitSplitState(true);
-		}
 		m_nHeldNotes = 0;
 		m_bSustain = false;
 		m_bSustainedNotes = false;
-		m_Lock.Release();
-		// Split-state reset log: after the lock
-		// is released, so the diag write never nests under
-		// m_Lock.
-		LogSplitState("reset");
-		return;
 	}
 
 	// Sounding-note tracking for power management (core 0 only):

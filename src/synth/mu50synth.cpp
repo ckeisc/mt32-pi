@@ -696,83 +696,22 @@ void CMU50Synth::HandleMIDIShortMessage(u32 nMessage)
 	if (!m_pH8)
 		return;
 
-	// Handle system reset (0xFF) host-side, like EmuSC: reset the
-	// whole front end (firmware reboots and re-initializes the SWP00)
-	// rather than forwarding the byte to the firmware parser.
+	// System Reset (0xFF): forward the byte to the firmware parser
+	// like any other message, instead of rebooting the H8 host-side.
+	// The firmware owns the reset semantics — the MIDI spec defines
+	// System Reset as a parameter reset (voices off, controllers
+	// reset), not a reboot — and a host-side m_pH8->reset() here
+	// silences the synth for ~8 s on every stray 0xFF: DOSMID sends
+	// the illegal CC110=255 value raw, so every Descent 2 song
+	// opened with an ~8 s hole. Clear the held-note tracking to
+	// match the firmware's voices-off, then fall through: split mode
+	// stages the message for the audio thread, single-core queues
+	// the single byte to SCI1 RX.
 	if (nStatus == 0xFF)
 	{
-		if (m_bSplitMode)
-		{
-			// Split: the reset touches audio-owned (H8, resampler)
-			// and SWP-owned (registers, ring) state, so it needs
-			// both threads quiescent. Park the SWP thread, wait
-			// for the audio thread to leave RenderResampledSplit
-			// (bounded; a Render call is ~10 ms), then reset with
-			// both threads out. On timeout the reset is dropped
-			// (logged) rather than racing the audio thread.
-			if (!ParkSwp())
-			{
-				LOGWARN("MU50 split reset dropped: SWP park timeout");
-				return;
-			}
-			unsigned nSpins = 0;
-			while (__atomic_load_n(&m_bAudioBusy, __ATOMIC_ACQUIRE) && nSpins < 10000000U)
-			{
-				mu50spsc::CpuRelax();
-				++nSpins;
-			}
-			if (__atomic_load_n(&m_bAudioBusy, __ATOMIC_ACQUIRE))
-			{
-				LOGWARN("MU50 split reset dropped: audio busy timeout");
-				UnparkSwp();
-				return;
-			}
-			m_pH8->reset();
-			if (m_pSynth)
-				m_pSynth->reset();
-			m_dResampleCarry  = 0.0;
-			m_bResamplePrimed = false;
-			m_PrevSample[0] = m_PrevSample[1] = 0;
-			m_LeftoverSample[0][0] = m_LeftoverSample[0][1] = 0;
-			m_LeftoverSample[1][0] = m_LeftoverSample[1][1] = 0;
-			m_dH8CycleCarry = 0.0;
-			m_bH8Halted     = false;
-			m_WEventFifo.Clear();
-			m_PublishedBlocks.Clear();
-			m_MidiStage.Clear();
-			// Drain the ring (SWP parked, audio idle: safe).
-			{
-				TNativeFrame Dropped;
-				while (m_NativeRing.Dequeue(Dropped))
-					;
-			}
-			m_nHeldNotes      = 0;
-			m_bSustain        = false;
-			m_bSustainedNotes = false;
-			UnparkSwp();
-			return;
-		}
-		m_Lock.Acquire();
-		m_pH8->reset();
-		if (m_pSynth)
-			m_pSynth->reset();
-		m_dResampleCarry  = 0.0;
-		m_bResamplePrimed = false;
-		m_PrevSample[0] = m_PrevSample[1] = 0;
-		m_LeftoverSample[0][0] = m_LeftoverSample[0][1] = 0;
-		m_LeftoverSample[1][0] = m_LeftoverSample[1][1] = 0;
-		m_dH8CycleCarry = 0.0;
-		m_bH8Halted     = false;
-		// FIFO is empty at every Render return by construction
-		// (pushes happen only inside AdvanceH8, drained before
-		// the block render), but a reset must never leave stale
-		// events for the fresh boot; cleared for M2-readiness.
-		m_WEventFifo.Clear();
-		m_nHeldNotes      = 0;
-		m_bSustain        = false;
+		m_nHeldNotes = 0;
+		m_bSustain = false;
 		m_bSustainedNotes = false;
-		m_Lock.Release();
-		return;
 	}
 
 	if (m_bSplitMode)
