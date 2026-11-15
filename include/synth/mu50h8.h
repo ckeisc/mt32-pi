@@ -246,6 +246,7 @@ private:
   int irq_filter_; // 0/1/2 from CCR + SYSCR (see update_irq_filter)
   void intc_update();
   void intc_raise(int vector);
+  void intc_clear(int vector); // MAME 868c260: clear a pending IRQ (e.g. SCI enable turned off)
   static int intc_slot(int vector);
 
   // ---- SCI (x2: 0 = unused by MU50, 1 = MIDI) ----

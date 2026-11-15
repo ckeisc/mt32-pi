@@ -254,6 +254,11 @@ void Mu50H8::intc_raise(int vector) {
   intc_update();
 }
 
+void Mu50H8::intc_clear(int vector) {
+  intc_pending_ &= ~((u64)1 << vector);
+  intc_update();
+}
+
 void Mu50H8::update_irq_filter() {
   // h83003 update_irq_filter (SYSCR INTM = bit 3).
   if (syscr_ & 0x08) {
@@ -857,6 +862,17 @@ void Mu50H8::sci_write(Sci &s, u32 off, u8 v) {
       if ((delta & kScrRie) && (v & kScrRie) &&
           (s.ssr & (kSsrOrer | kSsrFer | kSsrPer)))
         intc_raise(s.eri);
+      // MAME 868c260: turning an interrupt-enable off clears its pending
+      // IRQ, so a disabled SCI interrupt cannot fire later from a stale
+      // pending bit.
+      if ((delta & kScrTie) && !(v & kScrTie))
+        intc_clear(s.txi);
+      if ((delta & kScrTeie) && !(v & kScrTeie))
+        intc_clear(s.tei);
+      if ((delta & kScrRie) && !(v & kScrRie)) {
+        intc_clear(s.rxi);
+        intc_clear(s.eri);
+      }
       break;
     }
     case kSciTdr:
