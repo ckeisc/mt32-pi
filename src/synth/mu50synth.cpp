@@ -1447,6 +1447,14 @@ void CMU50Synth::SetSplitMode(bool bSplit)
 	m_bSplitMode = bSplit;
 }
 
+void CMU50Synth::SetFilter0277(bool b0277)
+{
+	// Contract: call before the SWP thread starts; afterwards the
+	// flag is read-only (thread-creation happens-before covers it).
+	if (m_pSynth)
+		m_pSynth->set_filter_0277(b0277);
+}
+
 void CMU50Synth::PCMTaskIteration()
 {
 	// Unconditional-call discipline: the worker loop calls this

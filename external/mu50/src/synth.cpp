@@ -268,6 +268,12 @@ Status Synth::render(std::int16_t* output, std::size_t frames) {
 }
 
 void Synth::reset() { impl_->reset(); }
+
+void Synth::set_filter_0277(bool v) noexcept {
+    if (impl_)
+        impl_->core.set_filter_0277(v);
+}
+
 const Config& Synth::config() const noexcept { return impl_->config; }
 bool Synth::wave_rom_loaded() const noexcept { return !impl_->wave_rom.empty(); }
 unsigned Synth::active_voices() const noexcept {

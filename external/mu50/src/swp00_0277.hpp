@@ -76,6 +76,15 @@ public:
     void set_pan(int chan, std::uint8_t v) noexcept { mixer_[chan].pan_w(v); }
     void keyon(int chan) noexcept;
 
+    // Route A hybrid (test): select the MAME 0.277 filter behaviours
+    // (sweep + cutoff cap) for all voices. Default false (HEAD).
+    // When true, FilterBlock::keyon puts the cutoff straight to its
+    // target and the sweep is a hidden timer, and info_w caps the
+    // cutoff at 0x7c0 when the resonance bits are below 4.
+    void set_filter_0277(bool v) noexcept {
+        for (auto& f : filter_) f.m_filter_0277 = v;
+    }
+
     // Stored register values (readback).
     std::uint16_t phase(int chan) const noexcept { return streaming_[chan].m_phase; }
     std::uint16_t start(int chan) const noexcept { return streaming_[chan].m_start; }
@@ -215,12 +224,21 @@ private:
     // --- Filter block (HEAD filter_block) ---
     // Chamberlin-configuration LPF. m_k/m_k_target are the 12-bit
     // cutoff (top bit is an added 1); m_q is the resonance.
+    // Route A hybrid (test): m_filter_0277 selects the MAME 0.277
+    // filter behaviours for this voice (sweep + cutoff cap). When
+    // set, keyon puts the cutoff straight to its target and the
+    // sweep is only a hidden timer (m_sweep_timer) that reports
+    // "done" when it expires, instead of HEAD's sweep-up from
+    // 0x800; and info_w caps the cutoff at 0x7c0 when the resonance
+    // bits are below 4. Default false (HEAD).
     struct FilterBlock {
         enum : u8 { SWEEP_NONE = 0, SWEEP_UP = 1, SWEEP_DONE = 2 };
         s32 m_q = 0x80, m_b = 0, m_l = 0;
         u16 m_k = 0xfff, m_k_target = 0x7ff;
         u16 m_info = 0x27ff;
         u8 m_speed = 0, m_sweep = SWEEP_NONE;
+        bool m_filter_0277 = false;
+        u32 m_sweep_timer = 0;
 
         void clear() noexcept;
         void keyon() noexcept;

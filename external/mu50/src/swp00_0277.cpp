@@ -40,6 +40,26 @@ std::uint16_t Swp0277Core::interpolation_step(u32 speed, u32 sample_counter) noe
 }
 
 // ---------------------------------------------------------------------------
+// 0.277 global step table (Route A hybrid only)
+// ---------------------------------------------------------------------------
+// MAME 0.277's global_step(): the per-sample step for the filter sweep
+// timer (and the LFO/envelope linear steps). Used only by the 0.277
+// sweep timer in FilterBlock::step when m_filter_0277 is set. Ported
+// verbatim from the pre-overhaul 0.277 port.
+static std::uint32_t filter_0277_global_step(std::uint32_t i) noexcept {
+    std::uint32_t v = 0;
+    switch (i >> 3) {
+    default: v = static_cast<std::uint32_t>(((i & 7) + 8) << (1 + (i >> 3))); break;
+    case 0xb: v = static_cast<std::uint32_t>(((i & 7) + 4) << 13); break;
+    case 0xc: v = static_cast<std::uint32_t>(((i & 6) + 6) << 14); break;
+    case 0xd: v = static_cast<std::uint32_t>(((i & 4) + 7) << 15); break;
+    case 0xe: v = 15 << 15; break;
+    case 0xf: v = 31 << 15; break;
+    }
+    return v;
+}
+
+// ---------------------------------------------------------------------------
 // ROM access (direct buffer; the region mirrors over the 24-bit bus, and
 // our 4 MiB ROM mirrors within itself via the size mask, as before).
 // ---------------------------------------------------------------------------
@@ -373,6 +393,7 @@ void Swp0277Core::FilterBlock::clear() noexcept {
     m_info = 0x27ff; // Actual reset value unknown
     m_speed = 0x00;
     m_sweep = SWEEP_NONE;
+    m_sweep_timer = 0;
 
     m_k_target = 0x7ff;
     m_k = 0xfff;
@@ -387,8 +408,22 @@ void Swp0277Core::FilterBlock::keyon() noexcept {
     m_l = 0;
 
     if (m_speed & 0x80) {
-        m_sweep = SWEEP_UP;
-        m_k = 0x800;
+        if (m_filter_0277) {
+            // 0.277 sweep (Route A hybrid): the cutoff goes straight
+            // to its target and the sweep is only a hidden timer that
+            // reports "done" when it expires. HEAD instead starts the
+            // cutoff almost closed (m_k = 0x800, ~27 Hz) and sweeps it
+            // up, which gives every such note a muffled onset when the
+            // firmware uses bit 7 with slow speeds -- the "radio"
+            // sound. The timer starts at 0x4000000 like 0.277 and
+            // counts down in step(); m_k stays at target throughout.
+            m_k = m_k_target;
+            m_sweep = SWEEP_UP;
+            m_sweep_timer = 0x4000000;
+        } else {
+            m_sweep = SWEEP_UP;
+            m_k = 0x800;
+        }
     } else {
         m_k = m_k_target;
     }
@@ -414,6 +449,22 @@ Swp0277Core::s32 Swp0277Core::FilterBlock::step(s16 input, s32 lmod, u32 sample_
         }
         break;
     case SWEEP_UP:
+        if (m_filter_0277) {
+            // 0.277 sweep: the cutoff is already at target (set in
+            // keyon); only the hidden timer counts down. The step is
+            // the 0.277 global-step value for this speed, halved, one
+            // decrement per sample. When it reaches zero the sweep is
+            // done and status() reports 0xc0, exactly as 0.277's
+            // istep(lpf_timer, 0, step_hi).
+            const u32 step = filter_0277_global_step(m_speed & 0x7f) >> 1;
+            if (step >= m_sweep_timer) {
+                m_sweep_timer = 0;
+                m_sweep = SWEEP_DONE;
+            } else {
+                m_sweep_timer -= step;
+            }
+            break;
+        }
         m_k += Swp0277Core::interpolation_step(m_speed & 0x7f, sample_counter);
         if (m_k >= 0xfff) {
             m_k = m_k_target;
@@ -439,7 +490,15 @@ void Swp0277Core::FilterBlock::info_w(u16 data) noexcept {
     m_info = data;
     s32 q = (m_info >> 11) + 4;
     m_q = (0x10 - (q & 7)) << (4 - (q >> 3));
-    m_k_target = m_info & 0x7ff;
+    u16 level = static_cast<u16>(m_info & 0x7ff);
+    if (m_filter_0277) {
+        // 0.277 cutoff cap (Route A hybrid): when the resonance bits
+        // (m_info >> 11) are below 4, cap the cutoff level at 0x7c0.
+        // HEAD has no cap. Ported from 0.277 set_lpf_info.
+        if ((m_info >> 11) < 4 && level > 0x7c0)
+            level = 0x7c0;
+    }
+    m_k_target = level;
     if (m_k_target)
         m_k_target |= 0x800;
 }

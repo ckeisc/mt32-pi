@@ -115,6 +115,10 @@ public:
 	// flag, or the park ack deadlocks (Nuked wedge rule).
 	// SetSplitMode must be called before the SWP thread starts.
 	void SetSplitMode(bool bSplit);
+	// Route A hybrid (test): select the MAME 0.277 filter behaviours
+	// (sweep + cutoff cap) in the SWP00 core. Call before the SWP
+	// thread starts; afterwards the flag is read-only.
+	void SetFilter0277(bool b0277);
 	void PCMTaskIteration();
 	bool ParkSwp(); // request park, wait for ack; false on timeout
 	void UnparkSwp();

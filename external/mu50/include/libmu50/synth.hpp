@@ -78,6 +78,14 @@ public:
     // sums the core's per-voice active flags, no behavior change).
     unsigned active_voices() const noexcept;
 
+    // Route A hybrid (test): select the MAME 0.277 filter behaviours
+    // (sweep + cutoff cap) in the SWP00 core. Default false (HEAD).
+    // When true, a key-on with the filter-speed bit 7 set puts the
+    // cutoff straight to its target (no muffled onset) and the sweep
+    // is a hidden timer, and info_w caps the cutoff at 0x7c0 when the
+    // resonance bits are below 4.
+    void set_filter_0277(bool v) noexcept;
+
     // Per-block SWP00 state snapshot for the split-mode readback path.
     // The SWP thread owns the live Synth; the audio thread must never
     // read it. The SWP thread captures this after each rendered block
