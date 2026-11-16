@@ -36,6 +36,7 @@
 #include "lcd/ui.h"
 #include "synth/mu50synth.h"
 #include "synth/mu50h8.h"
+#include "synth/fir44k48k.h"
 #include "utility.h"
 
 // libmu50 headers are only included here (this file is compiled as C++17;
@@ -97,7 +98,7 @@ void MU50H8Sci1RdrRead(void* pCtx)
 
 }
 
-CMU50Synth::CMU50Synth(unsigned nSampleRate, float nGain)
+CMU50Synth::CMU50Synth(unsigned nSampleRate, float nGain, TMU50Resampler Resampler)
 	: CSynthBase(nSampleRate),
 	  m_pSynth(nullptr),
 	  m_pH8(nullptr),
@@ -128,14 +129,23 @@ CMU50Synth::CMU50Synth(unsigned nSampleRate, float nGain)
 	  m_nVolume(100),
 	  m_dResampleRatio(44100.0 / static_cast<double>(nSampleRate)),
 	  m_dResampleCarry(0.0),
+	  m_nResampleDen(nSampleRate),
 	  m_bResamplePrimed(false),
 	  m_PrevSample{},
 	  m_LeftoverSample{},
 	  m_NativeScratch{},
 	  m_FloatScratch{},
+	  m_Resampler(Resampler),
+	  m_FirHistory{},
 	  m_WEventFifo{},
 	  m_nWEventFifoCap(kWEventFifoSize - 1),
 	  m_SwpShadow{},
+	  m_StateSnapVoice{},
+	  m_StateSnapCounter(0),
+	  m_nStateSeq(0),
+	  m_LastGoodVoice{},
+	  m_LastGoodCounter(0),
+	  m_bLastGoodValid(false),
 	  m_NativeRing{},
 	  m_PublishedBlocks{},
 	  m_MidiStage{},
@@ -491,13 +501,102 @@ u8 CMU50Synth::OnH8SwpRead(u16 nAddr)
 		return nValue;
 	}
 	// Split: the SWP thread owns live register state, so the audio
-	// thread must never read it. Pending-scan newest-wins first
-	// (M0: reads are cold, single-address 0x001, always
-	// read-your-own-write); the audio-side shadow covers the case
-	// where the newest write was already drained (shadow == last
-	// written == live for side-effect-free control registers, and
-	// the firmware never reads any other address, M0). A failed
-	// read returns 0, matching the M2 harness stub behavior.
+	// thread must never read it. Register 0x01 is the state readback
+	// port (not a stored value): compute state_r from the latest
+	// published per-block snapshot, using the shadowed state address
+	// (m_SwpShadow[1] == control_regs[1]). Seqlock read: retry if the
+	// SWP thread is mid-write or the snapshot changed under us; fall
+	// back to the echo (shadow) if no snapshot exists yet. For every
+	// other address the pending-scan newest-wins first (M0: reads are
+	// cold, single-address 0x001, always read-your-own-write); the
+	// audio-side shadow covers the case where the newest write was
+	// already drained (shadow == last written == live for
+	// side-effect-free control registers, and the firmware never reads
+	// any other address, M0). A failed read returns 0, matching the
+	// M2 harness stub behavior.
+	if (nAddr == 0x01)
+	{
+		// Seqlock read (Copilot review on PR #12): spin while the SWP
+		// thread is mid-write (odd seq) -- the writer's critical
+		// section is only ~160 bytes, so it finishes quickly. Never
+		// fall back to the echo on a torn read: the echo returns the
+		// state address, which is exactly the bug this fix removes.
+		// Only the "no snapshot yet" case (seq == 0, boot only) uses
+		// the echo. If the retry bound is hit, return state_r from
+		// the last-good copy instead.
+		for (int nTry = 0; nTry < 10; ++nTry)
+		{
+			const u32 nSeq0 = __atomic_load_n(&m_nStateSeq, __ATOMIC_ACQUIRE);
+			if (nSeq0 == 0)
+				break; // no snapshot yet (boot only): fall through to echo
+			if ((nSeq0 & 1) != 0)
+			{
+				// SWP mid-write: relax (yield) so the writer's copy
+				// can finish before the next try. Without this the 10
+				// tries finish in nanoseconds and a collision goes
+				// straight to the last-good copy without ever waiting
+				// (Copilot follow-up on PR #12). That fallback is
+				// still correct, but the spin should actually spin.
+				mu50spsc::CpuRelax();
+				continue;
+			}
+			u8 Voice[32][5];
+			for (int c = 0; c < 32; ++c)
+				for (int s = 0; s < 5; ++s)
+					Voice[c][s] = m_StateSnapVoice[c][s];
+			const u32 nCounter = m_StateSnapCounter;
+			// ACQUIRE fence: the copy above must not be reordered
+			// after the nSeq1 load. An acquire load on nSeq1 keeps
+			// later accesses from moving above it, but not earlier
+			// ones from moving below it, so without this fence the
+			// copy could be performed after the check. (Copilot
+			// review on PR #12; matters on ARM.)
+			__atomic_thread_fence(__ATOMIC_ACQUIRE);
+			const u32 nSeq1 = __atomic_load_n(&m_nStateSeq, __ATOMIC_ACQUIRE);
+			if (nSeq0 != nSeq1)
+			{
+				mu50spsc::CpuRelax();
+				continue; // torn read: retry
+			}
+			// Clean read: save as last-good, then compute state_r.
+			for (int c = 0; c < 32; ++c)
+				for (int s = 0; s < 5; ++s)
+					m_LastGoodVoice[c][s] = Voice[c][s];
+			m_LastGoodCounter = nCounter;
+			m_bLastGoodValid = true;
+			const u8 nStateAddr = m_SwpShadow[1];
+			const int nChan = nStateAddr & 0x1f;
+			switch (nStateAddr >> 5)
+			{
+			case 0: return Voice[nChan][0]; // filter_status
+			case 1: return static_cast<u8>(0xc0 | (nCounter >> 13)); // sample counter
+			case 2: return Voice[nChan][1]; // envelope_status
+			case 3: return Voice[nChan][2]; // mixer_status_glo
+			case 4: return Voice[nChan][3]; // mixer_status_panl
+			case 5: return Voice[nChan][4]; // mixer_status_panr
+			default: return 0;
+			}
+		}
+		// Retry bound hit: return state_r from the last-good copy
+		// rather than the echo. (If there is no last-good copy, no
+		// snapshot was ever published, so fall through to the echo
+		// below -- boot only.)
+		if (m_bLastGoodValid)
+		{
+			const u8 nStateAddr = m_SwpShadow[1];
+			const int nChan = nStateAddr & 0x1f;
+			switch (nStateAddr >> 5)
+			{
+			case 0: return m_LastGoodVoice[nChan][0];
+			case 1: return static_cast<u8>(0xc0 | (m_LastGoodCounter >> 13));
+			case 2: return m_LastGoodVoice[nChan][1];
+			case 3: return m_LastGoodVoice[nChan][2];
+			case 4: return m_LastGoodVoice[nChan][3];
+			case 5: return m_LastGoodVoice[nChan][4];
+			default: return 0;
+			}
+		}
+	}
 	TWEvent Event;
 	if (m_WEventFifo.FindNewest([nAddr](const TWEvent& E) { return E.nAddr == nAddr; }, Event))
 		return Event.nData;
@@ -684,9 +783,11 @@ void CMU50Synth::QueueMIDIMessageBytes(u8 nStatus, u8 nData1, u8 nData2)
 // driver sends queued bytes at 31250 baud whenever the line is idle,
 // and the SCI only samples them once the firmware enables RX, so MIDI
 // sent while the firmware is still booting is dropped, as on hardware.
-// Note: the H8 MIDI queue is 256 bytes and drops on overrun, so a
+// Note: the H8 MIDI queue is 4096 bytes and drops on overrun, so a
 // single SysEx longer than that truncates (short control SysExes,
-// including XG/GM resets, are unaffected).
+// including XG/GM resets, are unaffected). The SCI receiver has a
+// 256-byte RX FIFO behind the RDR, so a dense SysEx burst is not
+// lost to RDR overrun while the firmware drains it.
 void CMU50Synth::HandleMIDIShortMessage(u32 nMessage)
 {
 	const u8 nStatus = nMessage & 0xFF;
@@ -911,27 +1012,125 @@ double CMU50Synth::ResamplePulledBlock(float* pOutBuffer, size_t nOutDone,
 		return NativeFrame(nIndex - 1);
 	};
 
-	for (size_t i = 0; i < nBlockOut; ++i)
+	if (m_Resampler == TMU50Resampler::Kaiser)
 	{
-		const double dPos = dBlockStart + static_cast<double>(i) * dRatio;
-		const size_t nIndex = static_cast<size_t>(dPos);
-		const double dFrac  = dPos - static_cast<double>(nIndex);
-		const s16* pFrameM1 = PrevFrame(nIndex);
-		const s16* pFrame0 = NativeFrame(nIndex);
-		const s16* pFrame1 = NativeFrame(nIndex + 1);
-		const s16* pFrame2 = NativeFrame(nIndex + 2);
-		// Catmull-Rom weights (identical to Nuked's cubic)
-		const float t = static_cast<float>(dFrac);
-		const float t2 = t * t;
-		const float t3 = t2 * t;
-		const float w0 = -0.5f * t + t2 - 0.5f * t3;
-		const float w1 = 1.0f - 2.5f * t2 + 1.5f * t3;
-		const float w2 = 0.5f * t + 2.0f * t2 - 1.5f * t3;
-		const float w3 = -0.5f * t2 + 0.5f * t3;
-		const float fLeft  = (w0 * pFrameM1[0] + w1 * pFrame0[0] + w2 * pFrame1[0] + w3 * pFrame2[0]) / 32768.0f;
-		const float fRight = (w0 * pFrameM1[1] + w1 * pFrame0[1] + w2 * pFrame1[1] + w3 * pFrame2[1]) / 32768.0f;
-		pOutBuffer[(nOutDone + i) * 2]     = fLeft * fScale;
-		pOutBuffer[(nOutDone + i) * 2 + 1] = fRight * fScale;
+		// 64-tap polyphase windowed-sinc FIR (kFir44k48kQ15, flat to
+		// 20 kHz). Tap 0 is the frame 31 before the interpolation
+		// point, tap 63 is 32 after it. Negative indices read the
+		// carried history (m_FirHistory); the enlarged native-render
+		// margin supplies the lookahead.
+		//
+		// GCC-only optimization (no NEON intrinsics): the build is
+		// -O2 with no -ffast-math, and GCC does not auto-vectorize
+		// this loop at -O2 (verified: the float form emits scalar
+		// fmul/scvtf, 0 vector ops). So the loop is written for
+		// cheap scalar code instead of relying on the vectorizer:
+		//   - Exact rational phase (see below): the phase advances by
+		//     exactly 44100/m_nResampleDen native frames per output,
+		//     kept as an integer numerator with a carry -- no
+		//     per-output double dPos/dFrac and no accumulating
+		//     rounding error.
+		//   - Integer FIR: Q15 coefficients (kFir44k48kQ15) and
+		//     int64 accumulation. This drops the per-tap s16->float
+		//     conversion and float multiply-add; each tap is one
+		//     smull/madd + add. int64 is required: max |sum| is
+		//     2.95e9 (sum|coeff_q15| = 90116), over the int32 limit.
+		//   - One float multiply per output: the /32768 and the gain
+		//     are folded into fOutScale = fScale / 2^30 (the Q15
+		//     table carries one factor of 32768, the output scale
+		//     the other). Q15 quantization error is < 1 LSB per tap;
+		//     per-phase DC gain stays within 2e-4 of 1.0.
+		auto FirFrame = [&](long nIdx) -> const s16*
+		{
+			if (nIdx < 0)
+				return m_FirHistory[32 + nIdx];
+			return NativeFrame(static_cast<size_t>(nIdx));
+		};
+		// Fast path: when all 64 taps lie in the scratch (the common
+		// case -- only the first outputs of a block touch the carried
+		// history), run a plain pointer loop. The per-tap lambda was
+		// ~600 us/callback (diag-38 max_us over the 5.33 ms budget)
+		// and made the FIR sound broken.
+		const long nScratchBase = m_bResamplePrimed ? 2 : 0;
+		const float fOutScale = fScale * (1.0f / 1073741824.0f);
+		// Exact rational phase: the native rate is 44100 and the output
+		// rate is m_nResampleDen, so the phase advances by exactly
+		// 44100/m_nResampleDen native frames per output. The fractional
+		// position is kept as an integer numerator over m_nResampleDen
+		// (0..den-1) with a carry into the native index -- no rounding
+		// error accumulates, so the phase index always matches the
+		// double form. (A fixed-point increment was tried first: the
+		// rounded increment drifted 1 unit per 5 outputs and put the
+		// phase 1 step low on ~20% of outputs, a 0.2% RMS output
+		// difference. A u32 fraction with 32 bits has the same drift
+		// whenever the exact position lands on a phase boundary,
+		// which 44100/48000 does regularly.) The numerator 44100 is
+		// below the denominator (44.1k -> 48k), so one subtract per
+		// output suffices for the carry. nPhase is one integer
+		// division per output (~4 us per block, negligible).
+		const u32 nNum = 44100, nDen = m_nResampleDen;
+		size_t nIndex = static_cast<size_t>(dBlockStart);
+		u32 nFracNum = static_cast<u32>((dBlockStart - static_cast<double>(nIndex)) * static_cast<double>(nDen) + 0.5);
+		if (nFracNum >= nDen)
+			nFracNum = nDen - 1;
+		for (size_t i = 0; i < nBlockOut; ++i)
+		{
+			const unsigned nPhase = static_cast<unsigned>((static_cast<u64>(nFracNum) * 256) / nDen);
+			const int16_t* pCoeff = kFir44k48kQ15[nPhase];
+			const long nBase = static_cast<long>(nIndex) - 31;
+			int64_t nLeft = 0, nRight = 0;
+			if (nBase >= nScratchBase)
+			{
+				const s16* pS = &m_NativeScratch[(static_cast<size_t>(nBase - nScratchBase)) * 2];
+				for (size_t t = 0; t < 64; ++t)
+				{
+					nLeft  += static_cast<int64_t>(pCoeff[t]) * pS[t * 2];
+					nRight += static_cast<int64_t>(pCoeff[t]) * pS[t * 2 + 1];
+				}
+			}
+			else
+			{
+				for (size_t t = 0; t < 64; ++t)
+				{
+					const s16* pF = FirFrame(nBase + static_cast<long>(t));
+					nLeft  += static_cast<int64_t>(pCoeff[t]) * pF[0];
+					nRight += static_cast<int64_t>(pCoeff[t]) * pF[1];
+				}
+			}
+			pOutBuffer[(nOutDone + i) * 2]     = static_cast<float>(nLeft) * fOutScale;
+			pOutBuffer[(nOutDone + i) * 2 + 1] = static_cast<float>(nRight) * fOutScale;
+			nFracNum += nNum;
+			if (nFracNum >= nDen)
+			{
+				nFracNum -= nDen;
+				++nIndex;
+			}
+		}
+	}
+	else
+	{
+		for (size_t i = 0; i < nBlockOut; ++i)
+		{
+			const double dPos = dBlockStart + static_cast<double>(i) * dRatio;
+			const size_t nIndex = static_cast<size_t>(dPos);
+			const double dFrac  = dPos - static_cast<double>(nIndex);
+			const s16* pFrameM1 = PrevFrame(nIndex);
+			const s16* pFrame0 = NativeFrame(nIndex);
+			const s16* pFrame1 = NativeFrame(nIndex + 1);
+			const s16* pFrame2 = NativeFrame(nIndex + 2);
+			// Catmull-Rom weights (identical to Nuked's cubic)
+			const float t = static_cast<float>(dFrac);
+			const float t2 = t * t;
+			const float t3 = t2 * t;
+			const float w0 = -0.5f * t + t2 - 0.5f * t3;
+			const float w1 = 1.0f - 2.5f * t2 + 1.5f * t3;
+			const float w2 = 0.5f * t + 2.0f * t2 - 1.5f * t3;
+			const float w3 = -0.5f * t2 + 0.5f * t3;
+			const float fLeft  = (w0 * pFrameM1[0] + w1 * pFrame0[0] + w2 * pFrame1[0] + w3 * pFrame2[0]) / 32768.0f;
+			const float fRight = (w0 * pFrameM1[1] + w1 * pFrame0[1] + w2 * pFrame1[1] + w3 * pFrame2[1]) / 32768.0f;
+			pOutBuffer[(nOutDone + i) * 2]     = fLeft * fScale;
+			pOutBuffer[(nOutDone + i) * 2 + 1] = fRight * fScale;
+		}
 	}
 
 	// Carry three frames into the next block: the frame before
@@ -953,6 +1152,28 @@ double CMU50Synth::ResamplePulledBlock(float* pOutBuffer, size_t nOutDone,
 	m_LeftoverSample[1][0] = pLeftover1[0];
 	m_LeftoverSample[1][1] = pLeftover1[1];
 	m_bResamplePrimed = true;
+	// Kaiser FIR history: carry the 32 frames before the next
+	// block's boundary (effective index nConsumed) so the FIR's
+	// negative taps read real audio. Missing frames (first block)
+	// stay silence.
+	if (m_Resampler == TMU50Resampler::Kaiser)
+	{
+		for (size_t j = 0; j < 32; ++j)
+		{
+			long nIdx = static_cast<long>(nConsumed) - 32 + static_cast<long>(j);
+			if (nIdx >= 0)
+			{
+				const s16* pF = NativeFrame(static_cast<size_t>(nIdx));
+				m_FirHistory[j][0] = pF[0];
+				m_FirHistory[j][1] = pF[1];
+			}
+			else
+			{
+				m_FirHistory[j][0] = 0;
+				m_FirHistory[j][1] = 0;
+			}
+		}
+	}
 	return dEndPos - static_cast<double>(nConsumed);
 
 }
@@ -978,26 +1199,30 @@ void CMU50Synth::RenderResampled(float* pOutBuffer, size_t nFrames)
 	size_t nOutDone = 0;
 	while (nOutDone < nFrames)
 	{
-		// Cap the block so the native frames it needs fit the scratch
-		const size_t nMaxBlockOut = static_cast<size_t>((kNativeScratchFrames - 3) / dRatio);
+		// Cap the block so the native frames it needs fit the scratch.
+		// Kaiser FIR needs 30 more native frames than the cubic (32
+		// lookahead taps vs the cubic's 2), so the margin is
+		// resampler-dependent; the cubic path is unchanged.
+		const size_t nMargin = (m_Resampler == TMU50Resampler::Kaiser) ? 33 : 3;
+		const size_t nMaxBlockOut = static_cast<size_t>((kNativeScratchFrames - nMargin) / dRatio);
 		const size_t nBlockOut = Utility::Min(nFrames - nOutDone,
 		                                      Utility::Max(static_cast<size_t>(1), nMaxBlockOut));
 
 		// Native frames to render: primed blocks render up to one
 		// past the new leftover pair (the cubic's next tap); the
 		// first block has no carried frames and renders three extra
-		// (pair + next tap)
+		// (pair + next tap). Kaiser adds 30 for the FIR lookahead.
 		double dBlockStart;
 		size_t nNativeRender;
 		if (m_bResamplePrimed)
 		{
 			dBlockStart   = m_dResampleCarry;
-			nNativeRender = static_cast<size_t>(dBlockStart + nBlockOut * dRatio) + 1;
+			nNativeRender = static_cast<size_t>(dBlockStart + nBlockOut * dRatio) + 1 + (nMargin - 3);
 		}
 		else
 		{
 			dBlockStart   = 0.0;
-			nNativeRender = static_cast<size_t>(nBlockOut * dRatio) + 3;
+			nNativeRender = static_cast<size_t>(nBlockOut * dRatio) + nMargin;
 		}
 
 		// Advance the firmware by the time this block represents, so
@@ -1172,7 +1397,11 @@ void CMU50Synth::RenderResampledSplit(float* pOutBuffer, size_t nFrames)
 	m_nPendingCount = 0;
 	while (nOutDone < nFrames)
 	{
-		const size_t nMaxBlockOut = static_cast<size_t>((kNativeScratchFrames - 3) / dRatio);
+		// Kaiser FIR needs 30 more native frames than the cubic
+		// (32 lookahead taps vs the cubic's 2); the margin is
+		// resampler-dependent so the cubic path is unchanged.
+		const size_t nMargin = (m_Resampler == TMU50Resampler::Kaiser) ? 33 : 3;
+		const size_t nMaxBlockOut = static_cast<size_t>((kNativeScratchFrames - nMargin) / dRatio);
 		const size_t nBlockOut = Utility::Min(nFrames - nOutDone,
 		                                      Utility::Max(static_cast<size_t>(1), nMaxBlockOut));
 		double dBlockStart;
@@ -1180,12 +1409,12 @@ void CMU50Synth::RenderResampledSplit(float* pOutBuffer, size_t nFrames)
 		if (bPrimedVirt)
 		{
 			dBlockStart   = dCarry;
-			nNativeRender = static_cast<size_t>(dBlockStart + nBlockOut * dRatio) + 1;
+			nNativeRender = static_cast<size_t>(dBlockStart + nBlockOut * dRatio) + 1 + (nMargin - 3);
 		}
 		else
 		{
 			dBlockStart   = 0.0;
-			nNativeRender = static_cast<size_t>(nBlockOut * dRatio) + 3;
+			nNativeRender = static_cast<size_t>(nBlockOut * dRatio) + nMargin;
 		}
 		// Advance + publish (drains staging, steps H8, publishes).
 		AdvanceH8(nNativeRender);
@@ -1216,6 +1445,14 @@ void CMU50Synth::SetSplitMode(bool bSplit)
 	// Contract: call before the SWP thread starts; afterwards the
 	// flag is read-only (thread-creation happens-before covers it).
 	m_bSplitMode = bSplit;
+}
+
+void CMU50Synth::SetFilter0277(bool b0277)
+{
+	// Contract: call before the SWP thread starts; afterwards the
+	// flag is read-only (thread-creation happens-before covers it).
+	if (m_pSynth)
+		m_pSynth->set_filter_0277(b0277);
 }
 
 void CMU50Synth::PCMTaskIteration()
@@ -1287,6 +1524,26 @@ void CMU50Synth::PCMTaskIteration()
 			EnqueueSwpFrame(Block.nSeq, Frame);
 		}
 		nDone += nChunk;
+	}
+	// Publish the SWP00 state snapshot for the split-mode 0x01 readback
+	// (Claude review 2026-11-15): the state at the end of this block.
+	// Seqlock write: odd seq = writing, even = stable. The audio thread
+	// computes state_r from this snapshot in OnH8SwpRead.
+	{
+		libmu50::Synth::StateSnapshot Snap;
+		m_pSynth->snapshot_state(Snap);
+		__atomic_add_fetch(&m_nStateSeq, 1, __ATOMIC_RELAXED); // -> odd
+		// RELEASE fence: the plain data stores below must not become
+		// visible before the odd sequence number. On ARM (weak
+		// ordering) a RELAXED bump alone does not order them, so a
+		// reader could see the new seq with stale data. (Copilot
+		// review on PR #12.)
+		__atomic_thread_fence(__ATOMIC_RELEASE);
+		for (int c = 0; c < 32; ++c)
+			for (int s = 0; s < 5; ++s)
+				m_StateSnapVoice[c][s] = Snap.voice[c][s];
+		m_StateSnapCounter = Snap.sample_counter;
+		__atomic_add_fetch(&m_nStateSeq, 1, __ATOMIC_RELEASE); // -> even
 	}
 	__atomic_add_fetch(&m_nSwpRenderUs, CTimer::Get()->GetClockTicks() - nSwpStartUs, __ATOMIC_RELAXED);
 	UpdateRingHighWater();

@@ -1,505 +1,724 @@
 // license:BSD-3-Clause
-// Ported from MAME 0.277 src/devices/sound/swp00.cpp (Olivier Galibert).
+// Ported from MAME HEAD src/devices/sound/swp00.cpp (Olivier Galibert),
+// synthesis overhaul b75872c plus the 84fde62 and 40dd6fc corrections.
+// See swp00_0277.hpp for the model and the deliberate differences.
 #include "swp00_0277.hpp"
+
+#include <algorithm>
 
 namespace libmu50::detail {
 
-namespace {
-constexpr std::array<std::uint32_t, 4> kLfoCenteredSaw = {0x00000000, 0x00000000, 0xfff00000, 0xfff00000};
-constexpr std::array<std::uint32_t, 4> kLfoCenteredTri = {0x00000000, 0x0007ffff, 0xfff7ffff, 0xfff00000};
-constexpr std::array<std::uint32_t, 4> kLfoOffsetSaw = {0x00000000, 0x00000000, 0x00000000, 0x00000000};
-constexpr std::array<std::uint32_t, 4> kLfoOffsetTri = {0x00000000, 0x00000000, 0x000fffff, 0x000fffff};
-constexpr std::array<std::int32_t, 16> kPanmap = {
-    0x000, 0x040, 0x080, 0x0c0, 0x100, 0x140, 0x180, 0x1c0,
-    0x200, 0x240, 0x280, 0x2c0, 0x300, 0x340, 0x380, 0xfff};
-constexpr std::array<std::uint8_t, 4> kDpcmOffset = {7, 6, 4, 0};
-} // namespace
+// ---------------------------------------------------------------------------
+// interpolation_step
+// ---------------------------------------------------------------------------
+// A generic interpolation subblock used by envelopes, filter and LFO.
+// Provides a step to add/subtract to a counter, depending on a 00-7f
+// speed value and the current sample number. 84fde62: for speed >= 0x78
+// return 0x1f (was 0x7f); for speed >= 0x58 the step sizes halve.
+std::uint16_t Swp0277Core::interpolation_step(u32 speed, u32 sample_counter) noexcept {
+    // Phase is incorrect, and very weird
+    if (speed >= 0x78)
+        return 0x1f;
 
-bool Swp0277Core::istep(std::int32_t& value, std::int32_t limit, std::int32_t step) noexcept {
-    if (value < limit) {
-        value += step;
-        if (value >= limit) {
-            value = limit;
-            return true;
-        }
-        return false;
-    }
-    if (value > limit) {
-        value -= step;
-        if (value <= limit) {
-            value = limit;
-            return true;
-        }
-        return false;
-    }
-    return true;
-}
+    u32 k0 = speed >> 3;
+    u32 k1 = speed & 7;
 
-std::int32_t Swp0277Core::fpadd(std::int32_t value, std::int32_t step) noexcept {
-    s32 e = value >> 24;
-    s32 m = value & 0xffffff;
-    m += step << e;
-    if (m & 0xfe000000)
-        return 0xfffffff;
-    while (m & 0x01000000) {
-        m <<= 1;
-        e++;
-    }
-    if (e >= 16)
-        return 0xfffffff;
-    return (e << 24) | (m & 0xffffff);
-}
-
-std::int32_t Swp0277Core::fpsub(std::int32_t value, std::int32_t step) noexcept {
-    s32 e = value >> 24;
-    s32 m = (value & 0xffffff) | 0xfe000000;
-    m = e < 0xc ? m - (step << e) : (m >> (e - 0xb)) - (step << 0xb);
-    if (m >= 0)
-        return 0;
-    if (e >= 0xc)
-        e = 0xb;
-    // The casts below only silence -Wsign-compare: m < 0 is established
-    // above, and in the negative range the signed comparison against
-    // these constants gives the same result as MAME's unsigned literals.
-    while (m < static_cast<s32>(0xfe000000)) {
-        if (!e)
-            return 0;
-        e--;
-        m >>= 1;
-    }
-    while (e != 0xf && (m >= static_cast<s32>(0xff000000))) {
-        e++;
-        m <<= 1;
-    }
-    return (e << 24) | (m & 0xffffff);
-}
-
-bool Swp0277Core::fpstep(std::int32_t& value, std::int32_t limit, std::int32_t step) noexcept {
-    // value, limit and step are 4.24 but step has its exponent and
-    // top four bits zero
-    if (value == limit)
-        return true;
-    if (value < limit) {
-        value = fpadd(value, step);
-        if (value >= limit) {
-            value = limit;
-            return true;
-        }
-        return false;
-    }
-    value = fpsub(value, step);
-    if (value <= limit) {
-        value = limit;
-        return true;
-    }
-    return false;
-}
-
-// sample is signed 24.8
-std::int32_t Swp0277Core::fpapply(std::int32_t value, std::int32_t sample) noexcept {
-    if (value >= 0x10000000)
-        return 0;
-    return (s64(sample) - ((s64(sample) * ((value >> 9) & 0x7fff)) >> 16)) >> (value >> 24);
-}
-
-// sample is signed 24.8
-// NOTE: ported verbatim from MAME, including the shift count
-// (31 - (value >> 22)), which goes negative for large cutoff values.
-// The same compiler compiles the same expression the same way on both
-// sides; do NOT "fix" it, or the port diverges from MAME.
-std::int32_t Swp0277Core::lpffpapply(std::int32_t value, std::int32_t sample) noexcept {
-    return ((((value >> 7) & 0x7fff) | 0x8000) * s64(sample)) >> (31 - (value >> 22));
-}
-
-const std::array<Swp0277Core::u32, 128>& Swp0277Core::global_step() noexcept {
-    static const std::array<u32, 128> table = [] {
-        std::array<u32, 128> t{};
-        for (int i = 0; i != 128; i++) {
-            u32 v = 0;
-            switch (i >> 3) {
-            default: v = static_cast<u32>(((i & 7) + 8) << (1 + (i >> 3))); break;
-            case 0xb: v = static_cast<u32>(((i & 7) + 4) << 13); break;
-            case 0xc: v = static_cast<u32>(((i & 6) + 6) << 14); break;
-            case 0xd: v = static_cast<u32>(((i & 4) + 7) << 15); break;
-            case 0xe: v = 15 << 15; break;
-            case 0xf: v = 31 << 15; break;
-            }
-            t[static_cast<std::size_t>(i)] = v;
-        }
-        return t;
-    }();
-    return table;
-}
-
-const std::array<Swp0277Core::s16, 256>& Swp0277Core::dpcm_table() noexcept {
-    static const std::array<s16, 256> table = [] {
-        std::array<s16, 256> t{};
-        for (int i = 0; i < 128; i++) {
-            s16 base = static_cast<s16>(((i & 0x1f) << (3 + (i >> 5))) + (((1 << (i >> 5)) - 1) << 8));
-            t[static_cast<std::size_t>(i | 0x80)] = static_cast<s16>(-base);
-            t[static_cast<std::size_t>(i)] = base;
-        }
-        return t;
-    }();
-    return table;
-}
-
-const std::array<Swp0277Core::s32, 0x80>& Swp0277Core::attack_linear_step() noexcept {
-    static const std::array<s32, 0x80> table = {
-        0x00027, 0x0002b, 0x0002f, 0x00033, 0x00037, 0x0003d, 0x00042, 0x00048,
-        0x0004d, 0x00056, 0x0005e, 0x00066, 0x0006f, 0x0007a, 0x00085, 0x00090,
-        0x0009b, 0x000ac, 0x000bd, 0x000cc, 0x000de, 0x000f4, 0x00109, 0x00120,
-        0x00135, 0x00158, 0x00179, 0x00199, 0x001bc, 0x001e7, 0x00214, 0x00240,
-        0x0026b, 0x002af, 0x002f2, 0x00332, 0x00377, 0x003d0, 0x0042c, 0x00480,
-        0x004dc, 0x0055e, 0x005e9, 0x0066e, 0x006f4, 0x007a4, 0x00857, 0x0090b,
-        0x009c3, 0x00acb, 0x00bd6, 0x00ce6, 0x00e00, 0x00f5e, 0x010d2, 0x01234,
-        0x0139e, 0x015d0, 0x017f3, 0x01a20, 0x01c4a, 0x01f52, 0x02232, 0x0250f,
-        0x027ff, 0x02c72, 0x03109, 0x0338b, 0x039c4, 0x04038, 0x04648, 0x04c84,
-        0x05262, 0x05c1c, 0x065af, 0x06f5c, 0x07895, 0x0866f, 0x09470, 0x0a19e,
-        0x0ae4c, 0x0c566, 0x0db8d, 0x0f00f, 0x10625, 0x12937, 0x14954, 0x16c17,
-        0x1886e, 0x1c71c, 0x20000, 0x239e1, 0x2647c, 0x2aaab, 0x2ecfc, 0x3241f,
-        0x35e51, 0x3a83b, 0x40000, 0x4325c, 0x47dc1, 0x4c8f9, 0x50505, 0x55555,
-        0x58160, 0x5d174, 0x60606, 0x62b2e, 0x67b24, 0x6a63c, 0x6d3a0, 0x6eb3e,
-        0x71c72, 0x73616, 0x75075, 0x76b98, 0x78788, 0x78788, 0x7a44c, 0x7a44c,
-        0x7a44c, 0x7a44c, 0x7a44c, 0x7a44c, 0x7a44c, 0x7a44c, 0x7a44c, 0x7a44c};
-    return table;
-}
-
-const std::array<Swp0277Core::s32, 0x20>& Swp0277Core::decay_linear_step() noexcept {
-    static const std::array<s32, 0x20> table = {
-        0x15083, 0x17ad2, 0x1a41a, 0x1cbe7, 0x1f16d, 0x22ef1, 0x26a44, 0x2a1e4,
-        0x2da35, 0x34034, 0x3a197, 0x40000, 0x45b82, 0x4b809, 0x51833, 0x57262,
-        0x5d9f7, 0x6483f, 0x6b15c, 0x71c72, 0x77976, 0x7d119, 0x83127, 0x88889,
-        0x8d3dd, 0x939a8, 0x991f2, 0x9d89e, 0xa0a0a, 0xa57eb, 0xa72f0, 0xac769};
-    return table;
-}
-
-void Swp0277Core::reset() noexcept {
-    // Mirrors device_reset: all registers and state zeroed. (MAME's
-    // device_reset also zeroes the MEG state; the Synth shell resets
-    // MegState separately.)
-    lpf_info_.fill(0);
-    lpf_speed_.fill(0);
-    lfo_famod_depth_.fill(0);
-    rev_level_.fill(0);
-    dry_level_.fill(0);
-    cho_level_.fill(0);
-    var_level_.fill(0);
-    glo_level_.fill(0);
-    panning_.fill(0);
-    attack_speed_.fill(0);
-    attack_level_.fill(0);
-    decay_speed_.fill(0);
-    decay_level_.fill(0);
-    pitch_.fill(0);
-    start_.fill(0);
-    end_.fill(0);
-    format_.fill(0);
-    address_.fill(0);
-    lfo_step_.fill(0);
-    lfo_pmod_depth_.fill(0);
-    lfo_phase_.fill(0);
-    sample_pos_.fill(0);
-    envelope_level_.fill(0);
-    glo_level_cur_.fill(0);
-    pan_l_.fill(0);
-    pan_r_.fill(0);
-    lpf_feedback_.fill(0);
-    lpf_target_value_.fill(0);
-    lpf_value_.fill(0);
-    lpf_timer_.fill(0);
-    lpf_ha_.fill(0);
-    lpf_hb_.fill(0);
-    active_.fill(false);
-    decay_.fill(false);
-    decay_done_.fill(false);
-    lpf_done_.fill(false);
-    dpcm_current_.fill(0);
-    dpcm_next_.fill(0);
-    dpcm_address_.fill(0);
-    dpcm_sum_.fill(0);
-    // Derived constants are recomputed by precompute_voices() at the
-    // start of every render call; clearing here only avoids stale
-    // values surviving a reset.
-    precomp_.fill(VoicePrecomp{});
-}
-
-void Swp0277Core::set_lpf_info(int chan, u16 v) noexcept {
-    if (lpf_info_[chan] == v)
-        return;
-    lpf_info_[chan] = v;
-    // lpf_info_w recompute (MAME 0.277).
-    s32 fb = v >> 11;
-    s32 level = v & 0x7ff;
-    if (fb < 4 && level > 0x7c0)
-        level = 0x7c0;
-    if (level)
-        level |= 0x800;
-    lpf_feedback_[chan] = (fb + 4) << 21;
-    lpf_target_value_[chan] = level << 14;
-}
-
-void Swp0277Core::keyon(int chan) noexcept {
-    // Mirrors swp00_device::keyon (MAME 0.277) exactly.
-    sample_pos_[chan] = -static_cast<s32>(start_[chan]) << 15;
-    dpcm_address_[chan] = address_[chan] - start_[chan];
-    dpcm_sum_[chan] = 0;
-    dpcm_current_[chan] = 0;
-    dpcm_next_[chan] = 0;
-    lpf_value_[chan] = lpf_target_value_[chan];
-    lpf_timer_[chan] = 0x4000000;
-    lpf_ha_[chan] = 0;
-    lpf_hb_[chan] = 0;
-    glo_level_cur_[chan] = static_cast<s32>(glo_level_[chan]) << 4;
-    pan_l_[chan] = kPanmap[(panning_[chan] >> 4) & 0xf];
-    pan_r_[chan] = kPanmap[panning_[chan] & 0xf];
-    active_[chan] = true;
-    decay_[chan] = false;
-    decay_done_[chan] = false;
-    lfo_phase_[chan] = 0;
-    if (decay_speed_[chan] & 0x80) {
-        envelope_level_[chan] = 0;
-        decay_[chan] = true;
-    } else if ((attack_speed_[chan] & 0x80) || attack_level_[chan]) {
-        envelope_level_[chan] = static_cast<s32>(attack_level_[chan]) << 20;
+    if (speed >= 0x58) {
+        k0 -= 10;
+        u32 a = (2 << k0) - 1;
+        u32 b = (1 << k0) - 1;
+        static const u8 mx[8] = { 0x00, 0x80, 0x88, 0xa8, 0xaa, 0xea, 0xee, 0xfe };
+        return ((mx[k1] << (sample_counter & 7)) & 0x80) ? static_cast<u16>(a) : static_cast<u16>(b);
     } else {
-        envelope_level_[chan] = 0x8000000;
+        k0 = 10 - k0;
+        // util::make_bitmask<u32>(k0): k0 low bits set (0 when k0 == 0).
+        if (sample_counter & ((k0 == 0) ? 0u : ((1u << k0) - 1)))
+            return 0;
+        static const u16 mx[8] = { 0xaaaa, 0xeaaa, 0xeaea, 0xeeea, 0xeeee, 0xfeee, 0xfefe, 0xfffe };
+        return (mx[k1] << ((sample_counter >> k0) & 0xf)) & 0x8000 ? 1 : 0;
     }
 }
 
-Swp0277Core::u8 Swp0277Core::read_byte(u32 address, const u8* rom, std::size_t rom_size) const noexcept {
-    // MAME device_rom_interface: the region mirrors over the 24-bit bus.
+// ---------------------------------------------------------------------------
+// 0.277 global step table (Route A hybrid only)
+// ---------------------------------------------------------------------------
+// MAME 0.277's global_step(): the per-sample step for the filter sweep
+// timer (and the LFO/envelope linear steps). Used only by the 0.277
+// sweep timer in FilterBlock::step when m_filter_0277 is set. Ported
+// verbatim from the pre-overhaul 0.277 port.
+static std::uint32_t filter_0277_global_step(std::uint32_t i) noexcept {
+    std::uint32_t v = 0;
+    switch (i >> 3) {
+    default: v = static_cast<std::uint32_t>(((i & 7) + 8) << (1 + (i >> 3))); break;
+    case 0xb: v = static_cast<std::uint32_t>(((i & 7) + 4) << 13); break;
+    case 0xc: v = static_cast<std::uint32_t>(((i & 6) + 6) << 14); break;
+    case 0xd: v = static_cast<std::uint32_t>(((i & 4) + 7) << 15); break;
+    case 0xe: v = 15 << 15; break;
+    case 0xf: v = 31 << 15; break;
+    }
+    return v;
+}
+
+// ---------------------------------------------------------------------------
+// ROM access (direct buffer; the region mirrors over the 24-bit bus, and
+// our 4 MiB ROM mirrors within itself via the size mask, as before).
+// ---------------------------------------------------------------------------
+Swp0277Core::u8 Swp0277Core::read_byte(u32 address, const u8* rom, std::size_t rom_size) noexcept {
     if (rom_size == 0)
         return 0;
     return rom[address & static_cast<u32>(rom_size - 1)];
 }
 
-Swp0277Core::u16 Swp0277Core::read_word(u32 address, const u8* rom, std::size_t rom_size) const noexcept {
+Swp0277Core::u16 Swp0277Core::read_word(u32 address, const u8* rom, std::size_t rom_size) noexcept {
     // ENDIANNESS_LITTLE: low byte first.
     return static_cast<u16>(read_byte(address, rom, rom_size) |
                             (static_cast<u16>(read_byte(address + 1, rom, rom_size)) << 8));
 }
 
-void Swp0277Core::precompute_voices() noexcept {
-    const auto& gstep = global_step();
-    const auto& astep = attack_linear_step();
-    const auto& dstep = decay_linear_step();
-    for (int chan = 0; chan != 32; chan++) {
-        VoicePrecomp& p = precomp_[chan];
-        p.format_case = static_cast<u8>(format_[chan] >> 6);
-        p.dpcm_offset = kDpcmOffset[format_[chan] & 3];
-        p.dpcm_scale = static_cast<u8>((format_[chan] >> 2) & 7);
-        const bool tri = (lfo_step_[chan] & 0x40) != 0;
-        p.lfo_centered = tri ? kLfoCenteredTri.data() : kLfoCenteredSaw.data();
-        p.lfo_offset = tri ? kLfoOffsetTri.data() : kLfoOffsetSaw.data();
-        p.lfo_fa_shift = tri ? 2 : 1;
-        p.tremolo_shift = tri ? 3 : 2;
-        p.pmod_shift = tri ? 18 : 19;
-        p.lfo_step_value = gstep[0x20 + (lfo_step_[chan] & 0x3f)];
-        p.sample_increment = ((pitch_[chan] & 0xfff) << (8 + (static_cast<s16>(pitch_[chan]) >> 12))) >> 4;
-        p.dry_const = static_cast<s32>(dry_level_[chan]) << 20;
-        p.rev_const = static_cast<s32>(rev_level_[chan]) << 20;
-        p.cho_const = static_cast<s32>(cho_level_[chan]) << 20;
-        p.var_const = static_cast<s32>(var_level_[chan]) << 20;
-        p.famod_hi = lfo_famod_depth_[chan] >> 5;
-        p.famod_lo = lfo_famod_depth_[chan] & 0x1f;
-        p.lfo_pmod_depth = lfo_pmod_depth_[chan];
-        p.lpf_step_hi = static_cast<s32>(gstep[lpf_speed_[chan] & 0x7f] >> 1);
-        // Masked, not raw: the _lo values are consumed ONLY in the
-        // bit-7-clear branch, where masked == raw, so the mask is
-        // exact for every use and avoids an OOB read when bit 7 set.
-        p.lpf_step_lo = static_cast<s32>(gstep[lpf_speed_[chan] & 0x7f] >> 1);
-        p.lpf_hi = (lpf_speed_[chan] & 0x80) != 0;
-        p.lpf_target = lpf_target_value_[chan];
-        p.lpf_feedback = lpf_feedback_[chan];
-        p.decay_exp = (decay_speed_[chan] & 0x60) == 0x60;
-        p.decay_step_exp = dstep[decay_speed_[chan] & 0x1f];
-        p.decay_step_lin = static_cast<s32>(gstep[decay_speed_[chan] & 0x7f] << 1);
-        p.decay_target = static_cast<s32>(decay_level_[chan]) << 20;
-        p.attack_step = astep[attack_speed_[chan] & 0x7f];
-        p.attack_step_lin = static_cast<s32>(gstep[attack_speed_[chan] & 0x7f] << 1);
-        p.attack_hi = (attack_speed_[chan] & 0x80) != 0;
-        p.glo_target = static_cast<s32>(glo_level_[chan]) << 4;
-        p.pan_l_target = kPanmap[(panning_[chan] >> 4) & 0xf];
-        p.pan_r_target = kPanmap[panning_[chan] & 0xf];
-        p.end = end_[chan];
-        p.address = address_[chan];
+// ---------------------------------------------------------------------------
+// DPCM tables (HEAD streaming_block::dpcm_expand / max_value).
+// ---------------------------------------------------------------------------
+const std::array<Swp0277Core::s16, 256>& Swp0277Core::dpcm_expand() noexcept {
+    static const std::array<s16, 256> table = [] {
+        std::array<s16, 256> t{};
+        const s16 offset[4] = { 0, 0x20, 0x60, 0xe0 };
+        for (u32 i = 0; i != 128; i++) {
+            u32 e = i >> 5;
+            s16 base = static_cast<s16>(((i & 0x1f) << e) + offset[e]);
+            t[i] = base;
+            t[i + 128] = static_cast<s16>(-base);
+        }
+        t[0x80] = 0x88; // Not actually used by samples, but tested on swp30 hardware
+        return t;
+    }();
+    return table;
+}
+
+const std::array<Swp0277Core::s32, 8>& Swp0277Core::dpcm_max_value() noexcept {
+    static const std::array<s32, 8> table = {
+        0x7fff, 0x7ffe, 0x7ffc, 0x7ff8, 0x7ff0, 0x7fe0, 0x7fc0, 0x7f80};
+    return table;
+}
+
+// ---------------------------------------------------------------------------
+// Streaming block
+// ---------------------------------------------------------------------------
+void Swp0277Core::StreamingBlock::clear() noexcept {
+    m_phase = 0x8000;
+    m_start = 0;
+    m_loop = 0;
+    m_address = 0;
+    m_pitch = 0;
+    m_format = 0;
+    m_pos = 0;
+    m_pos_dec = 0;
+    m_dpcm_s0 = m_dpcm_s1 = 0;
+    m_dpcm_pos = 0;
+    m_dpcm_delta = 0;
+    m_first = false;
+    m_done = false;
+    m_last = 0;
+}
+
+void Swp0277Core::StreamingBlock::keyon() noexcept {
+    m_pos = -m_start;
+    m_pos_dec = (m_phase << 1) & 0x7ffe;
+    m_dpcm_s0 = m_dpcm_s1 = 0;
+    m_dpcm_pos = static_cast<u32>(m_pos + 1);
+    m_dpcm_delta = 0;
+    m_first = true;
+    m_done = false;
+}
+
+void Swp0277Core::StreamingBlock::read_16(const u8* rom, std::size_t rom_size, s16& val0, s16& val1) noexcept {
+    // m_pos can be negative just after keyon; cast to u32 before the
+    // shift so the address wraps modularly (same value as MAME's
+    // signed arithmetic, without UB).
+    u32 adr = m_address + (static_cast<u32>(m_pos) << 1);
+    val0 = static_cast<s16>(Swp0277Core::read_word(adr, rom, rom_size));
+    val1 = static_cast<s16>(Swp0277Core::read_word(adr + 2, rom, rom_size));
+}
+
+void Swp0277Core::StreamingBlock::read_12(const u8* rom, std::size_t rom_size, s16& val0, s16& val1) noexcept {
+    u32 adr = m_address + static_cast<u32>((m_pos >> 2) * 6);
+    switch (m_pos & 3) {
+    case 0: { // bcCa AB.. -> Cabc ..AB
+        u16 w0 = Swp0277Core::read_word(adr, rom, rom_size);
+        u16 w1 = Swp0277Core::read_word(adr + 2, rom, rom_size);
+        val0 = static_cast<s16>(w0 << 4);
+        val1 = static_cast<s16>(((w0 >> 8) | (w1 << 8)) & 0xfff0);
+        break;
+    }
+    case 1: { // ..c. abBC .A.. -> c... BCab ...A
+        u16 w0 = Swp0277Core::read_word(adr, rom, rom_size);
+        u16 w1 = Swp0277Core::read_word(adr + 2, rom, rom_size);
+        u16 w2 = Swp0277Core::read_word(adr + 4, rom, rom_size);
+        val0 = static_cast<s16>(((w0 >> 8) | (w1 << 8)) & 0xfff0);
+        val1 = static_cast<s16>(((w1 >> 4) & 0x0ff0) | (w2 << 12));
+        break;
+    }
+    case 2: { // ..bc CaAB -> bc.. ABCa
+        u16 w1 = Swp0277Core::read_word(adr + 2, rom, rom_size);
+        u16 w2 = Swp0277Core::read_word(adr + 4, rom, rom_size);
+        val0 = static_cast<s16>(((w1 >> 4) & 0x0ff0) | (w2 << 12));
+        val1 = static_cast<s16>(w2 & 0xfff0);
+        break;
+    }
+    case 3: { // c.ab BC.A -> abc. .ABC
+        u16 w2 = Swp0277Core::read_word(adr + 4, rom, rom_size);
+        u16 w3 = Swp0277Core::read_word(adr + 6, rom, rom_size);
+        val0 = static_cast<s16>(w2 & 0xfff0);
+        val1 = static_cast<s16>(w3 << 4);
+        break;
+    }
     }
 }
 
+void Swp0277Core::StreamingBlock::read_8(const u8* rom, std::size_t rom_size, s16& val0, s16& val1) noexcept {
+    u32 adr = m_address + static_cast<u32>(m_pos);
+    val0 = static_cast<s16>(Swp0277Core::read_byte(adr, rom, rom_size) << 8);
+    val1 = static_cast<s16>(Swp0277Core::read_byte(adr + 1, rom, rom_size) << 8);
+}
+
+void Swp0277Core::StreamingBlock::dpcm_step(u8 input) noexcept {
+    u32 mode = m_format & 3;
+    u32 scale = (m_format >> 2) & 7;
+    s32 limit = Swp0277Core::dpcm_max_value()[scale];
+
+    m_dpcm_s0 = m_dpcm_s1;
+
+    s32 delta = m_dpcm_delta + Swp0277Core::dpcm_expand()[input];
+    s32 sample = m_dpcm_s1 + (delta << scale);
+
+    if (sample < -0x8000) {
+        sample = -0x8000;
+        delta = 0;
+    } else if (sample > limit) {
+        sample = limit;
+        delta = 0;
+    }
+    m_dpcm_s1 = static_cast<s16>(sample);
+
+    switch (mode) {
+    case 0: delta = delta * 7 / 8; break;
+    case 1: delta = delta * 3 / 4; break;
+    case 2: delta = delta / 2; break;
+    case 3: delta = 0; break;
+    }
+    m_dpcm_delta = delta;
+}
+
+void Swp0277Core::StreamingBlock::read_8c(const u8* rom, std::size_t rom_size, s16& val0, s16& val1) noexcept {
+    while (m_dpcm_pos != static_cast<u32>(m_pos + 2)) {
+        dpcm_step(Swp0277Core::read_byte(m_address + m_dpcm_pos, rom, rom_size));
+        m_dpcm_pos++;
+    }
+    val0 = m_dpcm_s0;
+    val1 = m_dpcm_s1;
+}
+
+std::pair<Swp0277Core::s16, bool> Swp0277Core::StreamingBlock::step(const u8* rom, std::size_t rom_size, s32 fmod) noexcept {
+    if (m_done)
+        return std::make_pair(m_last, false);
+
+    s16 val0 = 0, val1 = 0;
+    switch (m_format >> 6) {
+    case 0: read_16(rom, rom_size, val0, val1); break;
+    case 1: read_12(rom, rom_size, val0, val1); break;
+    case 2: read_8(rom, rom_size, val0, val1); break;
+    case 3: read_8c(rom, rom_size, val0, val1); break;
+    }
+
+    // 2-point linear interpolation (9-bit multiplier, 15-bit counter).
+    u32 step = static_cast<u32>(((m_pitch & 0xfff) << (8 + (static_cast<s16>(m_pitch) >> 12))) >> 4);
+    s32 interp = (m_pos_dec >> 6) & 0x1ff;
+    // The multiplier has a precision limited to 15 bits.
+    s32 result = val0 + ((((val1 - val0) * interp) >> 10) << 1);
+
+    m_pos_dec += static_cast<s32>(step) + (fmod << 4);
+    if (m_pos_dec >= 0x8000) {
+        m_first = false;
+        m_pos += m_pos_dec >> 15;
+        m_pos_dec &= 0x7fff;
+        if (m_pos >= m_loop) {
+            if (m_loop) {
+                m_pos -= m_loop;
+                if ((m_format & 0xc0) != 0xc0) {
+                    m_pos_dec += (m_format << 9) & 0x7e00;
+                    if (m_pos_dec >= 0x8000)
+                        m_pos++;
+                    m_pos_dec &= 0x7fff;
+                }
+                m_dpcm_pos = 1;
+            } else {
+                m_done = true;
+                m_last = static_cast<s16>(result);
+                return std::make_pair(m_last, true);
+            }
+        }
+    }
+    return std::make_pair(static_cast<s16>(result), false);
+}
+
+// ---------------------------------------------------------------------------
+// Envelope block
+// ---------------------------------------------------------------------------
+// The attenuation is on 12 bits (4 exponent, 8 mantissa) and targets
+// are left-shifted and zero-padded by 4 bits. Attack can be normal
+// (speed bit 7 set: attenuation falls to 0), timed (speed bit 7 clear
+// and starting point 0: attenuation stays at 0 for a time depending
+// on the speed) or decay-like (speed bit 7 clear and target != 0).
+// Decay is normal (constant speed toward the target) or, when bit 7
+// is set and speed >= 0x60, variable speed linear in amplitude space.
+void Swp0277Core::EnvelopeBlock::clear() noexcept {
+    m_attack_speed = 0;
+    m_attack_level = 0;
+    m_decay_speed = 0;
+    m_decay_level = 0;
+    m_envelope_level = 0xfff;
+    m_envelope_mode = DECAY_DONE;
+}
+
+void Swp0277Core::EnvelopeBlock::keyon() noexcept {
+    if (m_decay_speed & 0x80) {
+        // Immediate release
+        m_envelope_level = 0;
+        m_envelope_mode = DECAY;
+    } else {
+        if (m_attack_speed & 0x80)
+            // normal mode
+            m_envelope_level = m_attack_level << 4;
+        else
+            // decay-like or timed mode
+            m_envelope_level = 0;
+        m_envelope_mode = ATTACK;
+    }
+}
+
+Swp0277Core::u8 Swp0277Core::EnvelopeBlock::status() const noexcept {
+    // 40dd6fc: never returns 0xff for DECAY_DONE; always
+    // (mode<<6)|(level>>6).
+    return static_cast<u8>((m_envelope_mode << 6) | (m_envelope_level >> 6));
+}
+
+bool Swp0277Core::EnvelopeBlock::active() const noexcept {
+    // 40dd6fc: a voice is still active if its level has not fully
+    // decayed, even when the envelope mode is DECAY_DONE.
+    return m_envelope_mode != DECAY_DONE || m_envelope_level < 0x800;
+}
+
+Swp0277Core::u16 Swp0277Core::EnvelopeBlock::step(u32 sample_counter) noexcept {
+    u16 result = static_cast<u16>(m_envelope_level);
+    switch (m_envelope_mode) {
+    case ATTACK: {
+        if (m_attack_speed & 0x80) {
+            // normal mode
+            s32 level = m_envelope_level - static_cast<s32>(Swp0277Core::interpolation_step(
+                (m_attack_speed & 0x7f) + ((m_envelope_level >> 7) << 2), sample_counter));
+            if (level <= 0) {
+                level = 0;
+                m_envelope_mode = DECAY;
+            }
+            m_envelope_level = level;
+        } else {
+            s32 level = m_envelope_level + static_cast<s32>(Swp0277Core::interpolation_step(m_attack_speed, sample_counter));
+            if (m_attack_level) {
+                // decay-like mode
+                s32 limit = m_attack_level << 4;
+                if (level >= limit) {
+                    m_envelope_mode = DECAY;
+                    if (level >= 0xfff)
+                        level = 0xfff;
+                }
+            } else {
+                // timed mode
+                if (level >= 0x800) {
+                    level = 0;
+                    m_envelope_mode = DECAY;
+                }
+                result = 0;
+            }
+            // 84fde62: the delay-attack path computes the level but
+            // must also store it, or the attack ramp stalls.
+            m_envelope_level = level;
+        }
+        break;
+    }
+
+    case DECAY: {
+        u32 key = m_decay_speed >= 0xe0
+            ? static_cast<u32>(m_decay_speed - 0x90 + ((m_envelope_level >> 7) << 2))
+            : static_cast<u32>(m_decay_speed & 0x7f);
+        s32 limit = m_decay_level << 4;
+        s32 level = m_envelope_level;
+        if (level < limit) {
+            level += static_cast<s32>(Swp0277Core::interpolation_step(key, sample_counter));
+            if (level > limit) {
+                m_envelope_mode = DECAY_DONE;
+                if (level > 0xfff)
+                    level = 0xfff;
+            }
+        } else if (level > limit) {
+            level -= static_cast<s32>(Swp0277Core::interpolation_step(key, sample_counter));
+            if (level < limit) {
+                m_envelope_mode = DECAY_DONE;
+                if (level < 0)
+                    level = 0;
+            }
+        } else {
+            m_envelope_mode = DECAY_DONE;
+        }
+        m_envelope_level = level;
+        break;
+    }
+
+    case DECAY_DONE:
+        break;
+    }
+
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// Filter block
+// ---------------------------------------------------------------------------
+// Chamberlin-configuration LPF. Encoded q is fp 2.3 (with a 4 offset),
+// k is fp 4.8 but the top bit is an added 1 except when it is all zero.
+// The chip interpolates between consecutive values of k; when updating
+// the coefficient registers Q is updated immediately and K uses the
+// interpolation block with the configured speed to reach the new value.
+// When w=1 at keyon, the filter sweeps from 800 to fff at the configured
+// speed then jumps to the programmed level.
+void Swp0277Core::FilterBlock::clear() noexcept {
+    m_info = 0x27ff; // Actual reset value unknown
+    m_speed = 0x00;
+    m_sweep = SWEEP_NONE;
+    m_sweep_timer = 0;
+
+    m_k_target = 0x7ff;
+    m_k = 0xfff;
+    m_q = 0x80;
+
+    m_b = 0;
+    m_l = 0;
+}
+
+void Swp0277Core::FilterBlock::keyon() noexcept {
+    m_b = 0;
+    m_l = 0;
+
+    if (m_speed & 0x80) {
+        if (m_filter_0277) {
+            // 0.277 sweep (Route A hybrid): the cutoff goes straight
+            // to its target and the sweep is only a hidden timer that
+            // reports "done" when it expires. HEAD instead starts the
+            // cutoff almost closed (m_k = 0x800, ~27 Hz) and sweeps it
+            // up, which gives every such note a muffled onset when the
+            // firmware uses bit 7 with slow speeds -- the "radio"
+            // sound. The timer starts at 0x4000000 like 0.277 and
+            // counts down in step(); m_k stays at target throughout.
+            m_k = m_k_target;
+            m_sweep = SWEEP_UP;
+            m_sweep_timer = 0x4000000;
+        } else {
+            m_sweep = SWEEP_UP;
+            m_k = 0x800;
+        }
+    } else {
+        m_k = m_k_target;
+    }
+}
+
+Swp0277Core::s32 Swp0277Core::FilterBlock::step(s16 input, s32 lmod, u32 sample_counter) noexcept {
+    s32 km = std::max(static_cast<s32>(m_k) - lmod, 0);
+    s64 k = (0x101 + (km & 0xff)) << (km >> 8);
+    s32 h = (input << 6) - m_l - static_cast<s32>((static_cast<s64>(m_q) * m_b) >> 7);
+    m_b = m_b + static_cast<s32>((k * h) >> 24);
+    m_l = m_l + static_cast<s32>((k * m_b) >> 24);
+
+    switch (m_sweep) {
+    case SWEEP_NONE:
+        if (m_k < m_k_target) {
+            m_k += Swp0277Core::interpolation_step(m_speed & 0x7f, sample_counter);
+            if (m_k > m_k_target)
+                m_k = m_k_target;
+        } else if (m_k > m_k_target) {
+            m_k -= Swp0277Core::interpolation_step(m_speed & 0x7f, sample_counter);
+            if (m_k < m_k_target)
+                m_k = m_k_target;
+        }
+        break;
+    case SWEEP_UP:
+        if (m_filter_0277) {
+            // 0.277 sweep: the cutoff is already at target (set in
+            // keyon); only the hidden timer counts down. The step is
+            // the 0.277 global-step value for this speed, halved, one
+            // decrement per sample. When it reaches zero the sweep is
+            // done and status() reports 0xc0, exactly as 0.277's
+            // istep(lpf_timer, 0, step_hi).
+            const u32 step = filter_0277_global_step(m_speed & 0x7f) >> 1;
+            if (step >= m_sweep_timer) {
+                m_sweep_timer = 0;
+                m_sweep = SWEEP_DONE;
+            } else {
+                m_sweep_timer -= step;
+            }
+            break;
+        }
+        m_k += Swp0277Core::interpolation_step(m_speed & 0x7f, sample_counter);
+        if (m_k >= 0xfff) {
+            m_k = m_k_target;
+            m_sweep = SWEEP_DONE;
+        }
+        break;
+    case SWEEP_DONE:
+        break;
+    }
+
+    return m_l;
+}
+
+Swp0277Core::u8 Swp0277Core::FilterBlock::status() const noexcept {
+    return static_cast<u8>((m_sweep == SWEEP_DONE || (m_sweep == SWEEP_NONE && m_k == m_k_target) ? 0xc0 : 0x00) |
+                           ((m_k >> 6) ^ 0x3f));
+}
+
+void Swp0277Core::FilterBlock::info_w(u16 data) noexcept {
+    // HEAD info_w<1> (high byte) recomputes Q; both byte writes
+    // recompute k_target. The shell writes the full 16-bit value at
+    // once, so both derivations run here.
+    m_info = data;
+    s32 q = (m_info >> 11) + 4;
+    m_q = (0x10 - (q & 7)) << (4 - (q >> 3));
+    u16 level = static_cast<u16>(m_info & 0x7ff);
+    if (m_filter_0277) {
+        // 0.277 cutoff cap (Route A hybrid): when the resonance bits
+        // (m_info >> 11) are below 4, cap the cutoff level at 0x7c0.
+        // HEAD has no cap. Ported from 0.277 set_lpf_info.
+        if ((m_info >> 11) < 4 && level > 0x7c0)
+            level = 0x7c0;
+    }
+    m_k_target = level;
+    if (m_k_target)
+        m_k_target |= 0x800;
+}
+
+// ---------------------------------------------------------------------------
+// LFO block
+// ---------------------------------------------------------------------------
+// 22-bit counter, optionally triangle-shaped, multiplied by the
+// different levels. The increment is encoded in a variant of fp 3.3:
+// for e<7 the value is (8+m)<<e, for e=7 (8+2*m)<<e, giving a cycle
+// time of 1489 to 523288 cycles (0.08 to 30 Hz).
+void Swp0277Core::LfoBlock::clear() noexcept {
+    m_counter = 0;
+    m_lamod = 0;
+    m_fmod = 0;
+    m_speed = 0x80;
+}
+
+std::tuple<Swp0277Core::u32, Swp0277Core::s32, Swp0277Core::s32> Swp0277Core::LfoBlock::step() noexcept {
+    u32 e = (m_speed >> 3) & 7;
+    u32 step;
+    if (e < 7)
+        step = (8 | (m_speed & 7)) << e;
+    else
+        step = (8 + 2 * (m_speed & 7)) << 7;
+
+    m_counter = (m_counter + step) & 0x3fffff;
+
+    u32 amod = 0;
+    s32 fmod = 0;
+    s32 lmod = 0;
+
+    if (!(m_speed & 0x80)) {
+        s32 shaped;
+        if (m_speed & 0x40)
+            shaped = static_cast<s32>(((m_counter << 1) & 0x3fffff) ^ (m_counter & 0x200000 ? 0x3fffff : 0));
+        else
+            shaped = static_cast<s32>(m_counter);
+
+        amod = (static_cast<u32>(shaped) * (m_lamod & 0x1f)) >> 16;
+        fmod = ((shaped - 0x200000) * m_fmod) >> 21;
+        lmod = (shaped * (m_lamod & 0xe0)) >> 20;
+    }
+
+    return std::make_tuple(amod, fmod, lmod);
+}
+
+// ---------------------------------------------------------------------------
+// Mixer block
+// ---------------------------------------------------------------------------
+// An attenuation is a 12-bit floating-point 4.8 value which combines
+// additively. The 8-bit levels are left-shifted by 4, the 4-bit (pan)
+// by 6. A pan of 0xf has a special mapped value of 0xfff (e.g. off).
+// Envelope and tremolo are given externally; this block manages all
+// other volumes. The four levels dry/reverb/chorus/variation apply
+// immediately when changed. Global and pan left/right interpolate
+// by 1 per sample toward their targets.
+void Swp0277Core::MixerBlock::clear() noexcept {
+    m_cglo = m_cpanl = m_cpanr = 0xfff;
+    m_tglo = m_tpanl = m_tpanr = 0xfff;
+    m_glo = m_pan = m_dry = m_rev = m_cho = m_var = 0xff;
+}
+
+void Swp0277Core::MixerBlock::keyon() noexcept {
+    m_cglo = m_tglo;
+    m_cpanl = m_tpanl;
+    m_cpanr = m_tpanr;
+}
+
+Swp0277Core::u8 Swp0277Core::MixerBlock::status_glo() const noexcept {
+    return static_cast<u8>((m_cglo == m_tglo ? 0xc0 : 0x00) | (m_cglo >> 6));
+}
+
+Swp0277Core::u8 Swp0277Core::MixerBlock::status_panl() const noexcept {
+    return static_cast<u8>((m_cpanl == m_tpanl ? 0xc0 : 0x00) | (m_cpanl >> 6));
+}
+
+Swp0277Core::u8 Swp0277Core::MixerBlock::status_panr() const noexcept {
+    return static_cast<u8>((m_cpanr == m_tpanr ? 0xc0 : 0x00) | (m_cpanr >> 6));
+}
+
+void Swp0277Core::MixerBlock::step(s32 sample, u16 envelope, u16 tremolo,
+                                    s32& dry_l, s32& dry_r, s32& rev,
+                                    s32& cho_l, s32& cho_r, s32& var_l, s32& var_r) noexcept {
+    u16 base = static_cast<u16>(envelope + tremolo + m_cglo);
+    dry_l += volume_apply(base + (m_dry << 4) + m_cpanl, sample);
+    dry_r += volume_apply(base + (m_dry << 4) + m_cpanr, sample);
+    rev   += volume_apply(base + (m_rev << 4), sample);
+    cho_l += volume_apply(base + (m_cho << 4) + m_cpanl, sample);
+    cho_r += volume_apply(base + (m_cho << 4) + m_cpanr, sample);
+    var_l += volume_apply(base + (m_var << 4) + m_cpanl, sample);
+    var_r += volume_apply(base + (m_var << 4) + m_cpanr, sample);
+
+    if (m_cglo < m_tglo)
+        m_cglo++;
+    else if (m_cglo > m_tglo)
+        m_cglo--;
+    if (m_cpanl < m_tpanl)
+        m_cpanl++;
+    else if (m_cpanl > m_tpanl)
+        m_cpanl--;
+    if (m_cpanr < m_tpanr)
+        m_cpanr++;
+    else if (m_cpanr > m_tpanr)
+        m_cpanr--;
+}
+
+Swp0277Core::s32 Swp0277Core::MixerBlock::volume_apply(s32 level, s32 sample) noexcept {
+    // Level is 4.8 floating point positive, and represents an attenuation.
+    // Sample is 16.6 signed and the result is in the same format.
+    // Passed-in value may have overflowed.
+    if (level >= 0xfff)
+        return 0;
+
+    s32 e = level >> 8;
+    s32 m = level & 0xff;
+    s64 mul = (0x1000000 - (m << 15)) >> e;
+    return static_cast<s32>((sample * mul) >> 24);
+}
+
+void Swp0277Core::MixerBlock::pan_w(u8 data) noexcept {
+    m_pan = data;
+    m_tpanl = static_cast<u16>((data << 2) & 0x3c0);
+    m_tpanr = static_cast<u16>((data << 6) & 0x3c0);
+    if (m_tpanl == 0x3c0)
+        m_tpanl = 0xfff;
+    if (m_tpanr == 0x3c0)
+        m_tpanr = 0xfff;
+}
+
+// ---------------------------------------------------------------------------
+// Core: reset / register writes / keyon
+// ---------------------------------------------------------------------------
+void Swp0277Core::reset() noexcept {
+    for (auto& s : streaming_) s.clear();
+    for (auto& e : envelope_) e.clear();
+    for (auto& f : filter_) f.clear();
+    for (auto& l : lfo_) l.clear();
+    for (auto& m : mixer_) m.clear();
+    sample_counter_ = 0;
+}
+
+void Swp0277Core::set_phase(int chan, u16 v) noexcept {
+    streaming_[chan].m_phase = v;
+}
+
+void Swp0277Core::set_start(int chan, u16 v) noexcept {
+    streaming_[chan].m_start = v;
+}
+
+void Swp0277Core::set_loop(int chan, u16 v) noexcept {
+    streaming_[chan].m_loop = v;
+}
+
+void Swp0277Core::set_address(int chan, u32 v) noexcept {
+    streaming_[chan].m_address = v & 0xffffff;
+}
+
+void Swp0277Core::set_pitch(int chan, u16 v) noexcept {
+    streaming_[chan].m_pitch = v;
+}
+
+void Swp0277Core::set_format(int chan, u8 v) noexcept {
+    streaming_[chan].m_format = v;
+}
+
+void Swp0277Core::set_lpf_info(int chan, u16 v) noexcept {
+    filter_[chan].info_w(v);
+}
+
+void Swp0277Core::keyon(int chan) noexcept {
+    streaming_[chan].keyon();
+    envelope_[chan].keyon();
+    filter_[chan].keyon();
+    lfo_[chan].keyon();
+    mixer_[chan].keyon();
+}
+
+// ---------------------------------------------------------------------------
+// Core: one sample (HEAD sound_stream_update voice section)
+// ---------------------------------------------------------------------------
 VoiceMix Swp0277Core::render_one(const u8* rom, std::size_t rom_size) noexcept {
-    // Mirrors the voice section of sound_stream_update (MAME 0.277),
-    // up to (but not including) the Variation block. Buses are >>8
-    // here, exactly as MAME feeds them to the MEG tail.
-    // Per-sample derived constants come from precomp_ (recomputed
-    // once per Synth::render call by precompute_voices); only
-    // stateful values are read from the arrays here.
-    const auto& dtab = dpcm_table();
     s32 dry_l = 0, dry_r = 0;
     s32 rev = 0;
     s32 cho_l = 0, cho_r = 0;
     s32 var_l = 0, var_r = 0;
 
     for (int chan = 0; chan != 32; chan++) {
-        if (!active_[chan])
+        // The LFO advances for every channel on every sample, even
+        // inactive ones (HEAD steps it before the active() check).
+        auto [amod, fmod, lmod] = lfo_[chan].step();
+
+        if (!envelope_[chan].active())
             continue;
-        const VoicePrecomp& pre = precomp_[chan];
 
-        u32 lfo_phase = lfo_phase_[chan] >> 7;
-        s32 lfo_p_phase = static_cast<s32>(lfo_phase ^
-            pre.lfo_centered[lfo_phase >> 18]);
-        s32 lfo_fa_phase = static_cast<s32>(lfo_phase ^
-            pre.lfo_offset[lfo_phase >> 18]);
+        auto [sample1, trigger_release] = streaming_[chan].step(rom, rom_size, fmod);
+        if (trigger_release)
+            envelope_[chan].trigger_release();
 
-        s16 val0 = 0, val1 = 0;
-        u32 base_address = pre.address;
-        s32 spos = sample_pos_[chan] >> 15;
-        switch (pre.format_case) {
-        case 0: { // 16-bits linear
-            u32 adr = base_address + (static_cast<u32>(spos) << 1);
-            val0 = static_cast<s16>(read_word(adr, rom, rom_size));
-            val1 = static_cast<s16>(read_word(adr + 2, rom, rom_size));
-            break;
-        }
-        case 1: { // 12-bits linear
-            u32 adr = base_address + (static_cast<u32>(spos >> 2) * 6);
-            switch (spos & 3) {
-            case 0: { // Cabc ..AB .... ....
-                u16 w0 = read_word(adr, rom, rom_size);
-                u16 w1 = read_word(adr + 2, rom, rom_size);
-                val0 = static_cast<s16>((w0 & 0x0fff) << 4);
-                val1 = static_cast<s16>(((w0 & 0xf000) >> 8) | ((w1 & 0x00ff) << 8));
-                break;
-            }
-            case 1: { // c... BCab ...A ....
-                u16 w0 = read_word(adr, rom, rom_size);
-                u16 w1 = read_word(adr + 2, rom, rom_size);
-                u16 w2 = read_word(adr + 4, rom, rom_size);
-                val0 = static_cast<s16>(((w0 & 0xf000) >> 8) | ((w1 & 0x00ff) << 8));
-                val1 = static_cast<s16>(((w1 & 0xff00) >> 4) | ((w2 & 0x000f) << 12));
-                break;
-            }
-            case 2: { // .... bc.. ABCa ....
-                u16 w1 = read_word(adr + 2, rom, rom_size);
-                u16 w2 = read_word(adr + 4, rom, rom_size);
-                val0 = static_cast<s16>(((w1 & 0xff00) >> 4) | ((w2 & 0x000f) << 12));
-                val1 = static_cast<s16>(w2 & 0xfff0);
-                break;
-            }
-            case 3: { // .... .... abc. .ABC
-                u16 w2 = read_word(adr + 4, rom, rom_size);
-                u16 w3 = read_word(adr + 6, rom, rom_size);
-                val0 = static_cast<s16>(w2 & 0xfff0);
-                val1 = static_cast<s16>((w3 & 0x0fff) << 4);
-                break;
-            }
-            }
-            break;
-        }
-        case 2: // 8-bits linear
-            val0 = static_cast<s16>(read_byte(base_address + static_cast<u32>(spos), rom, rom_size) << 8);
-            val1 = static_cast<s16>(read_byte(base_address + static_cast<u32>(spos) + 1, rom, rom_size) << 8);
-            break;
-        case 3: { // 8-bits delta-pcm: sequential by address, every byte
-            // decoded exactly once per pass; the loop sum resets on wrap.
-            u8 offset = pre.dpcm_offset;
-            u8 scale = pre.dpcm_scale;
-            u32 target_address = base_address + static_cast<u32>(spos) + 1;
-            while (dpcm_address_[chan] <= target_address) {
-                dpcm_current_[chan] = dpcm_next_[chan];
-                dpcm_sum_[chan] += dtab[read_byte(dpcm_address_[chan], rom, rom_size)] - offset;
-                s32 sample = (dpcm_sum_[chan] << scale) >> 3;
-                dpcm_address_[chan]++;
-                if (sample < -0x8000)
-                    sample = -0x8000;
-                else if (sample > 0x7fff)
-                    sample = 0x7fff;
-                dpcm_next_[chan] = static_cast<s16>(sample);
-            }
-            val0 = dpcm_current_[chan];
-            val1 = dpcm_next_[chan];
-            break;
-        }
-        }
-
-        s32 mul = sample_pos_[chan] & 0x7fff;
-        s32 sample = (val1 * mul + val0 * (0x8000 - mul)) >> 7;
-
-        s32 lpf_value = lpf_value_[chan] +
-            ((lfo_fa_phase * pre.famod_hi) << pre.lfo_fa_shift);
-
-        lpf_ha_[chan] += lpffpapply(lpf_value, sample - 2 * fpapply(pre.lpf_feedback, lpf_ha_[chan]) - lpf_hb_[chan]);
-        lpf_hb_[chan] += lpffpapply(lpf_value, lpf_ha_[chan]);
-
-        sample = lpf_hb_[chan];
-
-        s32 envelope_level;
-        if (decay_[chan] || attack_level_[chan] || (attack_speed_[chan] & 0x80))
-            envelope_level = envelope_level_[chan];
-        else
-            envelope_level = 0;
-
-        s32 tremolo_level = (lfo_fa_phase * pre.famod_lo) << pre.tremolo_shift;
-
-        // Common bus prefix, computed once (identical add order to
-        // the original seven lines: env + glo + trem, then the
-        // per-bus constant, then pan where present).
-        s32 base = envelope_level + (glo_level_cur_[chan] << 16) + tremolo_level;
-        dry_l += fpapply(base + pre.dry_const + (pan_l_[chan] << 16), sample);
-        dry_r += fpapply(base + pre.dry_const + (pan_r_[chan] << 16), sample);
-        rev += fpapply(base + pre.rev_const, sample);
-        cho_l += fpapply(base + pre.cho_const + (pan_l_[chan] << 16), sample);
-        cho_r += fpapply(base + pre.cho_const + (pan_r_[chan] << 16), sample);
-        var_l += fpapply(base + pre.var_const + (pan_l_[chan] << 16), sample);
-        var_r += fpapply(base + pre.var_const + (pan_r_[chan] << 16), sample);
-
-        lfo_phase_[chan] = (lfo_phase_[chan] + pre.lfo_step_value) & 0x7ffffff;
-
-        sample_pos_[chan] += (pre.sample_increment * (0x800 + ((lfo_p_phase * pre.lfo_pmod_depth) >> pre.pmod_shift))) >> 11;
-
-        if ((sample_pos_[chan] >> 15) >= pre.end) {
-            if (!pre.end)
-                active_[chan] = false;
-            else {
-                s32 prev = sample_pos_[chan];
-                do
-                    sample_pos_[chan] -= pre.end << 15;
-                while ((sample_pos_[chan] >> 15) >= pre.end);
-                dpcm_address_[chan] += static_cast<u32>((sample_pos_[chan] >> 15) - (prev >> 15));
-                dpcm_sum_[chan] = 0;
-            }
-        }
-
-        if (pre.lpf_hi)
-            lpf_done_[chan] = istep(lpf_timer_[chan], 0, pre.lpf_step_hi);
-        else
-            lpf_done_[chan] = istep(lpf_value_[chan], pre.lpf_target, pre.lpf_step_lo);
-
-        istep(glo_level_cur_[chan], pre.glo_target, 1);
-        istep(pan_l_[chan], pre.pan_l_target, 1);
-        istep(pan_r_[chan], pre.pan_r_target, 1);
-
-        if (decay_[chan]) {
-            if (pre.decay_exp)
-                decay_done_[chan] = fpstep(envelope_level_[chan], pre.decay_target, pre.decay_step_exp);
-            else
-                decay_done_[chan] = istep(envelope_level_[chan], pre.decay_target, pre.decay_step_lin);
-            if (envelope_level_[chan] & 0x8000000)
-                active_[chan] = false;
-        } else if (pre.attack_hi)
-            decay_[chan] = fpstep(envelope_level_[chan], 0, pre.attack_step);
-        else
-            decay_[chan] = istep(envelope_level_[chan], 0, pre.attack_step_lin);
+        s32 sample2 = filter_[chan].step(sample1, lmod, sample_counter_);
+        u16 envelope_level = envelope_[chan].step(sample_counter_);
+        mixer_[chan].step(sample2, envelope_level, static_cast<u16>(amod),
+                          dry_l, dry_r, rev, cho_l, cho_r, var_l, var_r);
     }
 
+    sample_counter_++;
+
     VoiceMix mix;
-    mix.dry_l = dry_l >> 8;
-    mix.dry_r = dry_r >> 8;
-    mix.reverb = rev >> 8;
-    mix.chorus_l = cho_l >> 8;
-    mix.chorus_r = cho_r >> 8;
-    mix.variation_l = var_l >> 8;
-    mix.variation_r = var_r >> 8;
+    // HEAD scale (unshifted): the MEG runs on the full 16.6 buses,
+    // exactly as in MAME HEAD. Shifting >>6 here (as the 0.277 port
+    // did) would run the MEG 64x cold and disable the distortion
+    // stage's saturate() in variation variant 0x80. synth.cpp applies
+    // HEAD's >>6 (put_int_clamp) to the MEG dry output instead.
+    mix.dry_l = dry_l;
+    mix.dry_r = dry_r;
+    mix.reverb = rev;
+    mix.chorus_l = cho_l;
+    mix.chorus_r = cho_r;
+    mix.variation_l = var_l;
+    mix.variation_r = var_r;
     return mix;
 }
 

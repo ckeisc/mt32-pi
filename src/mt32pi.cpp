@@ -478,7 +478,23 @@ bool CMT32Pi::InitMU50Synth()
 {
 	assert(m_pMU50Synth == nullptr);
 
-	m_pMU50Synth = new CMU50Synth(m_pConfig->AudioSampleRate, m_pConfig->MU50Gain);
+	// [mu50] resampler: cubic (default), kaiser (64-tap polyphase
+	// windowed-sinc FIR, flat to 20 kHz; case-insensitive, anything
+	// else falls back to cubic).
+	TMU50Resampler Resampler = TMU50Resampler::Cubic;
+	if (strcasecmp(m_pConfig->MU50Resampler, "kaiser") == 0)
+		Resampler = TMU50Resampler::Kaiser;
+
+	// [mu50] filter: 0277 (default), head. "0277" selects the MAME
+	// 0.277 filter behaviours in the SWP00 core (Route A hybrid):
+	// a key-on with the filter-speed bit 7 set puts the cutoff
+	// straight to its target (no muffled onset) with the sweep as a
+	// hidden timer, and info_w caps the cutoff at 0x7c0 when the
+	// resonance bits are below 4. "head" is the MAME HEAD behaviour.
+	// Case-insensitive; anything else falls back to head.
+	bool bFilter0277 = (strcasecmp(m_pConfig->MU50Filter, "0277") == 0);
+
+	m_pMU50Synth = new CMU50Synth(m_pConfig->AudioSampleRate, m_pConfig->MU50Gain, Resampler);
 	if (!m_pMU50Synth->Initialize())
 	{
 		LOGWARN("MU50 init failed; no complete MU50 wave ROM set present?");
@@ -493,6 +509,7 @@ bool CMT32Pi::InitMU50Synth()
 	// is harmless. m_bSwpActive defaults true, so a boot-default
 	// MU50 needs no SplitActivate; switch-to-MU50 unparks.
 	m_pMU50Synth->SetSplitMode(true);
+	m_pMU50Synth->SetFilter0277(bFilter0277);
 
 	m_pMU50Synth->SetUserInterface(&m_UserInterface);
 
@@ -1585,8 +1602,10 @@ void CMT32Pi::SetMasterVolume(s32 nVolume)
 		m_pEmuSCSynth->SetMasterVolume(m_nMasterVolume);
 	if (m_pNukedSC55Synth)
 		m_pNukedSC55Synth->SetMasterVolume(m_nMasterVolume);
+	if (m_pMU50Synth)
+		m_pMU50Synth->SetMasterVolume(m_nMasterVolume);
 
-	if (m_pCurrentSynth == m_pSoundFontSynth || m_pCurrentSynth == m_pEmuSCSynth || m_pCurrentSynth == m_pNukedSC55Synth)
+	if (m_pCurrentSynth == m_pSoundFontSynth || m_pCurrentSynth == m_pEmuSCSynth || m_pCurrentSynth == m_pNukedSC55Synth || m_pCurrentSynth == m_pMU50Synth)
 		LCDLog(TLCDLogType::Notice, "Volume: %d", m_nMasterVolume);
 }
 

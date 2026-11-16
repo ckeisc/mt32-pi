@@ -1,6 +1,7 @@
 // license:BSD-3-Clause
-// SWP00 register shell for the MAME 0.277-based voice core. Address
-// decoding mirrors MAME 0.277's rchan/rctrl maps; the voice semantics
+// SWP00 register shell for the MAME HEAD-based voice core (synthesis
+// overhaul b75872c plus the 84fde62 and 40dd6fc corrections). Address
+// decoding mirrors MAME HEAD's rchan/rctrl maps; the voice semantics
 // live in Swp0277Core and the MEG tail in MegState.
 #include "libmu50/synth.hpp"
 #include "swp00_0277.hpp"
@@ -37,8 +38,44 @@ struct Synth::Impl {
     void reset() {
         core.reset();
         for (auto& r : channel_regs) r.fill(0);
+        // Seed the register pairs whose core reset values are non-zero
+        // (Copilot review on PR #12, comment 2). The core resets the
+        // filter info to 0x27ff and the phase to 0x8000, but the shadow
+        // above resets to 0. If the firmware then writes only one byte
+        // of a pair, write_channel recomputes the 16-bit value from
+        // the shadow and the core gets the wrong other half (0 instead
+        // of the reset value). Seed them so a single-byte write uses
+        // the correct reset value for the other half. All other pairs
+        // (start, loop, address, pitch) reset to 0, matching the fill.
+        // LPF info 0x27ff: pair(0x21, 0x20), so [0x20]=0x27 (hi),
+        // [0x21]=0xff (lo). Phase 0x8000: pair(0x09, 0x08), so
+        // [0x08]=0x80 (hi), [0x09]=0x00 (lo, already 0).
+        for (auto& r : channel_regs)
+        {
+            r[0x20] = 0x27;
+            r[0x21] = 0xff;
+            r[0x08] = 0x80;
+        }
         meg.reset();
         control_regs.fill(0);
+    }
+
+    // HEAD swp00_device::state_r (register 0x01 readback): returns the
+    // computed voice state selected by the state address in
+    // control_regs[1] (written by state_adr_w). chan = adr & 0x1f.
+    // Cases 6/7 return 0 (HEAD logs "state %d unsupported").
+    std::uint8_t state_r() const noexcept {
+        const std::uint8_t adr = control_regs[1];
+        const int chan = adr & 0x1f;
+        switch (adr >> 5) {
+        case 0: return core.filter_status(chan);
+        case 1: return static_cast<std::uint8_t>(0xc0 | (core.sample_counter() >> 13));
+        case 2: return core.envelope_status(chan);
+        case 3: return core.mixer_status_glo(chan);
+        case 4: return core.mixer_status_panl(chan);
+        case 5: return core.mixer_status_panr(chan);
+        default: return 0;
+        }
     }
 
     void write_channel(std::uint8_t reg, std::uint8_t channel, std::uint8_t value) {
@@ -50,15 +87,14 @@ struct Synth::Impl {
                    (std::uint16_t(channel_regs[channel][hi_reg]) << 8);
         };
         switch (reg) {
-        // 0x08/0x09 are the HEAD phase registers; 0.277 has no phase
-        // register, so these writes are shadow-only (ignored by the core).
-        case 0x08: case 0x09: break;
+        // 0x08/0x09 are the HEAD phase registers (high/low byte).
+        case 0x08: case 0x09: c.set_phase(channel, pair(0x09, 0x08)); break;
         case 0x0a: case 0x0b: c.set_start(channel, pair(0x0b, 0x0a)); break;
         case 0x20: case 0x21: c.set_lpf_info(channel, pair(0x21, 0x20)); break;
         case 0x22: c.set_lpf_speed(channel, value); break;
-        case 0x23: c.set_lfo_famod_depth(channel, value); break;
-        case 0x24: c.set_lfo_step(channel, value); break;
-        case 0x25: c.set_lfo_pmod_depth(channel, value); break;
+        case 0x23: c.set_lfo_lamod(channel, value); break;
+        case 0x24: c.set_lfo_speed(channel, value); break;
+        case 0x25: c.set_lfo_fmod(channel, value); break;
         case 0x26: c.set_attack_speed(channel, value); break;
         case 0x27: c.set_attack_level(channel, value); break;
         case 0x28: c.set_decay_speed(channel, value); break;
@@ -68,7 +104,7 @@ struct Synth::Impl {
         case 0x2c: c.set_chorus_level(channel, value); break;
         case 0x2d: c.set_variation_level(channel, value); break;
         case 0x2e: c.set_glo_level(channel, value); break;
-        case 0x2f: c.set_panning(channel, value); break;
+        case 0x2f: c.set_pan(channel, value); break;
         case 0x30: c.set_format(channel, value); break;
         case 0x31: case 0x32: case 0x33:
             c.set_address(channel, std::uint32_t(channel_regs[channel][0x33]) |
@@ -76,7 +112,7 @@ struct Synth::Impl {
                           (std::uint32_t(channel_regs[channel][0x31]) << 16));
             break;
         case 0x34: case 0x35: c.set_pitch(channel, pair(0x35, 0x34)); break;
-        case 0x36: case 0x37: c.set_end(channel, pair(0x37, 0x36)); break;
+        case 0x36: case 0x37: c.set_loop(channel, pair(0x37, 0x36)); break;
         default: break;
         }
     }
@@ -143,6 +179,12 @@ Status Synth::read_register(std::uint16_t address, std::uint8_t& value) const {
         // MAME 0.277: waverom_access_r always returns 0x00 (busy flag),
         // and waverom_val_r returns the byte at voice-31's address and
         // auto-increments that address (24-bit wrap).
+        if (address == 0x01) {
+            // HEAD state_r: computed voice state, not the stored
+            // address byte (the firmware's only SWP00 read).
+            value = impl_->state_r();
+            return {};
+        }
         if (address == 0x02) {
             value = 0x00;
             return {};
@@ -204,27 +246,34 @@ Status Synth::render(std::int16_t* output, std::size_t frames) {
     for (std::size_t i = 0; i < frames; ++i) {
         const auto mix = impl_->core.render_one(impl_->wave_rom.data(), impl_->wave_rom.size());
         const auto routed = impl_->meg.process(mix);
-        // MAME 0.277 output staging: put_int(i, dry, 32768) delivers
-        // int16 = clamp(dry) directly. No >>2 (that was HEAD's
-        // put_int_clamp staging, which does not apply here).
-        // Mix headroom (2026-11-04, Silpheed forensics): the s32
-        // voice+MEG sum peaked at 49031 on Silpheed's first 120 s
-        // (1.496x the int16 rail) and 40828 on E1M1, so the clamp
-        // below flattened loud passages at gain 1.0. Scale the sum
-        // by H = (32768 / 49031) * 0.95 ~= 0.6349 BEFORE the clamp,
-        // same factor both channels, so the loudest measured
-        // material peaks at ~95% of full scale unclamped.
-        // Downstream [mu50] gain restores full loudness cleanly.
-        // routed is s32, exactly representable in double, so the
-        // multiply loses no precision on large sums.
-        constexpr double kMixHeadroom = (32768.0 / 49031.0) * 0.95;
-        output[2 * i] = clamp_s16(static_cast<std::int64_t>(routed[0] * kMixHeadroom));
-        output[2 * i + 1] = clamp_s16(static_cast<std::int64_t>(routed[1] * kMixHeadroom));
+        // MAME HEAD output staging: the MEG runs on the full 16.6
+        // voice buses, and its dry output is converted to a signed
+        // 18-bit ADC sample by >>6 with clamp to ±0x20000
+        // (put_int_clamp), then to host signed 16-bit PCM by >>2.
+        // Running the MEG on unshifted buses (instead of pre-shifting
+        // >>6 in render_one) lets the distortion stage's saturate()
+        // in variation variant 0x80 engage exactly as in HEAD. The
+        // final clamp_s16 handles the 0x20000>>2 = 0x8000 edge (one
+        // above int16 max).
+        auto adc = [](std::int64_t v) -> std::int32_t {
+            v >>= 6;
+            if (v > 0x20000) v = 0x20000;
+            if (v < -0x20000) v = -0x20000;
+            return static_cast<std::int32_t>(v);
+        };
+        output[2 * i] = clamp_s16(adc(routed[0]) >> 2);
+        output[2 * i + 1] = clamp_s16(adc(routed[1]) >> 2);
     }
     return {};
 }
 
 void Synth::reset() { impl_->reset(); }
+
+void Synth::set_filter_0277(bool v) noexcept {
+    if (impl_)
+        impl_->core.set_filter_0277(v);
+}
+
 const Config& Synth::config() const noexcept { return impl_->config; }
 bool Synth::wave_rom_loaded() const noexcept { return !impl_->wave_rom.empty(); }
 unsigned Synth::active_voices() const noexcept {
@@ -233,6 +282,17 @@ unsigned Synth::active_voices() const noexcept {
         if (impl_->core.active(static_cast<int>(ch))) ++n;
     return n;
 }
-const char* version() noexcept { return "0.277.0"; }
+
+void Synth::snapshot_state(StateSnapshot& out) const noexcept {
+    for (int chan = 0; chan < 32; ++chan) {
+        out.voice[chan][0] = impl_->core.filter_status(chan);
+        out.voice[chan][1] = impl_->core.envelope_status(chan);
+        out.voice[chan][2] = impl_->core.mixer_status_glo(chan);
+        out.voice[chan][3] = impl_->core.mixer_status_panl(chan);
+        out.voice[chan][4] = impl_->core.mixer_status_panr(chan);
+    }
+    out.sample_counter = impl_->core.sample_counter();
+}
+const char* version() noexcept { return "HEAD-b75872c"; }
 
 } // namespace libmu50
