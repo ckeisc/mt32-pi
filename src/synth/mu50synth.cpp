@@ -530,7 +530,16 @@ u8 CMU50Synth::OnH8SwpRead(u16 nAddr)
 			if (nSeq0 == 0)
 				break; // no snapshot yet (boot only): fall through to echo
 			if ((nSeq0 & 1) != 0)
-				continue; // SWP mid-write: spin, do not echo
+			{
+				// SWP mid-write: relax (yield) so the writer's copy
+				// can finish before the next try. Without this the 10
+				// tries finish in nanoseconds and a collision goes
+				// straight to the last-good copy without ever waiting
+				// (Copilot follow-up on PR #12). That fallback is
+				// still correct, but the spin should actually spin.
+				mu50spsc::CpuRelax();
+				continue;
+			}
 			u8 Voice[32][5];
 			for (int c = 0; c < 32; ++c)
 				for (int s = 0; s < 5; ++s)
@@ -545,7 +554,10 @@ u8 CMU50Synth::OnH8SwpRead(u16 nAddr)
 			__atomic_thread_fence(__ATOMIC_ACQUIRE);
 			const u32 nSeq1 = __atomic_load_n(&m_nStateSeq, __ATOMIC_ACQUIRE);
 			if (nSeq0 != nSeq1)
+			{
+				mu50spsc::CpuRelax();
 				continue; // torn read: retry
+			}
 			// Clean read: save as last-good, then compute state_r.
 			for (int c = 0; c < 32; ++c)
 				for (int s = 0; s < 5; ++s)

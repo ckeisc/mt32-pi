@@ -38,6 +38,24 @@ struct Synth::Impl {
     void reset() {
         core.reset();
         for (auto& r : channel_regs) r.fill(0);
+        // Seed the register pairs whose core reset values are non-zero
+        // (Copilot review on PR #12, comment 2). The core resets the
+        // filter info to 0x27ff and the phase to 0x8000, but the shadow
+        // above resets to 0. If the firmware then writes only one byte
+        // of a pair, write_channel recomputes the 16-bit value from
+        // the shadow and the core gets the wrong other half (0 instead
+        // of the reset value). Seed them so a single-byte write uses
+        // the correct reset value for the other half. All other pairs
+        // (start, loop, address, pitch) reset to 0, matching the fill.
+        // LPF info 0x27ff: pair(0x21, 0x20), so [0x20]=0x27 (hi),
+        // [0x21]=0xff (lo). Phase 0x8000: pair(0x09, 0x08), so
+        // [0x08]=0x80 (hi), [0x09]=0x00 (lo, already 0).
+        for (auto& r : channel_regs)
+        {
+            r[0x20] = 0x27;
+            r[0x21] = 0xff;
+            r[0x08] = 0x80;
+        }
         meg.reset();
         control_regs.fill(0);
     }
