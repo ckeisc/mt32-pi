@@ -78,6 +78,27 @@ public:
     // sums the core's per-voice active flags, no behavior change).
     unsigned active_voices() const noexcept;
 
+    // Per-block SWP00 state snapshot for the split-mode readback path.
+    // The SWP thread owns the live Synth; the audio thread must never
+    // read it. The SWP thread captures this after each rendered block
+    // and publishes it; the audio thread computes state_r (register
+    // 0x01) from the snapshot using the shadowed state address. One
+    // block of lag, no live-state race. Plain value, no behavior change.
+    struct StateSnapshot {
+        // Per-voice status, indexed [chan][slot]:
+        //   [0] filter_status (state_r case 0)
+        //   [1] envelope_status (case 2)
+        //   [2] mixer_status_glo (case 3)
+        //   [3] mixer_status_panl (case 4)
+        //   [4] mixer_status_panr (case 5)
+        // state_r case 1 is the sample counter (0xc0 | counter>>13).
+        std::uint8_t voice[32][5];
+        std::uint32_t sample_counter;
+    };
+    // Capture the current voice/mixer state. Call only from the thread
+    // that owns the Synth (the SWP thread in split mode).
+    void snapshot_state(StateSnapshot& out) const noexcept;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

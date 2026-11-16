@@ -478,7 +478,14 @@ bool CMT32Pi::InitMU50Synth()
 {
 	assert(m_pMU50Synth == nullptr);
 
-	m_pMU50Synth = new CMU50Synth(m_pConfig->AudioSampleRate, m_pConfig->MU50Gain);
+	// [mu50] resampler: cubic (default), kaiser (64-tap polyphase
+	// windowed-sinc FIR, flat to 20 kHz; case-insensitive, anything
+	// else falls back to cubic).
+	TMU50Resampler Resampler = TMU50Resampler::Cubic;
+	if (strcasecmp(m_pConfig->MU50Resampler, "kaiser") == 0)
+		Resampler = TMU50Resampler::Kaiser;
+
+	m_pMU50Synth = new CMU50Synth(m_pConfig->AudioSampleRate, m_pConfig->MU50Gain, Resampler);
 	if (!m_pMU50Synth->Initialize())
 	{
 		LOGWARN("MU50 init failed; no complete MU50 wave ROM set present?");

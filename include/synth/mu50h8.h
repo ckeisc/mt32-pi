@@ -246,11 +246,22 @@ private:
   int irq_filter_; // 0/1/2 from CCR + SYSCR (see update_irq_filter)
   void intc_update();
   void intc_raise(int vector);
+  void intc_clear(int vector); // MAME 868c260: clear a pending IRQ (e.g. SCI enable turned off)
   static int intc_slot(int vector);
 
   // ---- SCI (x2: 0 = unused by MU50, 1 = MIDI) ----
   struct Sci {
     u8 smr, brr, scr, tdr, ssr, ssr_read, rdr, rsr, tsr;
+    // RX FIFO (256 bytes): the H8's SCI has a 1-byte RDR on real
+    // hardware, but the Pi's H8 step granularity cannot service the
+    // RXI interrupt within one byte time (320 us at 31250 baud) during
+    // a dense SysEx burst, so back-to-back bytes overran the RDR and
+    // were lost (sci_rx_done set ORER and discarded them). The FIFO
+    // buffers received bytes so the firmware can drain them at its own
+    // pace without loss; RDRF tracks FIFO non-empty, and the RDR read
+    // pops the oldest byte. ORER is set only if the FIFO itself fills.
+    u8 rx_fifo_[256];
+    int rx_fifo_head_, rx_fifo_tail_;
     u8 rx_bit, tx_bit, rx_parity, tx_parity;
     int rx_state, tx_state; // 0 idle, 1 start, 2 bit, 3 parity, 4 stop, 5 last
     int rx_counter, tx_counter; // 16x oversample counters
@@ -275,7 +286,12 @@ private:
   // MIDI line driver (host side, SCI1): bytes queued by queue_midi_byte,
   // sent at 31250 baud (320 cycles/bit) regardless of RE (the SCI only
   // samples them when RE is set, as on hardware).
-  u8 midi_queue_[256];
+  // 4096 bytes: a song's initial XG SysEx setup burst (e.g. the MU50
+  // factory demo "The Musithm": 50 SysEx, 1523 bytes before the first
+  // note) must fit without overrun, or the setup is truncated and the
+  // MU50 plays unconfigured (quiet). The old 256-byte queue dropped
+  // most of that burst.
+  u8 midi_queue_[4096];
   int midi_q_head_, midi_q_tail_;
   int midi_bit_; // -1 start, 0-7 data, 8 stop, -2 idle
   u8 midi_byte_;

@@ -183,6 +183,7 @@ void Mu50H8::sci_reset(Sci &s, int eri, int rxi, int txi, int tei) {
   s.ssr_read = 0;
   s.rdr = 0;
   s.rsr = 0;
+  s.rx_fifo_head_ = s.rx_fifo_tail_ = 0;
   s.tsr = 0xff;
   s.rx_bit = s.tx_bit = 0;
   s.rx_parity = s.tx_parity = 0;
@@ -251,6 +252,11 @@ void Mu50H8::intc_update() {
 
 void Mu50H8::intc_raise(int vector) {
   intc_pending_ |= (u64)1 << vector;
+  intc_update();
+}
+
+void Mu50H8::intc_clear(int vector) {
+  intc_pending_ &= ~((u64)1 << vector);
   intc_update();
 }
 
@@ -857,6 +863,17 @@ void Mu50H8::sci_write(Sci &s, u32 off, u8 v) {
       if ((delta & kScrRie) && (v & kScrRie) &&
           (s.ssr & (kSsrOrer | kSsrFer | kSsrPer)))
         intc_raise(s.eri);
+      // MAME 868c260: turning an interrupt-enable off clears its pending
+      // IRQ, so a disabled SCI interrupt cannot fire later from a stale
+      // pending bit.
+      if ((delta & kScrTie) && !(v & kScrTie))
+        intc_clear(s.txi);
+      if ((delta & kScrTeie) && !(v & kScrTeie))
+        intc_clear(s.tei);
+      if ((delta & kScrRie) && !(v & kScrRie)) {
+        intc_clear(s.rxi);
+        intc_clear(s.eri);
+      }
       break;
     }
     case kSciTdr:
@@ -871,6 +888,10 @@ void Mu50H8::sci_write(Sci &s, u32 off, u8 v) {
                     ~kSsrMpbt) |
                    (v & kSsrMpbt));
       s.ssr_read &= s.ssr;
+      // RX FIFO: a firmware RDRF clear must not hide bytes still
+      // queued in the FIFO -- re-assert RDRF while bytes remain.
+      if (s.rx_fifo_head_ != s.rx_fifo_tail_)
+        s.ssr |= kSsrRdrf;
       if (s.tx_state == kStIdle && !(s.ssr & kSsrTdre)) sci_tx_start(s);
       break;
     }
@@ -896,6 +917,16 @@ u8 Mu50H8::sci_read(Sci &s, u32 off) {
       // MIDI input, so only SCI1 fires the hook.
       if (&s == &sci_[1] && hooks_.sci1_rdr_read)
         hooks_.sci1_rdr_read(hooks_.ctx);
+      // RDR pops the oldest byte from the RX FIFO; RDRF tracks
+      // FIFO non-empty (clears when the last byte is popped). The
+      // firmware's SSR-write RDRF clear is re-asserted below if
+      // bytes remain (see sci_write kSciSsr).
+      if (s.rx_fifo_head_ != s.rx_fifo_tail_) {
+        s.rdr = s.rx_fifo_[s.rx_fifo_head_];
+        s.rx_fifo_head_ = (s.rx_fifo_head_ + 1) & 255;
+        if (s.rx_fifo_head_ == s.rx_fifo_tail_)
+          s.ssr &= (u8)~kSsrRdrf;
+      }
       return s.rdr; // CPU read does NOT clear RDRF (SSR-write does)
     default: return 0xff;
   }
@@ -921,11 +952,20 @@ void Mu50H8::sci_rx_done(Sci &s) {
   if (!(s.ssr & kSsrFer)) {
     if ((s.smr & kSmrPe) && s.rx_parity) {
       s.ssr |= kSsrPer;
-    } else if (s.ssr & kSsrRdrf) {
-      s.ssr |= kSsrOrer;
     } else {
-      s.ssr |= kSsrRdrf;
-      s.rdr = s.rsr;
+      // Push the received byte into the RX FIFO (see Sci::rx_fifo_).
+      // On real hardware this is a 1-byte RDR and a late read loses
+      // the byte (ORER); here the FIFO absorbs the burst so the
+      // firmware can drain it without loss. ORER only if the FIFO
+      // itself is full.
+      const int next = (s.rx_fifo_tail_ + 1) & 255;
+      if (next == s.rx_fifo_head_) {
+        s.ssr |= kSsrOrer;
+      } else {
+        s.rx_fifo_[s.rx_fifo_tail_] = s.rsr;
+        s.rx_fifo_tail_ = next;
+        s.ssr |= kSsrRdrf;
+      }
     }
   }
   if (s.scr & kScrRie) {
@@ -1080,7 +1120,7 @@ void Mu50H8::sci_rx_line(int id, int level) {
 // ---------------- MIDI line driver ----------------
 
 bool Mu50H8::queue_midi_byte(u8 b) {
-  int next = (midi_q_tail_ + 1) & 255;
+  int next = (midi_q_tail_ + 1) & 4095;
   if (next == midi_q_head_) {
     logf("MIDI queue overrun, dropping %02x", 0, b);
     return false;
@@ -1090,7 +1130,7 @@ bool Mu50H8::queue_midi_byte(u8 b) {
   if (midi_bit_ == -2) {
     // Line idle: start this byte now (start bit = 0).
     midi_byte_ = midi_queue_[midi_q_head_];
-    midi_q_head_ = (midi_q_head_ + 1) & 255;
+    midi_q_head_ = (midi_q_head_ + 1) & 4095;
     midi_bit_ = -1;
     midi_edge_ = cycles_ + 320;
     // H2 Part A: host-side event-time mutation (the only one outside
@@ -1121,7 +1161,7 @@ void Mu50H8::midi_line_tick(u64 now) {
       // that corrupted every byte after the first).
       if (midi_q_head_ != midi_q_tail_) {
         midi_byte_ = midi_queue_[midi_q_head_];
-        midi_q_head_ = (midi_q_head_ + 1) & 255;
+        midi_q_head_ = (midi_q_head_ + 1) & 4095;
         midi_bit_ = -1;
         sci_rx_line(1, 0);
       } else {

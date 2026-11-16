@@ -48,10 +48,39 @@ namespace mu50h8
 	class Mu50H8;
 }
 
+// MU50 resampler: 44.1 kHz native -> 48 kHz output. Chosen once at
+// InitMU50Synth from [mu50] resampler in mt32-pi.cfg (case-insensitive;
+// anything unrecognized falls back to cubic). Cannot be changed
+// without a reboot.
+//
+//   cubic   (default) Catmull-Rom cubic interpolation, 4 taps. Cheap
+//           (~16x cheaper than kaiser) and always safe on the audio
+//           thread. Softens the top end: 16-20 kHz energy share falls
+//           from 0.0006 to 0.0004, 12-16 kHz from 0.0033 to 0.0026
+//           (measured on the Musithm). Use when CPU headroom matters
+//           or when the difference is inaudible.
+//   kaiser  64-tap polyphase windowed-sinc FIR, Kaiser beta=10,
+//           256 phases, flat to 20 kHz (0.00 dB at 1-19 kHz, 0.9997
+//           at 20 kHz). Preserves the high end exactly. Costs ~16x
+//           cubic (64 taps vs 4, stereo): ~6.1M MACs/s at 48 kHz.
+//           Currently scalar, NOT NEON-vectorized: the interleaved
+//           L/R scratch forces stride-2 loads, so GCC emits scalar
+//           fmul/scvtf (verified in the built object). Keep an eye on
+//           max_us; if it exceeds the 5.33 ms audio budget, fall
+//           back to cubic.
+//
+// Native-render lookahead margin: 33 frames for kaiser, 3 for cubic.
+// Mirrors the Nuked's TNukedResampler.
+enum class TMU50Resampler
+{
+	Kaiser,
+	Cubic
+};
+
 class CMU50Synth : public CSynthBase
 {
 public:
-	CMU50Synth(unsigned nSampleRate, float nGain);
+	CMU50Synth(unsigned nSampleRate, float nGain, TMU50Resampler Resampler);
 	virtual ~CMU50Synth() override;
 
 	// CSynthBase
@@ -224,6 +253,10 @@ private:
 	// are untouched).
 	double m_dResampleRatio; // native frames per output frame
 	double m_dResampleCarry; // fractional native position into the next block
+	u32 m_nResampleDen;     // output sample rate; the Kaiser phase runs on
+	                        // the exact rational 44100/m_nResampleDen, so a
+	                        // fixed-point increment cannot drift off a phase
+	                        // boundary (see ResamplePulledBlock)
 	bool m_bResamplePrimed;  // false until the first block has rendered
 	// Three native stereo frames carried across blocks: the frame
 	// before the boundary (cubic's prev tap) plus the pair
@@ -234,6 +267,17 @@ private:
 	s16 m_LeftoverSample[2][2];
 	s16 m_NativeScratch[2 * kNativeScratchFrames];
 	float m_FloatScratch[1024];
+
+	// Kaiser FIR resampler state (high-quality option, mirroring
+	// the Nuked's Kaiser FIR). The 64-tap polyphase windowed-sinc
+	// needs 31 frames of history before the block boundary and 32
+	// frames of lookahead past it; the history is carried here
+	// (the lookahead comes from the enlarged native-render margin).
+	// m_FirHistory holds the 32 native frames immediately before
+	// the current block's first effective frame (index 0), so the
+	// FIR tap at effective index k<0 reads m_FirHistory[32+k].
+	TMU50Resampler m_Resampler;
+	s16 m_FirHistory[32][2];
 
 	// M1: W-event FIFO + native sample ring (single-core refactor;
 	// no cores yet). The audio core pushes cycle-stamped W records
@@ -262,13 +306,32 @@ private:
 	size_t m_nWEventFifoCap;
 	// Audio-side shadow of last-written SWP values (full 0x000-0x7ff
 	// window), updated on every push in both modes. Split-mode read
-	// fallback (see OnH8SwpRead): for the measured pattern (reads
-	// always return the last-written value, M0 80,657/80,657) the
-	// shadow is exact, and it is audio-local, so no live-state race
-	// and no tear window between the two bytes of a 16-bit bus read
-	// (the hook is per-byte; the seqlock retry the plan suggested
-	// is subsumed by this -- there is no live read left to tear).
+	// fallback (see OnH8SwpRead): for side-effect-free control
+	// registers the shadow is exact, and it is audio-local, so no
+	// live-state race and no tear window between the two bytes of a
+	// 16-bit bus read (the hook is per-byte; the seqlock retry the
+	// plan suggested is subsumed by this -- there is no live read
+	// left to tear). NOTE: register 0x01 is NOT a stored value -- it
+	// is the state readback port (state_r). It is computed from the
+	// per-block snapshot (m_StateSnapVoice / m_StateSnapCounter) in
+	// OnH8SwpRead, never from this shadow; the old M0 measurement
+	// ("reads always return the last-written value, 80,657/80,657")
+	// predates state_r and does not apply to 0x01.
 	u8 m_SwpShadow[2048];
+	// Split-mode SWP00 state snapshot (Claude review 2026-11-15): the
+	// SWP thread captures the voice/mixer state after each rendered
+	// block and publishes it here; the audio thread computes state_r
+	// (register 0x01) from it in OnH8SwpRead, using the shadowed state
+	// address (m_SwpShadow[1]). One block of lag, no live-state race.
+	// Plain POD (this header is C++14 and only forward-declares
+	// libmu50; mu50synth.cpp copies from libmu50::StateSnapshot).
+	// voice[chan][0]=filter, [1]=envelope, [2]=mixer glo,
+	// [3]=mixer panl, [4]=mixer panr. Seqlock: m_nStateSeq is odd
+	// while the SWP thread is writing, even when stable, 0 when no
+	// snapshot has been published yet. __atomic access everywhere.
+	u8 m_StateSnapVoice[32][5];
+	u32 m_StateSnapCounter;
+	u32 m_nStateSeq;
 	struct TNativeFrame
 	{
 		s16 nLeft;
