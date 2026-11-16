@@ -127,6 +127,10 @@ CMU50Synth::CMU50Synth(unsigned nSampleRate, float nGain, TMU50Resampler Resampl
 	  m_nDiagLastSwpRenderUs(0),
 	  m_nGain(nGain),
 	  m_nVolume(100),
+	  m_fVolumeApplied(1.0f),
+	  m_fVolumeRampTarget(1.0f),
+	  m_fVolumeRampStep(0.0f),
+	  m_nVolumeRampFrames(0),
 	  m_dResampleRatio(44100.0 / static_cast<double>(nSampleRate)),
 	  m_dResampleCarry(0.0),
 	  m_nResampleDen(nSampleRate),
@@ -615,7 +619,8 @@ void CMU50Synth::OnH8Sci1RdrRead()
 
 void CMU50Synth::DrainMidiStage()
 {
-	// Split mode, audio thread only, called at each AdvanceH8.
+	// Audio thread only, called at each AdvanceH8 (split and
+	// non-split).
 	// Bytes staged by the MIDI thread land in SCI1 exactly as if
 	// the MIDI handler had queued them directly: cycles_ is
 	// unchanged since the last advance, so the line-driver edge
@@ -680,11 +685,15 @@ void CMU50Synth::DrainMidiStage()
 
 void CMU50Synth::AdvanceH8(size_t nNativeFrames)
 {
-	// Split mode: staged MIDI lands before any stepping, even when
-	// halted or when this block is empty -- matching single-core,
-	// where MIDI handlers queue regardless of halt state.
-	if (m_bSplitMode)
-		DrainMidiStage();
+	// Staged MIDI lands before any stepping, even when halted or
+	// when this block is empty -- matching the old single-core
+	// behavior, where MIDI handlers queue regardless of halt state.
+	// Always drained (split and non-split): in non-split the MIDI
+	// handlers used to queue directly under m_Lock while
+	// midi_line_tick() read the same queue on the audio thread
+	// without the lock, a race that corrupted the queue during
+	// SysEx bursts. Staging removes the race and the lock.
+	DrainMidiStage();
 
 	if (!m_pH8 || nNativeFrames == 0)
 		return;
@@ -815,51 +824,15 @@ void CMU50Synth::HandleMIDIShortMessage(u32 nMessage)
 		m_bSustainedNotes = false;
 	}
 
-	if (m_bSplitMode)
-	{
-		// Stage the message; the audio thread drains it at the next
-		// AdvanceH8 (note tracking + monitor update happen there).
-		// No m_Lock: the MIDI thread never touches H8 state.
-		const TMidiStage Stage{ 1, nStatus, nData1, nData2 };
-		if (!m_MidiStage.TryPush(Stage))
-			__atomic_add_fetch(&m_nStageDrops, 1, __ATOMIC_RELAXED);
-		return;
-	}
-
-	// Sounding-note tracking for power management (Nuked pattern):
-	// a note held, or held by the sustain pedal, keeps IsActive()
-	// true through quiet passages, so the clock cannot drop to
-	// power-save mid-performance.
-	if (nStatus < 0xF0)
-	{
-		const u8 nType = nStatus & 0xF0;
-		if (nType == 0x90 && nData2 > 0)
-			++m_nHeldNotes;
-		else if (nType == 0x80 || (nType == 0x90 && nData2 == 0))
-		{
-			if (m_bSustain && m_nHeldNotes > 0)
-			{
-				--m_nHeldNotes;
-				m_bSustainedNotes = true;
-			}
-			else if (m_nHeldNotes > 0)
-				--m_nHeldNotes;
-		}
-		else if (nType == 0xB0 && nData1 == 64)
-		{
-			m_bSustain = nData2 >= 64;
-			if (!m_bSustain)
-				m_bSustainedNotes = false;
-		}
-	}
-
-	// Serialize MIDI input against Render() on the audio core.
-	m_Lock.Acquire();
-	QueueMIDIMessageBytes(nStatus, nData1, nData2);
-	m_Lock.Release();
-
-	// Update MIDI monitor
-	CSynthBase::HandleMIDIShortMessage(nMessage);
+	// Always stage the message; the audio thread drains it at the
+	// next AdvanceH8 (note tracking + monitor update happen there).
+	// No m_Lock: the MIDI thread never touches H8 state. (Was
+	// split-only; non-split queued directly under m_Lock while the
+	// audio thread read the same queue without the lock -- a race
+	// that corrupted the queue during SysEx bursts.)
+	const TMidiStage Stage{ 1, nStatus, nData1, nData2 };
+	if (!m_MidiStage.TryPush(Stage))
+		__atomic_add_fetch(&m_nStageDrops, 1, __ATOMIC_RELAXED);
 }
 
 void CMU50Synth::HandleMIDISysExMessage(const u8* pData, size_t nSize)
@@ -869,22 +842,14 @@ void CMU50Synth::HandleMIDISysExMessage(const u8* pData, size_t nSize)
 
 	// The firmware expects the complete message including the leading
 	// 0xF0 and trailing 0xF7, and parses the stream itself.
-	if (m_bSplitMode)
-	{
-		// Stage byte by byte; the audio thread drains them in order.
-		for (size_t i = 0; i < nSize; ++i)
-		{
-			const TMidiStage Stage{ 0, pData[i], 0, 0 };
-			if (!m_MidiStage.TryPush(Stage))
-				__atomic_add_fetch(&m_nStageDrops, 1, __ATOMIC_RELAXED);
-		}
-		return;
-	}
-	m_Lock.Acquire();
+	// Always stage byte by byte; the audio thread drains them in
+	// order. No m_Lock. (Was split-only; see HandleMIDIShortMessage.)
 	for (size_t i = 0; i < nSize; ++i)
-		if (m_pH8->queue_midi_byte(pData[i]))
-			++m_nDiagMidiQueued;
-	m_Lock.Release();
+	{
+		const TMidiStage Stage{ 0, pData[i], 0, 0 };
+		if (!m_MidiStage.TryPush(Stage))
+			__atomic_add_fetch(&m_nStageDrops, 1, __ATOMIC_RELAXED);
+	}
 }
 
 bool CMU50Synth::IsActive()
@@ -903,46 +868,30 @@ void CMU50Synth::AllSoundOff()
 {
 	if (m_pH8)
 	{
-		if (m_bSplitMode)
-		{
-			// Stage the control entry; the drain queues the 32
-			// messages, clears note tracking, and resets the
-			// monitor, all on the audio thread.
-			const TMidiStage Stage{ 2, 0, 0, 0 };
-			if (!m_MidiStage.TryPush(Stage))
-				__atomic_add_fetch(&m_nStageDrops, 1, __ATOMIC_RELAXED);
-		}
-		else
-		{
-			// CC 120 (All Sound Off) and CC 123 (All Notes Off) on
-			// every channel; the firmware handles them like real
-			// hardware. The H8 and register core are NOT reset
-			// here: the firmware owns the voice state.
-			m_Lock.Acquire();
-			for (u8 nChannel = 0; nChannel < 16; ++nChannel)
-			{
-				const u8 SoundOff[3] = { static_cast<u8>(0xB0 | nChannel), 120, 0 };
-				const u8 NotesOff[3] = { static_cast<u8>(0xB0 | nChannel), 123, 0 };
-				QueueMIDIMessageBytes(SoundOff[0], SoundOff[1], SoundOff[2]);
-				QueueMIDIMessageBytes(NotesOff[0], NotesOff[1], NotesOff[2]);
-			}
-			m_Lock.Release();
-		}
+		// Always stage the control entry; the drain queues CC 120
+		// (All Sound Off) and CC 123 (All Notes Off) on every
+		// channel, clears note tracking, and resets the monitor,
+		// all on the audio thread. No m_Lock. (Was split-only;
+		// see HandleMIDIShortMessage.) The H8 and register core
+		// are NOT reset here: the firmware owns the voice state.
+		const TMidiStage Stage{ 2, 0, 0, 0 };
+		if (!m_MidiStage.TryPush(Stage))
+			__atomic_add_fetch(&m_nStageDrops, 1, __ATOMIC_RELAXED);
 	}
 
 	// Sounding-note tracking (see IsActive): an All Sound Off
-	// clears every held/sustained note. Split mode: the drain does
+	// clears every held/sustained note. With an H8 the drain does
 	// this (audio thread); doing it here would race the drain.
 	// (Without an H8 there is no drain, so clear directly.)
-	if (!m_bSplitMode || !m_pH8)
+	if (!m_pH8)
 	{
 		m_nHeldNotes      = 0;
 		m_bSustain        = false;
 		m_bSustainedNotes = false;
 	}
 
-	// Reset MIDI monitor. Split mode: the drain does this.
-	if (!m_bSplitMode || !m_pH8)
+	// Reset MIDI monitor. With an H8 the drain does this.
+	if (!m_pH8)
 		CSynthBase::AllSoundOff();
 }
 
@@ -951,6 +900,35 @@ void CMU50Synth::SetMasterVolume(u8 nVolume)
 	m_nVolume = nVolume;
 	// libmu50 has no volume API: volume is applied as a scale factor
 	// in RenderResampled(), together with the per-engine gain.
+	// Only the target is stored here; ResamplePulledBlock ramps the
+	// applied volume toward it (see NextVolumeScale()).
+}
+
+float CMU50Synth::NextVolumeScale()
+{
+	const float fScale = m_nGain * m_fVolumeApplied;
+	if (m_nVolumeRampFrames > 0)
+	{
+		m_fVolumeApplied += m_fVolumeRampStep;
+		if (--m_nVolumeRampFrames == 0)
+			m_fVolumeApplied = m_fVolumeRampTarget;
+	}
+	return fScale;
+}
+
+void CMU50Synth::ResetVolumeRamp()
+{
+	// Fade-in on synth switch: start from silence so the next
+	// Render ramps up to the target instead of starting at full
+	// volume mid-signal. Called by SwitchSynth before this synth
+	// becomes current, so the audio thread is not rendering it yet.
+	// (In split mode the audio thread does not hold m_Lock during
+	// Render, but the park in SplitDeactivate + the not-yet-current
+	// state make this safe; in non-split mode m_Lock is held by
+	// Render, and SwitchSynth runs outside it.)
+	m_fVolumeApplied = 0.0f;
+	m_fVolumeRampTarget = -1.0f;
+	m_nVolumeRampFrames = 0;
 }
 
 // Resample one pulled native block (see the header). Extracted
@@ -961,7 +939,18 @@ double CMU50Synth::ResamplePulledBlock(float* pOutBuffer, size_t nOutDone,
                                        size_t nNativeRender)
 {
 	const double dRatio = m_dResampleRatio;
-	const float fScale  = m_nGain * (static_cast<float>(m_nVolume) / 100.0f);
+	// Volume ramp: if the target moved (SetMasterVolume, or a
+	// ResetVolumeRamp() fade-in from a synth switch), (re)start a
+	// linear ramp from the currently applied volume over
+	// VolumeRampFrames. NextVolumeScale() advances it once per
+	// output frame below.
+	const float fVolumeTarget = static_cast<float>(m_nVolume) / 100.0f;
+	if (fVolumeTarget != m_fVolumeRampTarget)
+	{
+		m_fVolumeRampTarget = fVolumeTarget;
+		m_nVolumeRampFrames = VolumeRampFrames;
+		m_fVolumeRampStep = (fVolumeTarget - m_fVolumeApplied) / static_cast<float>(VolumeRampFrames);
+	}
 	// Activity for IsActive(): any non-zero native sample in this
 	// block marks the block's end as the last active frame.
 	for (size_t i = 0; i < nNativeRender * 2; ++i)
@@ -1052,7 +1041,6 @@ double CMU50Synth::ResamplePulledBlock(float* pOutBuffer, size_t nOutDone,
 		// ~600 us/callback (diag-38 max_us over the 5.33 ms budget)
 		// and made the FIR sound broken.
 		const long nScratchBase = m_bResamplePrimed ? 2 : 0;
-		const float fOutScale = fScale * (1.0f / 1073741824.0f);
 		// Exact rational phase: the native rate is 44100 and the output
 		// rate is m_nResampleDen, so the phase advances by exactly
 		// 44100/m_nResampleDen native frames per output. The fractional
@@ -1097,6 +1085,9 @@ double CMU50Synth::ResamplePulledBlock(float* pOutBuffer, size_t nOutDone,
 					nRight += static_cast<int64_t>(pCoeff[t]) * pF[1];
 				}
 			}
+			// Per-frame volume scale (advances the ramp); the Q15
+			// output scale folds in the /2^30 factor.
+			const float fOutScale = NextVolumeScale() * (1.0f / 1073741824.0f);
 			pOutBuffer[(nOutDone + i) * 2]     = static_cast<float>(nLeft) * fOutScale;
 			pOutBuffer[(nOutDone + i) * 2 + 1] = static_cast<float>(nRight) * fOutScale;
 			nFracNum += nNum;
@@ -1128,6 +1119,7 @@ double CMU50Synth::ResamplePulledBlock(float* pOutBuffer, size_t nOutDone,
 			const float w3 = -0.5f * t2 + 0.5f * t3;
 			const float fLeft  = (w0 * pFrameM1[0] + w1 * pFrame0[0] + w2 * pFrame1[0] + w3 * pFrame2[0]) / 32768.0f;
 			const float fRight = (w0 * pFrameM1[1] + w1 * pFrame0[1] + w2 * pFrame1[1] + w3 * pFrame2[1]) / 32768.0f;
+			const float fScale = NextVolumeScale();
 			pOutBuffer[(nOutDone + i) * 2]     = fLeft * fScale;
 			pOutBuffer[(nOutDone + i) * 2 + 1] = fRight * fScale;
 		}

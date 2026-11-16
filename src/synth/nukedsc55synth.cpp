@@ -260,6 +260,10 @@ CNukedSC55Synth::CNukedSC55Synth(unsigned nSampleRate, float nGain, bool bOversa
 	  m_nGain(nGain),
 	  m_bOversampling(bOversampling),
 	  m_nVolume(100),
+	  m_fVolumeApplied(1.0f),
+	  m_fVolumeRampTarget(1.0f),
+	  m_fVolumeRampStep(0.0f),
+	  m_nVolumeRampFrames(0),
 	  m_nNativeRate(0),
 	  m_dResampleRatio(1.0),
 	  m_dReadFrac(0.0),
@@ -714,80 +718,21 @@ bool CNukedSC55Synth::Initialize()
 
 void CNukedSC55Synth::HandleMIDIShortMessage(u32 nMessage)
 {
-	const u8 nStatus = nMessage & 0xFF;
-	const u8 nData1  = (nMessage >> 8) & 0xFF;
-	const u8 nData2  = (nMessage >> 16) & 0xFF;
-
 	if (!m_pEmulator)
 		return;
 
-	// System Reset (0xFF): forward the byte to the emulated UART
-	// like stock Nuked-SC55 does (R_PostEvent -> PostMIDI). The
-	// SC-55 firmware handles System Reset itself as a quick
-	// parameter reset, not a reboot — the stock renderer plays a
-	// file carrying a stray 0xFF from the first note, with no hole.
-	// A host-side ResetForRestart() here reboots the firmware
-	// (seconds of silence) on every stray 0xFF: DOSMID sends the
-	// illegal CC110=255 value raw, so every Descent 2 song opened
-	// with a 2-3 s hole. Clear the held-note tracking to match the
-	// firmware's voices-off, then fall through: the normal path
-	// below posts the single byte (nBytes == 1 for 0xFF).
-	if (nStatus == 0xFF)
-	{
-		m_nHeldNotes = 0;
-		m_bSustain = false;
-		m_bSustainedNotes = false;
-	}
-
-	// Sounding-note tracking for power management (core 0 only):
-	// a note held, or held by the sustain pedal, keeps IsActive()
-	// true through quiet passages, so the clock cannot drop to
-	// power-save mid-performance. Note-off for a note that was
-	// sustained releases the sustain hold only when the pedal is
-	// already up; pedal-up releases all sustained notes at once.
-	if (nStatus < 0xF0)
-	{
-		const u8 nType = nStatus & 0xF0;
-		if (nType == 0x90 && nData2 > 0)
-			++m_nHeldNotes;
-		else if (nType == 0x80 || (nType == 0x90 && nData2 == 0))
-		{
-			if (m_bSustain && m_nHeldNotes > 0)
-			{
-				--m_nHeldNotes;
-				m_bSustainedNotes = true;
-			}
-			else if (m_nHeldNotes > 0)
-				--m_nHeldNotes;
-		}
-		else if (nType == 0xB0 && nData1 == 64)
-		{
-			m_bSustain = nData2 >= 64;
-			if (!m_bSustain)
-				m_bSustainedNotes = false;
-		}
-	}
-
-	// Post exactly the bytes the message carries; the emulated UART
-	// parses the stream like the real hardware, so an extra data byte
-	// would corrupt the following message.
-	u8 Bytes[3] = { nStatus, nData1, nData2 };
-	size_t nBytes;
-	if (nStatus < 0xF0)
-		nBytes = ((nStatus & 0xE0) == 0xC0) ? 2 : 3;
-	else if (nStatus == 0xF1 || nStatus == 0xF3)
-		nBytes = 2;
-	else if (nStatus == 0xF2)
-		nBytes = 3;
-	else
-		nBytes = 1;
-
-	m_Lock.Acquire();
-	m_pEmulator->PostMIDI(std::span<const uint8_t>(Bytes, nBytes));
-	m_Lock.Release();
-
-	// Update MIDI monitor
-	CSynthBase::HandleMIDIShortMessage(nMessage);
+	// Lock-free MIDI input: stage the message; the audio thread
+	// drains it at the next RenderFrames (note tracking, the 0xFF
+	// held-note clear, PostMIDI, and the monitor update all happen
+	// there). No m_Lock: the MIDI thread never touches emulator
+	// state, so it no longer spins waiting for a whole Render to
+	// finish before it can post MIDI.
+	const u8 nStatus = nMessage & 0xFF;
+	const u8 nData1  = (nMessage >> 8) & 0xFF;
+	const u8 nData2  = (nMessage >> 16) & 0xFF;
+	const TMidiStage Stage{ 1, nStatus, nData1, nData2 };
+	if (!m_MidiStage.TryPush(Stage))
+		__atomic_add_fetch(&m_nStageDrops, 1, __ATOMIC_RELAXED);
 }
 
 void CNukedSC55Synth::HandleMIDISysExMessage(const u8* pData, size_t nSize)
@@ -795,11 +740,16 @@ void CNukedSC55Synth::HandleMIDISysExMessage(const u8* pData, size_t nSize)
 	if (!m_pEmulator || nSize == 0)
 		return;
 
-	// The emulator expects the complete message including the leading
-	// 0xF0 and trailing 0xF7; it parses the stream itself.
-	m_Lock.Acquire();
-	m_pEmulator->PostMIDI(std::span<const uint8_t>(pData, nSize));
-	m_Lock.Release();
+	// Lock-free MIDI input: stage byte by byte; the audio thread
+	// drains them in order. No m_Lock. The emulator expects the
+	// complete message including the leading 0xF0 and trailing 0xF7;
+	// it parses the stream itself.
+	for (size_t i = 0; i < nSize; ++i)
+	{
+		const TMidiStage Stage{ 0, pData[i], 0, 0 };
+		if (!m_MidiStage.TryPush(Stage))
+			__atomic_add_fetch(&m_nStageDrops, 1, __ATOMIC_RELAXED);
+	}
 }
 
 bool CNukedSC55Synth::IsActive()
@@ -819,34 +769,49 @@ void CNukedSC55Synth::AllSoundOff()
 {
 	if (m_pEmulator)
 	{
-		// CC 120 (All Sound Off) and CC 123 (All Notes Off) on every
-		// channel; the firmware handles them like real hardware.
-		m_Lock.Acquire();
-		for (u8 nChannel = 0; nChannel < 16; ++nChannel)
-		{
-			const u8 SoundOff[3] = { static_cast<u8>(0xB0 | nChannel), 120, 0 };
-			const u8 NotesOff[3] = { static_cast<u8>(0xB0 | nChannel), 123, 0 };
-			m_pEmulator->PostMIDI(std::span<const uint8_t>(SoundOff, sizeof(SoundOff)));
-			m_pEmulator->PostMIDI(std::span<const uint8_t>(NotesOff, sizeof(NotesOff)));
-		}
-		m_Lock.Release();
+		// Lock-free MIDI input: stage the control entry; the
+		// drain posts CC 120 + CC 123 on every channel, clears
+		// note tracking, and resets the monitor, all on the
+		// audio thread. No m_Lock.
+		const TMidiStage Stage{ 2, 0, 0, 0 };
+		if (!m_MidiStage.TryPush(Stage))
+			__atomic_add_fetch(&m_nStageDrops, 1, __ATOMIC_RELAXED);
 	}
-
-	// Sounding-note tracking (see IsActive): an All Sound Off
-	// clears every held/sustained note.
-	m_nHeldNotes = 0;
-	m_bSustain = false;
-	m_bSustainedNotes = false;
-
-	// Reset MIDI monitor
-	CSynthBase::AllSoundOff();
 }
 
 void CNukedSC55Synth::SetMasterVolume(u8 nVolume)
 {
 	// The emulated firmware owns its internal levels; mt32-pi's master
 	// volume is applied as an output scale in Render(), like the gain.
+	// Only the target is stored here; RenderFrames ramps the applied
+	// volume toward it (see NextVolumeScale()).
 	m_nVolume = nVolume;
+}
+
+float CNukedSC55Synth::NextVolumeScale()
+{
+	const float fScale = m_nGain * m_fVolumeApplied;
+	if (m_nVolumeRampFrames > 0)
+	{
+		m_fVolumeApplied += m_fVolumeRampStep;
+		if (--m_nVolumeRampFrames == 0)
+			m_fVolumeApplied = m_fVolumeRampTarget;
+	}
+	return fScale;
+}
+
+void CNukedSC55Synth::ResetVolumeRamp()
+{
+	// Fade-in on synth switch: start from silence so the next
+	// Render ramps up to the target instead of starting at full
+	// volume mid-signal. The ramp itself is (re)started in
+	// RenderFrames when it sees the target differs; forcing the
+	// ramp target to an impossible value here guarantees that.
+	m_Lock.Acquire();
+	m_fVolumeApplied = 0.0f;
+	m_fVolumeRampTarget = -1.0f;
+	m_nVolumeRampFrames = 0;
+	m_Lock.Release();
 }
 
 void CNukedSC55Synth::ResetFirState()
@@ -899,6 +864,125 @@ const char* CNukedSC55Synth::CycleResampler()
 	return pName;
 }
 
+void CNukedSC55Synth::DrainMidiStage()
+{
+	// Audio thread only, called from RenderFrames after acquiring
+	// m_Lock, before stepping. Staged bytes/messages land in the
+	// emulated UART exactly as if the MIDI handler had posted them
+	// directly, in the same order. Note tracking and the MIDI
+	// monitor move to the drain too, so all note state stays on
+	// the audio thread.
+	TMidiStage Stage;
+	while (m_MidiStage.TryPop(Stage))
+	{
+		if (Stage.nKind == 0)
+		{
+			m_pEmulator->PostMIDI(Stage.nB0);
+		}
+		else if (Stage.nKind == 1)
+		{
+			const u8 nStatus = Stage.nB0;
+			const u8 nData1  = Stage.nB1;
+			const u8 nData2  = Stage.nB2;
+
+			// System Reset (0xFF): the SC-55 firmware handles
+			// it as a quick parameter reset, not a reboot.
+			// Clear the held-note tracking to match the
+			// firmware's voices-off, then post the single byte.
+			// (DOSMID sends the illegal CC110=255 value raw;
+			// a host-side ResetForRestart() here rebooted the
+			// firmware and opened every Descent 2 song with a
+			// 2-3 s hole.)
+			if (nStatus == 0xFF)
+			{
+				m_nHeldNotes = 0;
+				m_bSustain = false;
+				m_bSustainedNotes = false;
+				m_pEmulator->PostMIDI(nStatus);
+				CSynthBase::HandleMIDIShortMessage(
+					static_cast<u32>(nStatus) |
+					(static_cast<u32>(nData1) << 8) |
+					(static_cast<u32>(nData2) << 16));
+				continue;
+			}
+
+			// Sounding-note tracking for power management: a
+			// note held, or held by the sustain pedal, keeps
+			// IsActive() true through quiet passages, so the
+			// clock cannot drop to power-save mid-performance.
+			// Note-off for a note that was sustained releases
+			// the sustain hold only when the pedal is already
+			// up; pedal-up releases all sustained notes at once.
+			if (nStatus < 0xF0)
+			{
+				const u8 nType = nStatus & 0xF0;
+				if (nType == 0x90 && nData2 > 0)
+					++m_nHeldNotes;
+				else if (nType == 0x80 || (nType == 0x90 && nData2 == 0))
+				{
+					if (m_bSustain && m_nHeldNotes > 0)
+					{
+						--m_nHeldNotes;
+						m_bSustainedNotes = true;
+					}
+					else if (m_nHeldNotes > 0)
+						--m_nHeldNotes;
+				}
+				else if (nType == 0xB0 && nData1 == 64)
+				{
+					m_bSustain = nData2 >= 64;
+					if (!m_bSustain)
+						m_bSustainedNotes = false;
+				}
+			}
+
+			// Post exactly the bytes the message carries; the
+			// emulated UART parses the stream like the real
+			// hardware, so an extra data byte would corrupt the
+			// following message.
+			u8 Bytes[3] = { nStatus, nData1, nData2 };
+			size_t nBytes;
+			if (nStatus < 0xF0)
+				nBytes = ((nStatus & 0xE0) == 0xC0) ? 2 : 3;
+			else if (nStatus == 0xF1 || nStatus == 0xF3)
+				nBytes = 2;
+			else if (nStatus == 0xF2)
+				nBytes = 3;
+			else
+				nBytes = 1;
+			m_pEmulator->PostMIDI(std::span<const uint8_t>(Bytes, nBytes));
+
+			// Update MIDI monitor
+			CSynthBase::HandleMIDIShortMessage(
+				static_cast<u32>(nStatus) |
+				(static_cast<u32>(nData1) << 8) |
+				(static_cast<u32>(nData2) << 16));
+		}
+		else if (Stage.nKind == 2)
+		{
+			// AllSoundOff: CC 120 (All Sound Off) and CC 123
+			// (All Notes Off) on every channel; the firmware
+			// handles them like real hardware.
+			for (u8 nChannel = 0; nChannel < 16; ++nChannel)
+			{
+				const u8 SoundOff[3] = { static_cast<u8>(0xB0 | nChannel), 120, 0 };
+				const u8 NotesOff[3] = { static_cast<u8>(0xB0 | nChannel), 123, 0 };
+				m_pEmulator->PostMIDI(std::span<const uint8_t>(SoundOff, sizeof(SoundOff)));
+				m_pEmulator->PostMIDI(std::span<const uint8_t>(NotesOff, sizeof(NotesOff)));
+			}
+
+			// Sounding-note tracking (see IsActive): an All
+			// Sound Off clears every held/sustained note.
+			m_nHeldNotes = 0;
+			m_bSustain = false;
+			m_bSustainedNotes = false;
+
+			// Reset MIDI monitor
+			CSynthBase::AllSoundOff();
+		}
+	}
+}
+
 size_t CNukedSC55Synth::RenderFrames(float* pOutBuffer, size_t nFrames)
 {
 	if (!m_pEmulator)
@@ -907,14 +991,30 @@ size_t CNukedSC55Synth::RenderFrames(float* pOutBuffer, size_t nFrames)
 		return nFrames;
 	}
 
-	const float nScale = m_nGain * (static_cast<float>(m_nVolume) / 100.0f);
-
 	CDiagLog& DiagLog        = CDiagLog::Get();
 	const bool bDiag         = DiagLog.IsEnabled();
 	const u64 nStartUs       = bDiag ? CTimer::Get()->GetClockTicks() : 0;
 	u64 nUnderrunFrames      = 0;
 
 	m_Lock.Acquire();
+
+	// Lock-free MIDI input: drain the staged queue before
+	// stepping, so staged bytes land in the emulated UART ahead
+	// of the MCU ticks that consume them.
+	DrainMidiStage();
+
+	// Volume ramp: if the target moved (SetMasterVolume, or a
+	// ResetVolumeRamp() fade-in from a synth switch), (re)start a
+	// linear ramp from the currently applied volume over
+	// VolumeRampFrames. NextVolumeScale() advances it once per
+	// output frame below.
+	const float fVolumeTarget = static_cast<float>(m_nVolume) / 100.0f;
+	if (fVolumeTarget != m_fVolumeRampTarget)
+	{
+		m_fVolumeRampTarget = fVolumeTarget;
+		m_nVolumeRampFrames = VolumeRampFrames;
+		m_fVolumeRampStep = (fVolumeTarget - m_fVolumeApplied) / static_cast<float>(VolumeRampFrames);
+	}
 
 	// Frames the streaming resampler below will need for this call:
 	// the position advance, plus the interpolation endpoint, the
@@ -1058,8 +1158,9 @@ size_t CNukedSC55Synth::RenderFrames(float* pOutBuffer, size_t nFrames)
 				nAccL += nCoeff * m_FirHist[nSlot * 2];
 				nAccR += nCoeff * m_FirHist[nSlot * 2 + 1];
 			}
-			pOutBuffer[nDone * 2] = nAccL * nScale;
-			pOutBuffer[nDone * 2 + 1] = nAccR * nScale;
+			const float fScale = NextVolumeScale();
+			pOutBuffer[nDone * 2] = nAccL * fScale;
+			pOutBuffer[nDone * 2 + 1] = nAccR * fScale;
 			++m_FirOutIndex;
 			m_FirPhase = (m_FirPhase + 1) % 3;
 		}
@@ -1108,8 +1209,9 @@ size_t CNukedSC55Synth::RenderFrames(float* pOutBuffer, size_t nFrames)
 			const float w1 = 1.0f - 2.5f * t2 + 1.5f * t3;
 			const float w2 = 0.5f * t + 2.0f * t2 - 1.5f * t3;
 			const float w3 = -0.5f * t2 + 0.5f * t3;
-			pOutBuffer[nDone * 2] = (w0 * m_CubicPrev.nLeft + w1 * m_CubicA.nLeft + w2 * m_CubicB.nLeft + w3 * m_CubicNext.nLeft) * nScale;
-			pOutBuffer[nDone * 2 + 1] = (w0 * m_CubicPrev.nRight + w1 * m_CubicA.nRight + w2 * m_CubicB.nRight + w3 * m_CubicNext.nRight) * nScale;
+			const float fScale = NextVolumeScale();
+			pOutBuffer[nDone * 2] = (w0 * m_CubicPrev.nLeft + w1 * m_CubicA.nLeft + w2 * m_CubicB.nLeft + w3 * m_CubicNext.nLeft) * fScale;
+			pOutBuffer[nDone * 2 + 1] = (w0 * m_CubicPrev.nRight + w1 * m_CubicA.nRight + w2 * m_CubicB.nRight + w3 * m_CubicNext.nRight) * fScale;
 
 			m_dReadFrac += m_dResampleRatio;
 		}
@@ -1142,8 +1244,9 @@ size_t CNukedSC55Synth::RenderFrames(float* pOutBuffer, size_t nFrames)
 				break;
 
 			const float nFrac = static_cast<float>(m_dReadFrac);
-			pOutBuffer[nDone * 2]     = (m_SampleA.nLeft + (m_SampleB.nLeft - m_SampleA.nLeft) * nFrac) * nScale;
-			pOutBuffer[nDone * 2 + 1] = (m_SampleA.nRight + (m_SampleB.nRight - m_SampleA.nRight) * nFrac) * nScale;
+			const float fScale = NextVolumeScale();
+			pOutBuffer[nDone * 2]     = (m_SampleA.nLeft + (m_SampleB.nLeft - m_SampleA.nLeft) * nFrac) * fScale;
+			pOutBuffer[nDone * 2 + 1] = (m_SampleA.nRight + (m_SampleB.nRight - m_SampleA.nRight) * nFrac) * fScale;
 
 			m_dReadFrac += m_dResampleRatio;
 		}

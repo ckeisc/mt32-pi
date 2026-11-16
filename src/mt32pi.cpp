@@ -1511,6 +1511,13 @@ void CMT32Pi::SwitchSynth(TSynth NewSynth)
 
 	CSynthBase* pOldSynth = m_pCurrentSynth;
 	m_pCurrentSynth->AllSoundOff();
+	// Fade-in on switch: reset the new synth's volume ramp so it
+	// starts from silence and ramps up to the master volume over
+	// ~5 ms instead of starting at full volume mid-signal. No-op
+	// for synths without a ramp (EmuSC, SoundFont, Munt). Called
+	// before the pointer swap, so the audio thread is not
+	// rendering the new synth yet.
+	pNewSynth->ResetVolumeRamp();
 	m_pCurrentSynth = pNewSynth;
 	const char* pMode = GetSynthMode(pNewSynth);
 	LOGNOTE("Switching to %s", pMode);

@@ -26,6 +26,7 @@
 #include <circle/types.h>
 
 #include "ringbuffer.h"
+#include "synth/mu50spsc.h"
 #include "synth/synthbase.h"
 #include "utility.h"
 
@@ -111,6 +112,10 @@ public:
 	virtual bool IsActive() override;
 	virtual void AllSoundOff() override;
 	virtual void SetMasterVolume(u8 nVolume) override;
+	// Fade-in on synth switch: reset the applied volume to silence
+	// so the next Render ramps up to the target over VolumeRampFrames
+	// instead of starting at full volume mid-signal. Takes m_Lock.
+	void ResetVolumeRamp() override;
 	virtual size_t Render(s16* pOutBuffer, size_t nFrames) override;
 	virtual size_t Render(float* pOutBuffer, size_t nFrames) override;
 
@@ -172,6 +177,15 @@ private:
 
 	void OnSample(s32 nLeft, s32 nRight);
 	size_t RenderFrames(float* pOutBuffer, size_t nFrames);
+	// Drain the staged-MIDI queue (see m_MidiStage): posts staged
+	// bytes/messages to the emulator, updates note tracking and the
+	// MIDI monitor, all on the audio thread. Called from
+	// RenderFrames after acquiring m_Lock, before stepping.
+	void DrainMidiStage();
+	// Volume scale for the next output frame (m_nGain * applied
+	// volume), advancing the ramp by one frame. Called exactly once
+	// per output frame, in order, from RenderFrames.
+	float NextVolumeScale();
 
 	// Split lifecycle: stop the PCM task and clear g_splitT (waits
 	// for the PCM idle ack, bounded; returns false on timeout, in
@@ -195,6 +209,20 @@ private:
 	float m_nGain;
 	bool m_bOversampling;
 	u8 m_nVolume;
+
+	// Master-volume ramp: SetMasterVolume only stores the target
+	// (m_nVolume); the applied volume chases it over ~5 ms so a
+	// volume change is a smooth ramp, not a gain step at the next
+	// Render call. The ramp is advanced once per output frame by
+	// NextVolumeScale(), so it spans Render calls. Audio-thread
+	// only (RenderFrames holds m_Lock); ResetVolumeRamp() also
+	// takes m_Lock, so a synth switch can force a fade-in from
+	// silence without racing the audio thread.
+	static constexpr size_t VolumeRampFrames = 240; // ~5 ms at 48 kHz
+	float m_fVolumeApplied;    // currently applied volume, 0.0-1.0
+	float m_fVolumeRampTarget; // target the current ramp heads toward
+	float m_fVolumeRampStep;   // per-frame step toward the target
+	size_t m_nVolumeRampFrames; // frames remaining in the current ramp
 
 	unsigned m_nNativeRate;
 	double m_dResampleRatio;	// Native frames consumed per output frame
@@ -287,6 +315,26 @@ private:
 	unsigned m_nHeldNotes = 0;
 	bool m_bSustain = false;
 	bool m_bSustainedNotes = false;
+
+	// Lock-free MIDI input (single-producer/single-consumer):
+	// the MIDI thread (core 0) stages messages here without taking
+	// m_Lock, and RenderFrames (core 2, audio thread) drains them
+	// into the emulator before stepping. This removes the lock
+	// contention where core 0 spun waiting for a whole Render to
+	// finish before it could post MIDI. Mirrors MU50's m_MidiStage.
+	// Kinds: 0 = one raw byte (SysEx), 1 = short message
+	// (nB0=status, nB1=data1, nB2=data2), 2 = AllSoundOff.
+	struct TMidiStage
+	{
+		u8 nKind;
+		u8 nB0;
+		u8 nB1;
+		u8 nB2;
+	};
+	mu50spsc::TSpscQueue<TMidiStage, 1024> m_MidiStage;
+	// Staged entries dropped because the queue was full (diagnostic;
+	// the queue holds 1023 entries, far above any MIDI burst).
+	u32 m_nStageDrops = 0;
 
 
 	char m_ModelName[16];
