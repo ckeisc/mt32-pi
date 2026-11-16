@@ -329,9 +329,29 @@ private:
 	// [3]=mixer panl, [4]=mixer panr. Seqlock: m_nStateSeq is odd
 	// while the SWP thread is writing, even when stable, 0 when no
 	// snapshot has been published yet. __atomic access everywhere.
+	// Fences (Copilot review on PR #12): the writer puts a RELEASE
+	// fence after the odd bump so the data stores cannot become
+	// visible before the odd seq, and the reader puts an ACQUIRE
+	// fence between the copy and the nSeq1 load so the copy cannot
+	// be reordered after the check. Without them the seqlock is
+	// unsound on ARM's weak ordering. Strictly, the plain data
+	// accesses are still a data race in the C++ sense; the fences
+	// make the seqlock correct, relaxed byte-wise atomics or a
+	// double-buffer would remove the race entirely.
 	u8 m_StateSnapVoice[32][5];
 	u32 m_StateSnapCounter;
 	u32 m_nStateSeq;
+	// Last-good snapshot copy, audio-side only (Copilot review on
+	// PR #12): the last successfully seqlock-read snapshot. If a
+	// read cannot get a clean snapshot within its retry bound, it
+	// returns state_r from this copy instead of falling back to the
+	// echo (which would return the state address -- the bug the
+	// snapshot fix removed). m_bLastGoodValid is false until the
+	// first clean read. Only the "no snapshot yet" case (m_nStateSeq
+	// == 0, boot only) ever uses the echo.
+	u8 m_LastGoodVoice[32][5];
+	u32 m_LastGoodCounter;
+	bool m_bLastGoodValid;
 	struct TNativeFrame
 	{
 		s16 nLeft;

@@ -143,6 +143,9 @@ CMU50Synth::CMU50Synth(unsigned nSampleRate, float nGain, TMU50Resampler Resampl
 	  m_StateSnapVoice{},
 	  m_StateSnapCounter(0),
 	  m_nStateSeq(0),
+	  m_LastGoodVoice{},
+	  m_LastGoodCounter(0),
+	  m_bLastGoodValid(false),
 	  m_NativeRing{},
 	  m_PublishedBlocks{},
 	  m_MidiStage{},
@@ -513,19 +516,42 @@ u8 CMU50Synth::OnH8SwpRead(u16 nAddr)
 	// M2 harness stub behavior.
 	if (nAddr == 0x01)
 	{
-		for (int nTry = 0; nTry < 3; ++nTry)
+		// Seqlock read (Copilot review on PR #12): spin while the SWP
+		// thread is mid-write (odd seq) -- the writer's critical
+		// section is only ~160 bytes, so it finishes quickly. Never
+		// fall back to the echo on a torn read: the echo returns the
+		// state address, which is exactly the bug this fix removes.
+		// Only the "no snapshot yet" case (seq == 0, boot only) uses
+		// the echo. If the retry bound is hit, return state_r from
+		// the last-good copy instead.
+		for (int nTry = 0; nTry < 10; ++nTry)
 		{
 			const u32 nSeq0 = __atomic_load_n(&m_nStateSeq, __ATOMIC_ACQUIRE);
-			if ((nSeq0 & 1) != 0 || nSeq0 == 0)
-				break; // SWP mid-write, or no snapshot yet: fall through to echo
+			if (nSeq0 == 0)
+				break; // no snapshot yet (boot only): fall through to echo
+			if ((nSeq0 & 1) != 0)
+				continue; // SWP mid-write: spin, do not echo
 			u8 Voice[32][5];
 			for (int c = 0; c < 32; ++c)
 				for (int s = 0; s < 5; ++s)
 					Voice[c][s] = m_StateSnapVoice[c][s];
 			const u32 nCounter = m_StateSnapCounter;
+			// ACQUIRE fence: the copy above must not be reordered
+			// after the nSeq1 load. An acquire load on nSeq1 keeps
+			// later accesses from moving above it, but not earlier
+			// ones from moving below it, so without this fence the
+			// copy could be performed after the check. (Copilot
+			// review on PR #12; matters on ARM.)
+			__atomic_thread_fence(__ATOMIC_ACQUIRE);
 			const u32 nSeq1 = __atomic_load_n(&m_nStateSeq, __ATOMIC_ACQUIRE);
 			if (nSeq0 != nSeq1)
 				continue; // torn read: retry
+			// Clean read: save as last-good, then compute state_r.
+			for (int c = 0; c < 32; ++c)
+				for (int s = 0; s < 5; ++s)
+					m_LastGoodVoice[c][s] = Voice[c][s];
+			m_LastGoodCounter = nCounter;
+			m_bLastGoodValid = true;
 			const u8 nStateAddr = m_SwpShadow[1];
 			const int nChan = nStateAddr & 0x1f;
 			switch (nStateAddr >> 5)
@@ -536,6 +562,25 @@ u8 CMU50Synth::OnH8SwpRead(u16 nAddr)
 			case 3: return Voice[nChan][2]; // mixer_status_glo
 			case 4: return Voice[nChan][3]; // mixer_status_panl
 			case 5: return Voice[nChan][4]; // mixer_status_panr
+			default: return 0;
+			}
+		}
+		// Retry bound hit: return state_r from the last-good copy
+		// rather than the echo. (If there is no last-good copy, no
+		// snapshot was ever published, so fall through to the echo
+		// below -- boot only.)
+		if (m_bLastGoodValid)
+		{
+			const u8 nStateAddr = m_SwpShadow[1];
+			const int nChan = nStateAddr & 0x1f;
+			switch (nStateAddr >> 5)
+			{
+			case 0: return m_LastGoodVoice[nChan][0];
+			case 1: return static_cast<u8>(0xc0 | (m_LastGoodCounter >> 13));
+			case 2: return m_LastGoodVoice[nChan][1];
+			case 3: return m_LastGoodVoice[nChan][2];
+			case 4: return m_LastGoodVoice[nChan][3];
+			case 5: return m_LastGoodVoice[nChan][4];
 			default: return 0;
 			}
 		}
@@ -1468,6 +1513,12 @@ void CMU50Synth::PCMTaskIteration()
 		libmu50::Synth::StateSnapshot Snap;
 		m_pSynth->snapshot_state(Snap);
 		__atomic_add_fetch(&m_nStateSeq, 1, __ATOMIC_RELAXED); // -> odd
+		// RELEASE fence: the plain data stores below must not become
+		// visible before the odd sequence number. On ARM (weak
+		// ordering) a RELAXED bump alone does not order them, so a
+		// reader could see the new seq with stale data. (Copilot
+		// review on PR #12.)
+		__atomic_thread_fence(__ATOMIC_RELEASE);
 		for (int c = 0; c < 32; ++c)
 			for (int s = 0; s < 5; ++s)
 				m_StateSnapVoice[c][s] = Snap.voice[c][s];

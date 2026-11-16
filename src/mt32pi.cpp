@@ -1592,8 +1592,10 @@ void CMT32Pi::SetMasterVolume(s32 nVolume)
 		m_pEmuSCSynth->SetMasterVolume(m_nMasterVolume);
 	if (m_pNukedSC55Synth)
 		m_pNukedSC55Synth->SetMasterVolume(m_nMasterVolume);
+	if (m_pMU50Synth)
+		m_pMU50Synth->SetMasterVolume(m_nMasterVolume);
 
-	if (m_pCurrentSynth == m_pSoundFontSynth || m_pCurrentSynth == m_pEmuSCSynth || m_pCurrentSynth == m_pNukedSC55Synth)
+	if (m_pCurrentSynth == m_pSoundFontSynth || m_pCurrentSynth == m_pEmuSCSynth || m_pCurrentSynth == m_pNukedSC55Synth || m_pCurrentSynth == m_pMU50Synth)
 		LCDLog(TLCDLogType::Notice, "Volume: %d", m_nMasterVolume);
 }
 
