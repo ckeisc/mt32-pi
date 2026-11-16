@@ -36,6 +36,7 @@
 #include "lcd/ui.h"
 #include "synth/mu50synth.h"
 #include "synth/mu50h8.h"
+#include "synth/fir44k48k.h"
 #include "utility.h"
 
 // libmu50 headers are only included here (this file is compiled as C++17;
@@ -97,7 +98,7 @@ void MU50H8Sci1RdrRead(void* pCtx)
 
 }
 
-CMU50Synth::CMU50Synth(unsigned nSampleRate, float nGain)
+CMU50Synth::CMU50Synth(unsigned nSampleRate, float nGain, TMU50Resampler Resampler)
 	: CSynthBase(nSampleRate),
 	  m_pSynth(nullptr),
 	  m_pH8(nullptr),
@@ -133,6 +134,8 @@ CMU50Synth::CMU50Synth(unsigned nSampleRate, float nGain)
 	  m_LeftoverSample{},
 	  m_NativeScratch{},
 	  m_FloatScratch{},
+	  m_Resampler(Resampler),
+	  m_FirHistory{},
 	  m_WEventFifo{},
 	  m_nWEventFifoCap(kWEventFifoSize - 1),
 	  m_SwpShadow{},
@@ -684,9 +687,11 @@ void CMU50Synth::QueueMIDIMessageBytes(u8 nStatus, u8 nData1, u8 nData2)
 // driver sends queued bytes at 31250 baud whenever the line is idle,
 // and the SCI only samples them once the firmware enables RX, so MIDI
 // sent while the firmware is still booting is dropped, as on hardware.
-// Note: the H8 MIDI queue is 256 bytes and drops on overrun, so a
+// Note: the H8 MIDI queue is 4096 bytes and drops on overrun, so a
 // single SysEx longer than that truncates (short control SysExes,
-// including XG/GM resets, are unaffected).
+// including XG/GM resets, are unaffected). The SCI receiver has a
+// 256-byte RX FIFO behind the RDR, so a dense SysEx burst is not
+// lost to RDR overrun while the firmware drains it.
 void CMU50Synth::HandleMIDIShortMessage(u32 nMessage)
 {
 	const u8 nStatus = nMessage & 0xFF;
@@ -911,27 +916,83 @@ double CMU50Synth::ResamplePulledBlock(float* pOutBuffer, size_t nOutDone,
 		return NativeFrame(nIndex - 1);
 	};
 
-	for (size_t i = 0; i < nBlockOut; ++i)
+	if (m_Resampler == TMU50Resampler::Kaiser)
 	{
-		const double dPos = dBlockStart + static_cast<double>(i) * dRatio;
-		const size_t nIndex = static_cast<size_t>(dPos);
-		const double dFrac  = dPos - static_cast<double>(nIndex);
-		const s16* pFrameM1 = PrevFrame(nIndex);
-		const s16* pFrame0 = NativeFrame(nIndex);
-		const s16* pFrame1 = NativeFrame(nIndex + 1);
-		const s16* pFrame2 = NativeFrame(nIndex + 2);
-		// Catmull-Rom weights (identical to Nuked's cubic)
-		const float t = static_cast<float>(dFrac);
-		const float t2 = t * t;
-		const float t3 = t2 * t;
-		const float w0 = -0.5f * t + t2 - 0.5f * t3;
-		const float w1 = 1.0f - 2.5f * t2 + 1.5f * t3;
-		const float w2 = 0.5f * t + 2.0f * t2 - 1.5f * t3;
-		const float w3 = -0.5f * t2 + 0.5f * t3;
-		const float fLeft  = (w0 * pFrameM1[0] + w1 * pFrame0[0] + w2 * pFrame1[0] + w3 * pFrame2[0]) / 32768.0f;
-		const float fRight = (w0 * pFrameM1[1] + w1 * pFrame0[1] + w2 * pFrame1[1] + w3 * pFrame2[1]) / 32768.0f;
-		pOutBuffer[(nOutDone + i) * 2]     = fLeft * fScale;
-		pOutBuffer[(nOutDone + i) * 2 + 1] = fRight * fScale;
+		// 64-tap polyphase windowed-sinc FIR (kFir44k48k, flat to
+		// 20 kHz). Tap 0 is the frame 31 before the interpolation
+		// point, tap 63 is 32 after it. Negative indices read the
+		// carried history (m_FirHistory); the enlarged native-render
+		// margin supplies the lookahead.
+		auto FirFrame = [&](long nIdx) -> const s16*
+		{
+			if (nIdx < 0)
+				return m_FirHistory[32 + nIdx];
+			return NativeFrame(static_cast<size_t>(nIdx));
+		};
+		// Fast path: when all 64 taps lie in the scratch (the common
+		// case -- only the first outputs of a block touch the carried
+		// history), run a plain pointer loop the compiler can
+		// vectorize (NEON) instead of a lambda call per tap. The
+		// per-tap lambda was ~600 us/callback (diag-38 max_us over
+		// the 5.33 ms budget) and made the FIR sound broken.
+		const long nScratchBase = m_bResamplePrimed ? 2 : 0;
+		for (size_t i = 0; i < nBlockOut; ++i)
+		{
+			const double dPos = dBlockStart + static_cast<double>(i) * dRatio;
+			const size_t nIndex = static_cast<size_t>(dPos);
+			const double dFrac  = dPos - static_cast<double>(nIndex);
+			size_t nPhase = static_cast<size_t>(dFrac * 256.0);
+			if (nPhase >= 256)
+				nPhase = 255;
+			const float* pCoeff = kFir44k48k[nPhase];
+			const long nBase = static_cast<long>(nIndex) - 31;
+			float fLeft = 0.0f, fRight = 0.0f;
+			if (nBase >= nScratchBase)
+			{
+				const s16* pS = &m_NativeScratch[(static_cast<size_t>(nBase - nScratchBase)) * 2];
+				for (size_t t = 0; t < 64; ++t)
+				{
+					fLeft  += pCoeff[t] * static_cast<float>(pS[t * 2]);
+					fRight += pCoeff[t] * static_cast<float>(pS[t * 2 + 1]);
+				}
+			}
+			else
+			{
+				for (size_t t = 0; t < 64; ++t)
+				{
+					const s16* pF = FirFrame(nBase + static_cast<long>(t));
+					fLeft  += pCoeff[t] * static_cast<float>(pF[0]);
+					fRight += pCoeff[t] * static_cast<float>(pF[1]);
+				}
+			}
+			pOutBuffer[(nOutDone + i) * 2]     = (fLeft / 32768.0f) * fScale;
+			pOutBuffer[(nOutDone + i) * 2 + 1] = (fRight / 32768.0f) * fScale;
+		}
+	}
+	else
+	{
+		for (size_t i = 0; i < nBlockOut; ++i)
+		{
+			const double dPos = dBlockStart + static_cast<double>(i) * dRatio;
+			const size_t nIndex = static_cast<size_t>(dPos);
+			const double dFrac  = dPos - static_cast<double>(nIndex);
+			const s16* pFrameM1 = PrevFrame(nIndex);
+			const s16* pFrame0 = NativeFrame(nIndex);
+			const s16* pFrame1 = NativeFrame(nIndex + 1);
+			const s16* pFrame2 = NativeFrame(nIndex + 2);
+			// Catmull-Rom weights (identical to Nuked's cubic)
+			const float t = static_cast<float>(dFrac);
+			const float t2 = t * t;
+			const float t3 = t2 * t;
+			const float w0 = -0.5f * t + t2 - 0.5f * t3;
+			const float w1 = 1.0f - 2.5f * t2 + 1.5f * t3;
+			const float w2 = 0.5f * t + 2.0f * t2 - 1.5f * t3;
+			const float w3 = -0.5f * t2 + 0.5f * t3;
+			const float fLeft  = (w0 * pFrameM1[0] + w1 * pFrame0[0] + w2 * pFrame1[0] + w3 * pFrame2[0]) / 32768.0f;
+			const float fRight = (w0 * pFrameM1[1] + w1 * pFrame0[1] + w2 * pFrame1[1] + w3 * pFrame2[1]) / 32768.0f;
+			pOutBuffer[(nOutDone + i) * 2]     = fLeft * fScale;
+			pOutBuffer[(nOutDone + i) * 2 + 1] = fRight * fScale;
+		}
 	}
 
 	// Carry three frames into the next block: the frame before
@@ -953,6 +1014,28 @@ double CMU50Synth::ResamplePulledBlock(float* pOutBuffer, size_t nOutDone,
 	m_LeftoverSample[1][0] = pLeftover1[0];
 	m_LeftoverSample[1][1] = pLeftover1[1];
 	m_bResamplePrimed = true;
+	// Kaiser FIR history: carry the 32 frames before the next
+	// block's boundary (effective index nConsumed) so the FIR's
+	// negative taps read real audio. Missing frames (first block)
+	// stay silence.
+	if (m_Resampler == TMU50Resampler::Kaiser)
+	{
+		for (size_t j = 0; j < 32; ++j)
+		{
+			long nIdx = static_cast<long>(nConsumed) - 32 + static_cast<long>(j);
+			if (nIdx >= 0)
+			{
+				const s16* pF = NativeFrame(static_cast<size_t>(nIdx));
+				m_FirHistory[j][0] = pF[0];
+				m_FirHistory[j][1] = pF[1];
+			}
+			else
+			{
+				m_FirHistory[j][0] = 0;
+				m_FirHistory[j][1] = 0;
+			}
+		}
+	}
 	return dEndPos - static_cast<double>(nConsumed);
 
 }
@@ -978,26 +1061,30 @@ void CMU50Synth::RenderResampled(float* pOutBuffer, size_t nFrames)
 	size_t nOutDone = 0;
 	while (nOutDone < nFrames)
 	{
-		// Cap the block so the native frames it needs fit the scratch
-		const size_t nMaxBlockOut = static_cast<size_t>((kNativeScratchFrames - 3) / dRatio);
+		// Cap the block so the native frames it needs fit the scratch.
+		// Kaiser FIR needs 30 more native frames than the cubic (32
+		// lookahead taps vs the cubic's 2), so the margin is
+		// resampler-dependent; the cubic path is unchanged.
+		const size_t nMargin = (m_Resampler == TMU50Resampler::Kaiser) ? 33 : 3;
+		const size_t nMaxBlockOut = static_cast<size_t>((kNativeScratchFrames - nMargin) / dRatio);
 		const size_t nBlockOut = Utility::Min(nFrames - nOutDone,
 		                                      Utility::Max(static_cast<size_t>(1), nMaxBlockOut));
 
 		// Native frames to render: primed blocks render up to one
 		// past the new leftover pair (the cubic's next tap); the
 		// first block has no carried frames and renders three extra
-		// (pair + next tap)
+		// (pair + next tap). Kaiser adds 30 for the FIR lookahead.
 		double dBlockStart;
 		size_t nNativeRender;
 		if (m_bResamplePrimed)
 		{
 			dBlockStart   = m_dResampleCarry;
-			nNativeRender = static_cast<size_t>(dBlockStart + nBlockOut * dRatio) + 1;
+			nNativeRender = static_cast<size_t>(dBlockStart + nBlockOut * dRatio) + 1 + (nMargin - 3);
 		}
 		else
 		{
 			dBlockStart   = 0.0;
-			nNativeRender = static_cast<size_t>(nBlockOut * dRatio) + 3;
+			nNativeRender = static_cast<size_t>(nBlockOut * dRatio) + nMargin;
 		}
 
 		// Advance the firmware by the time this block represents, so
@@ -1172,7 +1259,11 @@ void CMU50Synth::RenderResampledSplit(float* pOutBuffer, size_t nFrames)
 	m_nPendingCount = 0;
 	while (nOutDone < nFrames)
 	{
-		const size_t nMaxBlockOut = static_cast<size_t>((kNativeScratchFrames - 3) / dRatio);
+		// Kaiser FIR needs 30 more native frames than the cubic
+		// (32 lookahead taps vs the cubic's 2); the margin is
+		// resampler-dependent so the cubic path is unchanged.
+		const size_t nMargin = (m_Resampler == TMU50Resampler::Kaiser) ? 33 : 3;
+		const size_t nMaxBlockOut = static_cast<size_t>((kNativeScratchFrames - nMargin) / dRatio);
 		const size_t nBlockOut = Utility::Min(nFrames - nOutDone,
 		                                      Utility::Max(static_cast<size_t>(1), nMaxBlockOut));
 		double dBlockStart;
@@ -1180,12 +1271,12 @@ void CMU50Synth::RenderResampledSplit(float* pOutBuffer, size_t nFrames)
 		if (bPrimedVirt)
 		{
 			dBlockStart   = dCarry;
-			nNativeRender = static_cast<size_t>(dBlockStart + nBlockOut * dRatio) + 1;
+			nNativeRender = static_cast<size_t>(dBlockStart + nBlockOut * dRatio) + 1 + (nMargin - 3);
 		}
 		else
 		{
 			dBlockStart   = 0.0;
-			nNativeRender = static_cast<size_t>(nBlockOut * dRatio) + 3;
+			nNativeRender = static_cast<size_t>(nBlockOut * dRatio) + nMargin;
 		}
 		// Advance + publish (drains staging, steps H8, publishes).
 		AdvanceH8(nNativeRender);

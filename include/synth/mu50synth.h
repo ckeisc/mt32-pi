@@ -48,10 +48,18 @@ namespace mu50h8
 	class Mu50H8;
 }
 
+// 64-tap polyphase FIR (default, best quality); cubic is Catmull-Rom
+// (4 taps, ~16x cheaper). Mirrors the Nuked's TNukedResampler.
+enum class TMU50Resampler
+{
+	Kaiser,
+	Cubic
+};
+
 class CMU50Synth : public CSynthBase
 {
 public:
-	CMU50Synth(unsigned nSampleRate, float nGain);
+	CMU50Synth(unsigned nSampleRate, float nGain, TMU50Resampler Resampler);
 	virtual ~CMU50Synth() override;
 
 	// CSynthBase
@@ -234,6 +242,17 @@ private:
 	s16 m_LeftoverSample[2][2];
 	s16 m_NativeScratch[2 * kNativeScratchFrames];
 	float m_FloatScratch[1024];
+
+	// Kaiser FIR resampler state (high-quality option, mirroring
+	// the Nuked's Kaiser FIR). The 64-tap polyphase windowed-sinc
+	// needs 31 frames of history before the block boundary and 32
+	// frames of lookahead past it; the history is carried here
+	// (the lookahead comes from the enlarged native-render margin).
+	// m_FirHistory holds the 32 native frames immediately before
+	// the current block's first effective frame (index 0), so the
+	// FIR tap at effective index k<0 reads m_FirHistory[32+k].
+	TMU50Resampler m_Resampler;
+	s16 m_FirHistory[32][2];
 
 	// M1: W-event FIFO + native sample ring (single-core refactor;
 	// no cores yet). The audio core pushes cycle-stamped W records

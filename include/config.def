@@ -102,6 +102,7 @@ END_SECTION
 
 BEGIN_SECTION(mu50)
 CFG(gain,			float,			MU50Gain,					1.0f						)
+CFG(resampler,		CString,		MU50Resampler,			"cubic"					)
 END_SECTION
 
 BEGIN_SECTION(lcd)
