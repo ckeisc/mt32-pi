@@ -90,6 +90,7 @@ public:
 	virtual bool IsActive() override;
 	virtual void AllSoundOff() override;
 	virtual void SetMasterVolume(u8 nVolume) override;
+	void ResetVolumeRamp() override;
 	virtual size_t Render(s16* pOutBuffer, size_t nFrames) override;
 	virtual size_t Render(float* pOutBuffer, size_t nFrames) override;
 	virtual void ReportStatus() const override;
@@ -170,6 +171,10 @@ private:
 	// nNativeRender frames on entry. Returns the new fractional
 	// carry. Audio-thread only.
 	double ResamplePulledBlock(float* pOutBuffer, size_t nOutDone, size_t nBlockOut, double dBlockStart, size_t nNativeRender);
+	// Volume scale for the next output frame (m_nGain * applied
+	// volume), advancing the ramp by one frame. Called exactly once
+	// per output frame, in order, from ResamplePulledBlock.
+	float NextVolumeScale();
 
 	// Wait for the oldest pending block's frames, pull them into
 	// m_NativeScratch, and resample them. Audio-thread only.
@@ -251,6 +256,20 @@ private:
 
 	float m_nGain;
 	u8 m_nVolume;
+
+	// Master-volume ramp (same shape as Nuked): SetMasterVolume only
+	// stores the target; the applied volume chases it over ~5 ms so
+	// a volume change is a smooth ramp, not a gain step at the next
+	// Render call. Advanced once per output frame by
+	// NextVolumeScale(), so it spans ResamplePulledBlock calls.
+	// Audio-thread only; ResetVolumeRamp() is called by SwitchSynth
+	// before this synth becomes current, so the audio thread is not
+	// rendering it yet.
+	static constexpr size_t VolumeRampFrames = 240; // ~5 ms at 48 kHz
+	float m_fVolumeApplied;    // currently applied volume, 0.0-1.0
+	float m_fVolumeRampTarget; // target the current ramp heads toward
+	float m_fVolumeRampStep;   // per-frame step toward the target
+	size_t m_nVolumeRampFrames; // frames remaining in the current ramp
 
 	// Cubic Catmull-Rom resampler state (same 4-tap weights as
 	// Nuked's cubic resampler; implemented locally so Nuked's files

@@ -111,6 +111,10 @@ public:
 	virtual bool IsActive() override;
 	virtual void AllSoundOff() override;
 	virtual void SetMasterVolume(u8 nVolume) override;
+	// Fade-in on synth switch: reset the applied volume to silence
+	// so the next Render ramps up to the target over VolumeRampFrames
+	// instead of starting at full volume mid-signal. Takes m_Lock.
+	void ResetVolumeRamp() override;
 	virtual size_t Render(s16* pOutBuffer, size_t nFrames) override;
 	virtual size_t Render(float* pOutBuffer, size_t nFrames) override;
 
@@ -172,6 +176,10 @@ private:
 
 	void OnSample(s32 nLeft, s32 nRight);
 	size_t RenderFrames(float* pOutBuffer, size_t nFrames);
+	// Volume scale for the next output frame (m_nGain * applied
+	// volume), advancing the ramp by one frame. Called exactly once
+	// per output frame, in order, from RenderFrames.
+	float NextVolumeScale();
 
 	// Split lifecycle: stop the PCM task and clear g_splitT (waits
 	// for the PCM idle ack, bounded; returns false on timeout, in
@@ -195,6 +203,20 @@ private:
 	float m_nGain;
 	bool m_bOversampling;
 	u8 m_nVolume;
+
+	// Master-volume ramp: SetMasterVolume only stores the target
+	// (m_nVolume); the applied volume chases it over ~5 ms so a
+	// volume change is a smooth ramp, not a gain step at the next
+	// Render call. The ramp is advanced once per output frame by
+	// NextVolumeScale(), so it spans Render calls. Audio-thread
+	// only (RenderFrames holds m_Lock); ResetVolumeRamp() also
+	// takes m_Lock, so a synth switch can force a fade-in from
+	// silence without racing the audio thread.
+	static constexpr size_t VolumeRampFrames = 240; // ~5 ms at 48 kHz
+	float m_fVolumeApplied;    // currently applied volume, 0.0-1.0
+	float m_fVolumeRampTarget; // target the current ramp heads toward
+	float m_fVolumeRampStep;   // per-frame step toward the target
+	size_t m_nVolumeRampFrames; // frames remaining in the current ramp
 
 	unsigned m_nNativeRate;
 	double m_dResampleRatio;	// Native frames consumed per output frame

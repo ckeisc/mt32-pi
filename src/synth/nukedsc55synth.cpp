@@ -260,6 +260,10 @@ CNukedSC55Synth::CNukedSC55Synth(unsigned nSampleRate, float nGain, bool bOversa
 	  m_nGain(nGain),
 	  m_bOversampling(bOversampling),
 	  m_nVolume(100),
+	  m_fVolumeApplied(1.0f),
+	  m_fVolumeRampTarget(1.0f),
+	  m_fVolumeRampStep(0.0f),
+	  m_nVolumeRampFrames(0),
 	  m_nNativeRate(0),
 	  m_dResampleRatio(1.0),
 	  m_dReadFrac(0.0),
@@ -846,7 +850,35 @@ void CNukedSC55Synth::SetMasterVolume(u8 nVolume)
 {
 	// The emulated firmware owns its internal levels; mt32-pi's master
 	// volume is applied as an output scale in Render(), like the gain.
+	// Only the target is stored here; RenderFrames ramps the applied
+	// volume toward it (see NextVolumeScale()).
 	m_nVolume = nVolume;
+}
+
+float CNukedSC55Synth::NextVolumeScale()
+{
+	const float fScale = m_nGain * m_fVolumeApplied;
+	if (m_nVolumeRampFrames > 0)
+	{
+		m_fVolumeApplied += m_fVolumeRampStep;
+		if (--m_nVolumeRampFrames == 0)
+			m_fVolumeApplied = m_fVolumeRampTarget;
+	}
+	return fScale;
+}
+
+void CNukedSC55Synth::ResetVolumeRamp()
+{
+	// Fade-in on synth switch: start from silence so the next
+	// Render ramps up to the target instead of starting at full
+	// volume mid-signal. The ramp itself is (re)started in
+	// RenderFrames when it sees the target differs; forcing the
+	// ramp target to an impossible value here guarantees that.
+	m_Lock.Acquire();
+	m_fVolumeApplied = 0.0f;
+	m_fVolumeRampTarget = -1.0f;
+	m_nVolumeRampFrames = 0;
+	m_Lock.Release();
 }
 
 void CNukedSC55Synth::ResetFirState()
@@ -907,14 +939,25 @@ size_t CNukedSC55Synth::RenderFrames(float* pOutBuffer, size_t nFrames)
 		return nFrames;
 	}
 
-	const float nScale = m_nGain * (static_cast<float>(m_nVolume) / 100.0f);
-
 	CDiagLog& DiagLog        = CDiagLog::Get();
 	const bool bDiag         = DiagLog.IsEnabled();
 	const u64 nStartUs       = bDiag ? CTimer::Get()->GetClockTicks() : 0;
 	u64 nUnderrunFrames      = 0;
 
 	m_Lock.Acquire();
+
+	// Volume ramp: if the target moved (SetMasterVolume, or a
+	// ResetVolumeRamp() fade-in from a synth switch), (re)start a
+	// linear ramp from the currently applied volume over
+	// VolumeRampFrames. NextVolumeScale() advances it once per
+	// output frame below.
+	const float fVolumeTarget = static_cast<float>(m_nVolume) / 100.0f;
+	if (fVolumeTarget != m_fVolumeRampTarget)
+	{
+		m_fVolumeRampTarget = fVolumeTarget;
+		m_nVolumeRampFrames = VolumeRampFrames;
+		m_fVolumeRampStep = (fVolumeTarget - m_fVolumeApplied) / static_cast<float>(VolumeRampFrames);
+	}
 
 	// Frames the streaming resampler below will need for this call:
 	// the position advance, plus the interpolation endpoint, the
@@ -1058,8 +1101,9 @@ size_t CNukedSC55Synth::RenderFrames(float* pOutBuffer, size_t nFrames)
 				nAccL += nCoeff * m_FirHist[nSlot * 2];
 				nAccR += nCoeff * m_FirHist[nSlot * 2 + 1];
 			}
-			pOutBuffer[nDone * 2] = nAccL * nScale;
-			pOutBuffer[nDone * 2 + 1] = nAccR * nScale;
+			const float fScale = NextVolumeScale();
+			pOutBuffer[nDone * 2] = nAccL * fScale;
+			pOutBuffer[nDone * 2 + 1] = nAccR * fScale;
 			++m_FirOutIndex;
 			m_FirPhase = (m_FirPhase + 1) % 3;
 		}
@@ -1108,8 +1152,9 @@ size_t CNukedSC55Synth::RenderFrames(float* pOutBuffer, size_t nFrames)
 			const float w1 = 1.0f - 2.5f * t2 + 1.5f * t3;
 			const float w2 = 0.5f * t + 2.0f * t2 - 1.5f * t3;
 			const float w3 = -0.5f * t2 + 0.5f * t3;
-			pOutBuffer[nDone * 2] = (w0 * m_CubicPrev.nLeft + w1 * m_CubicA.nLeft + w2 * m_CubicB.nLeft + w3 * m_CubicNext.nLeft) * nScale;
-			pOutBuffer[nDone * 2 + 1] = (w0 * m_CubicPrev.nRight + w1 * m_CubicA.nRight + w2 * m_CubicB.nRight + w3 * m_CubicNext.nRight) * nScale;
+			const float fScale = NextVolumeScale();
+			pOutBuffer[nDone * 2] = (w0 * m_CubicPrev.nLeft + w1 * m_CubicA.nLeft + w2 * m_CubicB.nLeft + w3 * m_CubicNext.nLeft) * fScale;
+			pOutBuffer[nDone * 2 + 1] = (w0 * m_CubicPrev.nRight + w1 * m_CubicA.nRight + w2 * m_CubicB.nRight + w3 * m_CubicNext.nRight) * fScale;
 
 			m_dReadFrac += m_dResampleRatio;
 		}
@@ -1142,8 +1187,9 @@ size_t CNukedSC55Synth::RenderFrames(float* pOutBuffer, size_t nFrames)
 				break;
 
 			const float nFrac = static_cast<float>(m_dReadFrac);
-			pOutBuffer[nDone * 2]     = (m_SampleA.nLeft + (m_SampleB.nLeft - m_SampleA.nLeft) * nFrac) * nScale;
-			pOutBuffer[nDone * 2 + 1] = (m_SampleA.nRight + (m_SampleB.nRight - m_SampleA.nRight) * nFrac) * nScale;
+			const float fScale = NextVolumeScale();
+			pOutBuffer[nDone * 2]     = (m_SampleA.nLeft + (m_SampleB.nLeft - m_SampleA.nLeft) * nFrac) * fScale;
+			pOutBuffer[nDone * 2 + 1] = (m_SampleA.nRight + (m_SampleB.nRight - m_SampleA.nRight) * nFrac) * fScale;
 
 			m_dReadFrac += m_dResampleRatio;
 		}

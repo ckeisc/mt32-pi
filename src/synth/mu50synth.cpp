@@ -127,6 +127,10 @@ CMU50Synth::CMU50Synth(unsigned nSampleRate, float nGain, TMU50Resampler Resampl
 	  m_nDiagLastSwpRenderUs(0),
 	  m_nGain(nGain),
 	  m_nVolume(100),
+	  m_fVolumeApplied(1.0f),
+	  m_fVolumeRampTarget(1.0f),
+	  m_fVolumeRampStep(0.0f),
+	  m_nVolumeRampFrames(0),
 	  m_dResampleRatio(44100.0 / static_cast<double>(nSampleRate)),
 	  m_dResampleCarry(0.0),
 	  m_nResampleDen(nSampleRate),
@@ -951,6 +955,35 @@ void CMU50Synth::SetMasterVolume(u8 nVolume)
 	m_nVolume = nVolume;
 	// libmu50 has no volume API: volume is applied as a scale factor
 	// in RenderResampled(), together with the per-engine gain.
+	// Only the target is stored here; ResamplePulledBlock ramps the
+	// applied volume toward it (see NextVolumeScale()).
+}
+
+float CMU50Synth::NextVolumeScale()
+{
+	const float fScale = m_nGain * m_fVolumeApplied;
+	if (m_nVolumeRampFrames > 0)
+	{
+		m_fVolumeApplied += m_fVolumeRampStep;
+		if (--m_nVolumeRampFrames == 0)
+			m_fVolumeApplied = m_fVolumeRampTarget;
+	}
+	return fScale;
+}
+
+void CMU50Synth::ResetVolumeRamp()
+{
+	// Fade-in on synth switch: start from silence so the next
+	// Render ramps up to the target instead of starting at full
+	// volume mid-signal. Called by SwitchSynth before this synth
+	// becomes current, so the audio thread is not rendering it yet.
+	// (In split mode the audio thread does not hold m_Lock during
+	// Render, but the park in SplitDeactivate + the not-yet-current
+	// state make this safe; in non-split mode m_Lock is held by
+	// Render, and SwitchSynth runs outside it.)
+	m_fVolumeApplied = 0.0f;
+	m_fVolumeRampTarget = -1.0f;
+	m_nVolumeRampFrames = 0;
 }
 
 // Resample one pulled native block (see the header). Extracted
@@ -961,7 +994,18 @@ double CMU50Synth::ResamplePulledBlock(float* pOutBuffer, size_t nOutDone,
                                        size_t nNativeRender)
 {
 	const double dRatio = m_dResampleRatio;
-	const float fScale  = m_nGain * (static_cast<float>(m_nVolume) / 100.0f);
+	// Volume ramp: if the target moved (SetMasterVolume, or a
+	// ResetVolumeRamp() fade-in from a synth switch), (re)start a
+	// linear ramp from the currently applied volume over
+	// VolumeRampFrames. NextVolumeScale() advances it once per
+	// output frame below.
+	const float fVolumeTarget = static_cast<float>(m_nVolume) / 100.0f;
+	if (fVolumeTarget != m_fVolumeRampTarget)
+	{
+		m_fVolumeRampTarget = fVolumeTarget;
+		m_nVolumeRampFrames = VolumeRampFrames;
+		m_fVolumeRampStep = (fVolumeTarget - m_fVolumeApplied) / static_cast<float>(VolumeRampFrames);
+	}
 	// Activity for IsActive(): any non-zero native sample in this
 	// block marks the block's end as the last active frame.
 	for (size_t i = 0; i < nNativeRender * 2; ++i)
@@ -1052,7 +1096,6 @@ double CMU50Synth::ResamplePulledBlock(float* pOutBuffer, size_t nOutDone,
 		// ~600 us/callback (diag-38 max_us over the 5.33 ms budget)
 		// and made the FIR sound broken.
 		const long nScratchBase = m_bResamplePrimed ? 2 : 0;
-		const float fOutScale = fScale * (1.0f / 1073741824.0f);
 		// Exact rational phase: the native rate is 44100 and the output
 		// rate is m_nResampleDen, so the phase advances by exactly
 		// 44100/m_nResampleDen native frames per output. The fractional
@@ -1097,6 +1140,9 @@ double CMU50Synth::ResamplePulledBlock(float* pOutBuffer, size_t nOutDone,
 					nRight += static_cast<int64_t>(pCoeff[t]) * pF[1];
 				}
 			}
+			// Per-frame volume scale (advances the ramp); the Q15
+			// output scale folds in the /2^30 factor.
+			const float fOutScale = NextVolumeScale() * (1.0f / 1073741824.0f);
 			pOutBuffer[(nOutDone + i) * 2]     = static_cast<float>(nLeft) * fOutScale;
 			pOutBuffer[(nOutDone + i) * 2 + 1] = static_cast<float>(nRight) * fOutScale;
 			nFracNum += nNum;
@@ -1128,6 +1174,7 @@ double CMU50Synth::ResamplePulledBlock(float* pOutBuffer, size_t nOutDone,
 			const float w3 = -0.5f * t2 + 0.5f * t3;
 			const float fLeft  = (w0 * pFrameM1[0] + w1 * pFrame0[0] + w2 * pFrame1[0] + w3 * pFrame2[0]) / 32768.0f;
 			const float fRight = (w0 * pFrameM1[1] + w1 * pFrame0[1] + w2 * pFrame1[1] + w3 * pFrame2[1]) / 32768.0f;
+			const float fScale = NextVolumeScale();
 			pOutBuffer[(nOutDone + i) * 2]     = fLeft * fScale;
 			pOutBuffer[(nOutDone + i) * 2 + 1] = fRight * fScale;
 		}

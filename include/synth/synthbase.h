@@ -48,6 +48,13 @@ public:
 	virtual bool IsActive() = 0;
 	virtual void AllSoundOff() { m_MIDIMonitor.AllNotesOff(); };
 	virtual void SetMasterVolume(u8 nVolume) = 0;
+	// Fade-in on synth switch: reset the applied volume to silence
+	// so the next Render ramps up to the target instead of starting
+	// at full volume mid-signal. Default no-op; Nuked and MU50
+	// override it (they apply master volume as an output scale).
+	// Called by CMT32Pi::SwitchSynth before the new synth becomes
+	// current, so the audio thread is not rendering it yet.
+	virtual void ResetVolumeRamp() {}
 	virtual size_t Render(s16* pOutBuffer, size_t nFrames) = 0;
 	virtual size_t Render(float* pOutBuffer, size_t nFrames) = 0;
 	virtual void ReportStatus() const = 0;
