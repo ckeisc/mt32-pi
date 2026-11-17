@@ -23,9 +23,11 @@
 #ifndef _nukedsc55synth_h
 #define _nukedsc55synth_h
 
+#include <atomic>
 #include <circle/types.h>
 
 #include "ringbuffer.h"
+#include "synth/mu50spsc.h"
 #include "synth/synthbase.h"
 #include "utility.h"
 
@@ -60,7 +62,7 @@ public:
 
 	CONFIG_ENUM(TH8Engine, ENUM_NUKEDH8ENGINE);
 
-	CNukedSC55Synth(unsigned nSampleRate, float nGain, bool bOversampling, TNukedResampler Resampler);
+	CNukedSC55Synth(unsigned nSampleRate, float nGain, bool bOversampling, TNukedResampler Resampler, unsigned nChunkSize);
 	virtual ~CNukedSC55Synth() override;
 
 	// Dual-core split: true while the PCM task (core 3) may be
@@ -87,7 +89,7 @@ public:
 	// lock, then publish. Yields when there is no work. No-op when
 	// the split is inactive (it parks the task and acks the stop
 	// handshake instead).
-	void PCMTaskIteration();
+	bool PCMTaskIteration();
 
 	// Synth-switch split control (called by CMT32Pi::SwitchSynth,
 	// core 0): park the PCM task when switching away from this
@@ -111,6 +113,10 @@ public:
 	virtual bool IsActive() override;
 	virtual void AllSoundOff() override;
 	virtual void SetMasterVolume(u8 nVolume) override;
+	// Fade-in on synth switch: reset the applied volume to silence
+	// so the next Render ramps up to the target over VolumeRampFrames
+	// instead of starting at full volume mid-signal. Takes m_Lock.
+	void ResetVolumeRamp() override;
 	virtual size_t Render(s16* pOutBuffer, size_t nFrames) override;
 	virtual size_t Render(float* pOutBuffer, size_t nFrames) override;
 
@@ -172,6 +178,15 @@ private:
 
 	void OnSample(s32 nLeft, s32 nRight);
 	size_t RenderFrames(float* pOutBuffer, size_t nFrames);
+	// Drain the staged-MIDI queue (see m_MidiStage): posts staged
+	// bytes/messages to the emulator, updates note tracking and the
+	// MIDI monitor, all on the audio thread. Called from
+	// RenderFrames after acquiring m_Lock, before stepping.
+	void DrainMidiStage();
+	// Volume scale for the next output frame (m_nGain * applied
+	// volume), advancing the ramp by one frame. Called exactly once
+	// per output frame, in order, from RenderFrames.
+	float NextVolumeScale();
 
 	// Split lifecycle: stop the PCM task and clear g_splitT (waits
 	// for the PCM idle ack, bounded; returns false on timeout, in
@@ -181,7 +196,12 @@ private:
 	// bClearRing discards queued audio (reset path); activation
 	// keeps the priming frames (continuous boot audio). Refuses
 	// to activate when wedged.
-	bool StopSplitPCM();
+	// Park core 3. bSpinWait spins with SplitPause() instead of
+	// CScheduler::Yield() in the wait loop: the audio core (core 2)
+	// must not yield the scheduler while holding m_Lock in
+	// RenderFrames (the FIFO-resync path). Core-0 callers keep
+	// the scheduler yield (default false).
+	bool StopSplitPCM(bool bSpinWait = false);
 	void InitSplitState(bool bClearRing);
 
 	// Core-3 diag heartbeat line: gated on the
@@ -196,7 +216,27 @@ private:
 	bool m_bOversampling;
 	u8 m_nVolume;
 
+	// Master-volume ramp: SetMasterVolume only stores the target
+	// (m_nVolume); the applied volume chases it over ~5 ms so a
+	// volume change is a smooth ramp, not a gain step at the next
+	// Render call. The ramp is advanced once per output frame by
+	// NextVolumeScale(), so it spans Render calls. Audio-thread
+	// only (RenderFrames holds m_Lock); ResetVolumeRamp() also
+	// takes m_Lock, so a synth switch can force a fade-in from
+	// silence without racing the audio thread.
+	static constexpr size_t VolumeRampFrames = 240; // ~5 ms at 48 kHz
+	float m_fVolumeApplied;    // currently applied volume, 0.0-1.0
+	float m_fVolumeRampTarget; // target the current ramp heads toward
+	float m_fVolumeRampStep;   // per-frame step toward the target
+	size_t m_nVolumeRampFrames; // frames remaining in the current ramp
+
 	unsigned m_nNativeRate;
+	// One DMA block, in output frames: half the configured audio
+	// chunk size (256 -> 128). The Render wall-clock deadline is
+	// capped at one DMA block; deriving it from the chunk size
+	// keeps the cap correct if the chunk size ever changes
+	// (Claude review 2026-11-16 round 3).
+	unsigned m_nDMAblockFrames;
 	double m_dResampleRatio;	// Native frames consumed per output frame
 	double m_dReadFrac;		// Fractional carry of the streaming resampler
 	volatile u64 m_nWrittenFrames;	// Total native frames produced (callback)
@@ -204,8 +244,10 @@ private:
 
 	// Streaming resampler window: the two queued frames bracketing
 	// the next output position (m_dReadFrac relative to the first).
-	// Invalid until primed from the ring (first call, or after an
-	// underrun); a failed prime means the whole call is silence.
+	// Invalid until primed from the ring (first call only); an
+	// underrun keeps the window (concealment) so the next call
+	// resumes from where it left off. A failed prime means the
+	// whole call is silence.
 	TSplitSample m_SampleA;
 	TSplitSample m_SampleB;
 	bool m_bWindowValid;
@@ -230,9 +272,9 @@ private:
 
 	// Cubic Catmull-Rom resampler window (4 samples bracketing the
 	// output position, m_dReadFrac relative to m_CubicA). Primed
-	// from the ring (first call, or after an underrun); m_CubicPrev
-	// duplicates m_CubicA on prime (frac starts at 0, so the first
-	// output is exactly m_CubicA regardless).
+	// from the ring (first call only); an underrun keeps the window
+	// (concealment). m_CubicPrev duplicates m_CubicA on prime (frac
+	// starts at 0, so the first output is exactly m_CubicA regardless).
 	TSplitSample m_CubicPrev;
 	TSplitSample m_CubicA;
 	TSplitSample m_CubicB;
@@ -240,6 +282,53 @@ private:
 	bool m_bCubicValid;
 	bool m_bCubicActive;
 	TNukedResampler m_Resampler;
+
+	// Underrun concealment (pop-free playback): when the ring
+	// starves mid-call, the output fades out over the last
+	// ConcealFadeFrames produced frames instead of stepping to
+	// hard zero, and the resampler state (read frac, window, FIR
+	// history, cubic window) is KEPT so the next call resumes
+	// from where it left off. On the next call after a starved
+	// one, the first ConcealFadeFrames fade back in from zero.
+	// m_bConcealed is true when the previous RenderFrames call
+	// ended starved (faded out). 96 frames = 2 ms at 48 kHz.
+	//
+	// Clean mute (item F): under SUSTAINED overload the per-call
+	// fade-out/fade-in above cycles every DAC block (128 frames
+	// = 375 Hz), heard as a buzz. Instead, when an underrun
+	// leaves the ring unable to fill even one requested block,
+	// the synth latches m_bMuted: it fades out once (the entering
+	// call's fade-out), then outputs pure zeros -- resampler
+	// skipped, no fade-in/out -- until the ring recovers to
+	// MuteRecoverFill (the prefill target, 512 native frames).
+	// The exit fades back in once via the m_bConcealed mechanism
+	// (m_bConcealed stays true while muted). Hysteresis: the low
+	// threshold (fill < nNeed, ~256-341 native frames) is well
+	// below the high threshold (512), so the mute does not flap.
+	static constexpr size_t ConcealFadeFrames = 96;
+	static constexpr size_t MuteRecoverFill = 512; // prefill target (mt32pi.cpp)
+	bool m_bConcealed;
+	bool m_bMuted;
+
+	// Last output sample of the previous RenderFrames call
+	// (left/right, after any fade/decay). On an underrun that
+	// produces nothing (nDone == 0), the gap decays forward
+	// from this value instead of stepping to zero -- the
+	// previous block is already in the DAC queue and cannot be
+	// faded, so the tail has to start from where the signal
+	// actually was.
+	float m_fLastOutL = 0.0f;
+	float m_fLastOutR = 0.0f;
+
+	// Prefill: step the emulator until the sample ring holds at
+	// least nTargetFill native frames (or the step budget is
+	// exhausted). Called from AudioTask when the DAC queue is
+	// full, so idle time builds a cushion instead of spinning
+	// on zero-frame Render calls. Returns the ring fill after
+	// prefill. pfnShouldStop is polled during the prefill (see
+	// synthbase.h); when it returns true the prefill stops early
+	// so AudioTask can Render instead.
+	size_t Prefill(size_t nTargetFill, bool (*pfnShouldStop)(void*) = nullptr, void* pStopContext = nullptr) override;
 
 	CRingBuffer<TSplitSample, SplitRingFrames> m_SampleRing;
 	volatile size_t m_nSampleRingFill;
@@ -276,17 +365,43 @@ private:
 	u64 m_nLastSplitFifoFullWaits = 0;
 	u64 m_nLastSplitFifoDrops = 0;
 	u64 m_nLastSplitPCMUs = 0;
+	u64 m_nLastSplitFifoResync = 0; // last-seen fifo_resync (item E)
 
-	// Sounding-note tracking for power management (core 0 only:
-	// written by the MIDI path, read by IsActive, both on MainTask,
-	// so no lock is needed). A held or pedal-sustained note keeps
-	// the synth "active" even through a quiet passage, so the clock
-	// cannot drop to power-save mid-performance; silence with no
-	// notes held still idles normally. Reset by AllSoundOff and by
-	// the MIDI system-reset path.
-	unsigned m_nHeldNotes = 0;
-	bool m_bSustain = false;
-	bool m_bSustainedNotes = false;
+	// Sounding-note tracking for power management: written by
+	// DrainMidiStage on the audio thread (core 2) and read by
+	// IsActive on core 0, so these are atomic -- the old comment
+	// claiming "core 0 only, no lock is needed" predates the
+	// lock-free MIDI staging, which moved the writes to core 2.
+	// A held or pedal-sustained note keeps the synth "active"
+	// even through a quiet passage, so the clock cannot drop to
+	// power-save mid-performance; silence with no notes held
+	// still idles normally. Reset by AllSoundOff and by the MIDI
+	// system-reset path.
+	std::atomic<unsigned> m_nHeldNotes{0};
+	std::atomic<bool> m_bSustain{false};
+	std::atomic<bool> m_bSustainedNotes{false};
+
+	// Lock-free MIDI input (single-producer/single-consumer):
+	// the MIDI thread (core 0) stages messages here without taking
+	// m_Lock, and RenderFrames (core 2, audio thread) drains them
+	// into the emulator before stepping. This removes the lock
+	// contention where core 0 spun waiting for a whole Render to
+	// finish before it could post MIDI. Mirrors MU50's m_MidiStage.
+	// Kinds: 0 = one raw byte (SysEx), 1 = short message
+	// (nB0=status, nB1=data1, nB2=data2), 2 = AllSoundOff.
+	struct TMidiStage
+	{
+		u8 nKind;
+		u8 nB0;
+		u8 nB1;
+		u8 nB2;
+	};
+	mu50spsc::TSpscQueue<TMidiStage, 4096> m_MidiStage;
+	// Staged entries dropped because the queue was full (diagnostic;
+	// the queue holds 4095 entries, far above any MIDI burst).
+	// Reported as stage_drops in the window diag line; any
+	// non-zero value means a burst was truncated.
+	u32 m_nStageDrops = 0;
 
 
 	char m_ModelName[16];

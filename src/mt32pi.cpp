@@ -528,7 +528,15 @@ bool CMT32Pi::InitNukedSC55Synth()
 	else if (strcasecmp(m_pConfig->NukedResampler, "linear") == 0)
 		Resampler = TNukedResampler::Linear;
 
-	m_pNukedSC55Synth = new CNukedSC55Synth(m_pConfig->AudioSampleRate, m_pConfig->NukedGain, m_pConfig->NukedOversampling, Resampler);
+	// The Render deadline cap is one DMA block (chunk/2). The
+	// chunk the sound device actually uses is the effective
+	// one -- HDMI rounds it to a multiple of 384 first, so the
+	// configured AudioChunkSize (256) would cap the deadline
+	// at 128 frames against a real 192-frame block. The queue
+	// size is the effective chunk, so pass that.
+	const unsigned int nEffectiveChunkSize = m_pSound ? m_pSound->GetQueueSizeFrames()
+	                                                  : m_pConfig->AudioChunkSize;
+	m_pNukedSC55Synth = new CNukedSC55Synth(m_pConfig->AudioSampleRate, m_pConfig->NukedGain, m_pConfig->NukedOversampling, Resampler, nEffectiveChunkSize);
 	if (!m_pNukedSC55Synth->Initialize())
 	{
 		LOGWARN("Nuked-SC55 init failed; no complete SC-55 ROM set present?");
@@ -646,8 +654,13 @@ void CMT32Pi::UITask()
 
 	const bool bMisterEnabled = m_pConfig->ControlMister;
 
-	// Nothing for this core to do; bail out
-	if (!(m_pLCD || bMisterEnabled))
+	// Nothing for this core to do; bail out. But when diagnostics
+	// are enabled, this core must stay alive to drain the diag-log
+	// ring (item B): LogLine() only enqueues, and the SD write
+	// happens here in Drain(). Without this, a no-LCD / no-MiSTer
+	// build would never drain the ring and LogLine would drop
+	// every line once it filled.
+	if (!(m_pLCD || bMisterEnabled || CDiagLog::Get().IsEnabled()))
 	{
 		m_bUITaskDone = true;
 		return;
@@ -659,6 +672,11 @@ void CMT32Pi::UITask()
 	while (m_bRunning)
 	{
 		const unsigned int nTicks = CTimer::GetClockTicks();
+
+		// Drain the diag-log ring to SD (item B). No-op when
+		// diagnostics are disabled. Runs every iteration so a
+		// queued line reaches the card within one loop pass.
+		CDiagLog::Get().Drain();
 
 		// Update LCD
 		if (m_pLCD && (nTicks - m_nLCDUpdateTime) >= Utility::MillisToTicks(LCDUpdatePeriodMillis))
@@ -701,6 +719,23 @@ void CMT32Pi::UITask()
 	m_bUITaskDone = true;
 }
 
+// Prefill stop callback (see synthbase.h): Prefill runs while
+// the DAC queue is full; it must stop the moment the queue has
+// room so AudioTask can Render instead of sitting inside
+// Prefill while the queue drains. GetQueueFramesAvail is the
+// FILLED count, so room exists when it is below the queue size.
+struct TPrefillStopContext
+{
+	CSoundBaseDevice* pSound;
+	size_t nQueueSizeFrames;
+};
+
+static bool PrefillShouldStop(void* pContext)
+{
+	const TPrefillStopContext* pCtx = static_cast<const TPrefillStopContext*>(pContext);
+	return pCtx->pSound->GetQueueFramesAvail() < pCtx->nQueueSizeFrames;
+}
+
 void CMT32Pi::AudioTask()
 {
 	LOGNOTE("Audio task on Core 2 starting up");
@@ -723,6 +758,26 @@ void CMT32Pi::AudioTask()
 	{
 		const size_t nFrames = nQueueSizeFrames - m_pSound->GetQueueFramesAvail();
 		const size_t nWriteBytes = nFrames * nBytesPerFrame;
+
+		if (nFrames == 0)
+		{
+			// DAC queue full: no room to write. Instead of
+			// spinning on a zero-frame Render (which steps
+			// only ~3 frames and pollutes the Render stats),
+			// prefill the emulator toward a target fill of
+			// ~1.5 blocks (512 native frames = 384 output
+			// frames, 8 ms at 48 kHz). This idle time builds
+			// a cushion so the next Render does not starve.
+			// Prefill is a no-op for synths without a
+			// prefillable ring. The stop callback lets Prefill
+			// return the moment the queue has room, so the
+			// audio task does not sit inside Prefill while
+			// the DAC drains. Then loop back to re-check
+			// the queue.
+			TPrefillStopContext StopCtx{ m_pSound, nQueueSizeFrames };
+			m_pCurrentSynth->Prefill(512, PrefillShouldStop, &StopCtx);
+			continue;
+		}
 
 		m_pCurrentSynth->Render(FloatBuffer, nFrames);
 
@@ -753,10 +808,59 @@ void CMT32Pi::AudioTask()
 				m_nLimiterLastLimitedFrames = m_Limiter.GetLimitedFrames();
 				const unsigned nMinGainMilli = m_Limiter.GetMinGainMilli();
 				m_Limiter.ResetWindowStats();
+				// DAC null frames in this window, by cumulative
+				// accounting: attempted consumption (elapsed time
+				// x the configured sample rate) minus frames the
+				// DAC really took (written - queue fill). The
+				// frames sitting in the queue are the part the
+				// DAC has not consumed, so they belong on the
+				// attempted side:
+				//   nulls = attempted - (written - queue fill)
+				//         = attempted - written + queue fill.
+				// The block rendered but not yet written
+				// (nFrames) has no bearing on nulls already
+				// played and is dropped. The estimate is signed:
+				// the DMA phase can put the first window on
+				// either side of zero. The first window is the
+				// baseline: any startup / pipeline offset is
+				// absorbed there, and only growth above it is
+				// reported. The DAC pulls in whole DMA blocks
+				// while elapsed time is continuous, so the
+				// estimate wobbles by up to one block with no
+				// starvation -- growth of less than one DMA
+				// block (chunk/2) is jitter and is not reported.
+				if (m_bAudioFlowing && m_nAudioStartUs != 0)
+				{
+					const u64 nElapsedUs = nNowUs - m_nAudioStartUs;
+					const s64 nAttempted = static_cast<s64>(nElapsedUs * static_cast<u64>(m_pConfig->AudioSampleRate) / 1000000ULL);
+					const s64 nQueueFill = static_cast<s64>(m_pSound->GetQueueFramesAvail());
+					const s64 nEstimate = nAttempted + nQueueFill - static_cast<s64>(m_nTotalFramesWritten);
+					if (!m_bDacNullBaselineSet)
+					{
+						// First window: the baseline IS this
+						// estimate, and the high-water mark
+						// starts here too -- the DMA phase can
+						// put the estimate below zero, so an
+						// initial high-water mark of 0 would
+						// leave a phantom growth of -baseline.
+						m_nDacNullBaseline = nEstimate;
+						m_nDacNullFrames = nEstimate;
+						m_bDacNullBaselineSet = true;
+					}
+					else if (nEstimate > m_nDacNullFrames)
+						m_nDacNullFrames = nEstimate;
+				}
+				const s64 nGrowth = m_nDacNullFrames - m_nDacNullBaseline;
+				const u64 nBlockFrames = nQueueSizeFrames / 2;
+				const u64 nCumulativeNulls = (nGrowth >= static_cast<s64>(nBlockFrames))
+				                             ? static_cast<u64>(nGrowth) : 0;
+				const u64 nDacNullFrames = nCumulativeNulls - m_nDacLastNullFrames;
+				m_nDacLastNullFrames = nCumulativeNulls;
 				m_nLimiterWindowStartUs = nNowUs;
-				DiagLog.LogLine("window limiter limited=%llu min_gain_milli=%u",
+				DiagLog.LogLine("window limiter limited=%llu min_gain_milli=%u dac_null_frames=%llu",
 				                static_cast<unsigned long long>(nLimited),
-				                nMinGainMilli);
+				                nMinGainMilli,
+				                static_cast<unsigned long long>(nDacNullFrames));
 			}
 		}
 
@@ -784,6 +888,15 @@ void CMT32Pi::AudioTask()
 		const int nResult = m_pSound->Write(IntBuffer, nWriteBytes);
 		if (nResult != static_cast<int>(nWriteBytes))
 			LOGERR("Sound data dropped");
+		// Audio is flowing once the first block has been written;
+		// anchor the DAC accounting clock here and count the
+		// frames written for the cumulative null-frame check.
+		if (!m_bAudioFlowing)
+		{
+			m_nAudioStartUs = CTimer::Get()->GetClockTicks();
+			m_bAudioFlowing = true;
+		}
+		m_nTotalFramesWritten += nFrames;
 
 
 	}
@@ -802,23 +915,50 @@ void CMT32Pi::PCMTask()
 	// PCM idle ack, but the ack is written only by the iteration's
 	// parked branch, so gating the call on the flag means the ack
 	// can never arrive and every stop times out. The iteration
-	// itself gates on the flag, parks (acks idle) and yields when
-	// inactive, and backs off and yields when idle, so this loop
+	// itself gates on the flag, parks (acks idle) and returns false
+	// when inactive, and returns false when idle, so this loop
 	// is also the idle path for every other synth -- no work is
 	// ever done here unless the Nuked split is live.
 	// MU50 split (M4) follows the same discipline: its iteration
 	// is called unconditionally whenever the MU50 synth exists,
-	// gating + park ack inside, yielding when parked or idle. Both
-	// iterations run each loop pass when both synths exist (only
-	// the current one does work; the other parks/yields).
+	// gating + park ack inside, returning false when parked or
+	// idle. Both iterations run each loop pass when both synths
+	// exist (only the current one does work; the other returns
+	// false).
+	// Core 3 NEVER calls CScheduler::Yield(): the scheduler
+	// belongs to core 0 (Yield has no core check and no lock, so
+	// from core 3 it can save core 3's registers into the main
+	// task's slot and resume a network task on core 3 while core 0
+	// also runs scheduler tasks). When neither iteration did work,
+	// spin briefly (SplitPause) then sleep with wfe; core 2 sends
+	// sev after each cycles_pub store / block publish and core 0
+	// after setting m_bSplitActive / m_bSwpActive, so core 3 wakes
+	// when there is work or a reactivation. No lost wake-up: sev
+	// sets a latch on every core, so a sev landing between the
+	// work check and the wfe makes the wfe return immediately, and
+	// the loop re-checks for work after every wake. The short spin
+	// before sleeping keeps the chase latency low: core 3 does not
+	// sleep while core 2 is actively publishing.
+	unsigned nIdleSpins = 0;
 	while (m_bRunning)
 	{
+		bool bWorked = false;
 		if (m_pNukedSC55Synth)
-			m_pNukedSC55Synth->PCMTaskIteration();
+			bWorked |= m_pNukedSC55Synth->PCMTaskIteration();
 		if (m_pMU50Synth)
-			m_pMU50Synth->PCMTaskIteration();
-		if (!m_pNukedSC55Synth && !m_pMU50Synth)
-			CScheduler::Get()->Yield();
+			bWorked |= m_pMU50Synth->PCMTaskIteration();
+		if (!bWorked)
+		{
+			// Short spin before sleeping (SplitPause's ARM YIELD
+			// hint, inlined here: the backend header that defines
+			// SplitPause is scoped to nukedsc55synth.cpp only).
+			if (++nIdleSpins < 64)
+				__asm__ volatile ("yield" ::: "memory");
+			else
+				__asm__ volatile ("wfe" ::: "memory");
+		}
+		else
+			nIdleSpins = 0;
 	}
 }
 
@@ -1511,6 +1651,13 @@ void CMT32Pi::SwitchSynth(TSynth NewSynth)
 
 	CSynthBase* pOldSynth = m_pCurrentSynth;
 	m_pCurrentSynth->AllSoundOff();
+	// Fade-in on switch: reset the new synth's volume ramp so it
+	// starts from silence and ramps up to the master volume over
+	// ~5 ms instead of starting at full volume mid-signal. No-op
+	// for synths without a ramp (EmuSC, SoundFont, Munt). Called
+	// before the pointer swap, so the audio thread is not
+	// rendering the new synth yet.
+	pNewSynth->ResetVolumeRamp();
 	m_pCurrentSynth = pNewSynth;
 	const char* pMode = GetSynthMode(pNewSynth);
 	LOGNOTE("Switching to %s", pMode);

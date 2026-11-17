@@ -248,7 +248,7 @@ const char* FriendlyModelName(Romset Romset)
 
 } // namespace
 
-CNukedSC55Synth::CNukedSC55Synth(unsigned nSampleRate, float nGain, bool bOversampling, TNukedResampler Resampler)
+CNukedSC55Synth::CNukedSC55Synth(unsigned nSampleRate, float nGain, bool bOversampling, TNukedResampler Resampler, unsigned nChunkSize)
 	: CSynthBase(nSampleRate),
 	  m_pSplitState(nullptr),
 	  m_bSplitActive(false),
@@ -260,7 +260,12 @@ CNukedSC55Synth::CNukedSC55Synth(unsigned nSampleRate, float nGain, bool bOversa
 	  m_nGain(nGain),
 	  m_bOversampling(bOversampling),
 	  m_nVolume(100),
+	  m_fVolumeApplied(1.0f),
+	  m_fVolumeRampTarget(1.0f),
+	  m_fVolumeRampStep(0.0f),
+	  m_nVolumeRampFrames(0),
 	  m_nNativeRate(0),
+	  m_nDMAblockFrames(nChunkSize / 2 ? nChunkSize / 2 : 128),
 	  m_dResampleRatio(1.0),
 	  m_dReadFrac(0.0),
 	  m_nWrittenFrames(0),
@@ -280,6 +285,8 @@ CNukedSC55Synth::CNukedSC55Synth(unsigned nSampleRate, float nGain, bool bOversa
 	  m_bCubicValid(false),
 	  m_bCubicActive(false),
 	  m_Resampler(Resampler),
+	  m_bConcealed(false),
+	  m_bMuted(false),
 	  m_SampleRing{},
 	  m_nSampleRingFill(0),
 	  m_nSampleRingDrops(0),
@@ -376,7 +383,7 @@ void CNukedSC55Synth::OnSample(s32 nLeft, s32 nRight)
 	m_nWrittenFrames = m_nWrittenFrames + 1;
 }
 
-bool CNukedSC55Synth::StopSplitPCM()
+bool CNukedSC55Synth::StopSplitPCM(bool bSpinWait)
 {
 	if (!m_bSplitActive)
 		return true;
@@ -388,6 +395,14 @@ bool CNukedSC55Synth::StopSplitPCM()
 	// the PCM task has parked, nothing touches the backend anymore.
 	m_bSplitActive = false;
 	SplitDMB();
+	// Wake core 3 if it is sleeping in wfe: it must run one
+	// PCMTaskIteration to take the parked branch and ack idle.
+	// Without this sev, a sleeping core 3 never wakes -- core 2
+	// has moved to the new synth, so no further sev arrives --
+	// the wait below runs to its 5 s timeout with m_Lock held,
+	// and the split is wedged permanently (Claude review
+	// 2026-11-16 round 3).
+	SplitSendEvent();
 	// Bounded wait (5 s of wall clock): a parked task acks within
 	// milliseconds, so a timeout means core 3 is wedged inside a
 	// batch. On timeout the split is marked wedged and g_splitT is
@@ -408,7 +423,20 @@ bool CNukedSC55Synth::StopSplitPCM()
 			                        static_cast<unsigned long long>(m_pSplitState ? m_pSplitState->fifo_tail : 0));
 			return false;
 		}
-		CScheduler::Get()->Yield();
+		// Re-send sev each pass: core 3 may have re-entered wfe
+		// after the first sev (or read a stale flag), so a single
+		// sev does not close the race.
+		SplitSendEvent();
+		// Wait primitive depends on the caller: the audio core
+		// (core 2, RenderFrames, m_Lock held) spins with the
+		// scheduler-free SplitPause (a YIELD hint) so it never
+		// yields the scheduler -- and the audio task -- while
+		// holding the lock. Core-0 callers yield the scheduler
+		// (the original behaviour; core 0 is the scheduler core).
+		if (bSpinWait)
+			SplitPause();
+		else
+			CScheduler::Get()->Yield();
 	}
 	SplitDMB();
 	g_splitT = nullptr;
@@ -444,6 +472,18 @@ void CNukedSC55Synth::InitSplitState(bool bClearRing)
 		m_nSampleRingFill = 0;
 		m_bWindowValid = false;
 		m_dReadFrac = 0.0;
+		// Resampler history (item D): the ring is cleared but the
+		// FIR history and cubic window are not, so stale samples
+		// from the previous Nuked session would play under the new
+		// synth's fade-in. Reset them here, mirroring
+		// ApplyResamplerSelection (which already does both).
+		ResetFirState();
+		m_bCubicValid = false;
+		// Clean mute (item F): the ring is cleared, so a mute
+		// latched in the previous session is stale -- start
+		// unmuted. (m_bConcealed is left alone: the volume ramp
+		// already fades in from silence on a switch.)
+		m_bMuted = false;
 	}
 	// Activation (bClearRing false) keeps the priming frames: the
 	// first RenderFrames() drains the boot silence continuously.
@@ -456,6 +496,9 @@ void CNukedSC55Synth::InitSplitState(bool bClearRing)
 	SplitDMB();
 	m_bSplitActive = true;
 	SplitDMB();
+	// Wake core 3 if it is sleeping in wfe (it idles there
+	// instead of Yield, which belongs to core 0).
+	SplitSendEvent();
 }
 
 void CNukedSC55Synth::SplitActivate()
@@ -502,7 +545,7 @@ void CNukedSC55Synth::LogSplitState(const char* pTag)
 }
 
 
-void CNukedSC55Synth::PCMTaskIteration()
+bool CNukedSC55Synth::PCMTaskIteration()
 {
 	if (!m_bSplitActive || !m_pEmulator || !m_pSplitState)
 	{
@@ -514,10 +557,15 @@ void CNukedSC55Synth::PCMTaskIteration()
 		// the task again instead of letting it render. Conversely,
 		// m_bPCMIdle is false throughout any work batch (set below),
 		// so a stop waiter can never observe true mid-batch.
+		// No Yield() here: CScheduler::Yield() belongs to core 0
+		// (it has no core check and no lock, so from core 3 it can
+		// save core 3's registers into the main task's slot and
+		// resume a network task on core 3 while core 0 also runs
+		// scheduler tasks). The PCMTask loop idles with wfe/sev
+		// instead; this iteration just reports that it did no work.
 		m_bPCMIdle = true;
 		SplitDMB();
-		CScheduler::Get()->Yield();
-		return;
+		return false;
 	}
 
 	ThreadSplitStateCircle& S = *m_pSplitState;
@@ -533,13 +581,12 @@ void CNukedSC55Synth::PCMTaskIteration()
 	const uint64_t nTick = static_cast<uint64_t>(PCM.config.reg_slots + 1) * 25ULL;
 	if (nPublished <= PCM.cycles + ThreadSplitStateCircle::MaxTickCycles)
 	{
-		// Idle: back off 64 yield hints, then yield to the scheduler
-		// (the fork has tasks; the minimal kernel spun here).
+		// Idle: caught up with core 2, nothing to render. No
+		// Yield() here (see the parked branch: Yield belongs to
+		// core 0). The PCMTask loop does the spin-then-wfe backoff;
+		// this iteration just reports that it did no work.
 		S.core3_phase = 1;
-		for (unsigned i = 0; i < 64; ++i)
-			SplitPause();
-		CScheduler::Get()->Yield();
-		return;
+		return false;
 	}
 
 	m_bPCMIdle = false;
@@ -561,6 +608,7 @@ void CNukedSC55Synth::PCMTaskIteration()
 	if (nLag > static_cast<int64_t>(S.max_pcm_lag))
 		S.max_pcm_lag = static_cast<uint64_t>(nLag);
 	S.pcm_task_us = S.pcm_task_us + CTimer::Get()->GetClockTicks() - nWorkStartUs;
+	return true;
 }
 
 bool CNukedSC55Synth::Initialize()
@@ -714,80 +762,21 @@ bool CNukedSC55Synth::Initialize()
 
 void CNukedSC55Synth::HandleMIDIShortMessage(u32 nMessage)
 {
-	const u8 nStatus = nMessage & 0xFF;
-	const u8 nData1  = (nMessage >> 8) & 0xFF;
-	const u8 nData2  = (nMessage >> 16) & 0xFF;
-
 	if (!m_pEmulator)
 		return;
 
-	// System Reset (0xFF): forward the byte to the emulated UART
-	// like stock Nuked-SC55 does (R_PostEvent -> PostMIDI). The
-	// SC-55 firmware handles System Reset itself as a quick
-	// parameter reset, not a reboot — the stock renderer plays a
-	// file carrying a stray 0xFF from the first note, with no hole.
-	// A host-side ResetForRestart() here reboots the firmware
-	// (seconds of silence) on every stray 0xFF: DOSMID sends the
-	// illegal CC110=255 value raw, so every Descent 2 song opened
-	// with a 2-3 s hole. Clear the held-note tracking to match the
-	// firmware's voices-off, then fall through: the normal path
-	// below posts the single byte (nBytes == 1 for 0xFF).
-	if (nStatus == 0xFF)
-	{
-		m_nHeldNotes = 0;
-		m_bSustain = false;
-		m_bSustainedNotes = false;
-	}
-
-	// Sounding-note tracking for power management (core 0 only):
-	// a note held, or held by the sustain pedal, keeps IsActive()
-	// true through quiet passages, so the clock cannot drop to
-	// power-save mid-performance. Note-off for a note that was
-	// sustained releases the sustain hold only when the pedal is
-	// already up; pedal-up releases all sustained notes at once.
-	if (nStatus < 0xF0)
-	{
-		const u8 nType = nStatus & 0xF0;
-		if (nType == 0x90 && nData2 > 0)
-			++m_nHeldNotes;
-		else if (nType == 0x80 || (nType == 0x90 && nData2 == 0))
-		{
-			if (m_bSustain && m_nHeldNotes > 0)
-			{
-				--m_nHeldNotes;
-				m_bSustainedNotes = true;
-			}
-			else if (m_nHeldNotes > 0)
-				--m_nHeldNotes;
-		}
-		else if (nType == 0xB0 && nData1 == 64)
-		{
-			m_bSustain = nData2 >= 64;
-			if (!m_bSustain)
-				m_bSustainedNotes = false;
-		}
-	}
-
-	// Post exactly the bytes the message carries; the emulated UART
-	// parses the stream like the real hardware, so an extra data byte
-	// would corrupt the following message.
-	u8 Bytes[3] = { nStatus, nData1, nData2 };
-	size_t nBytes;
-	if (nStatus < 0xF0)
-		nBytes = ((nStatus & 0xE0) == 0xC0) ? 2 : 3;
-	else if (nStatus == 0xF1 || nStatus == 0xF3)
-		nBytes = 2;
-	else if (nStatus == 0xF2)
-		nBytes = 3;
-	else
-		nBytes = 1;
-
-	m_Lock.Acquire();
-	m_pEmulator->PostMIDI(std::span<const uint8_t>(Bytes, nBytes));
-	m_Lock.Release();
-
-	// Update MIDI monitor
-	CSynthBase::HandleMIDIShortMessage(nMessage);
+	// Lock-free MIDI input: stage the message; the audio thread
+	// drains it at the next RenderFrames (note tracking, the 0xFF
+	// held-note clear, PostMIDI, and the monitor update all happen
+	// there). No m_Lock: the MIDI thread never touches emulator
+	// state, so it no longer spins waiting for a whole Render to
+	// finish before it can post MIDI.
+	const u8 nStatus = nMessage & 0xFF;
+	const u8 nData1  = (nMessage >> 8) & 0xFF;
+	const u8 nData2  = (nMessage >> 16) & 0xFF;
+	const TMidiStage Stage{ 1, nStatus, nData1, nData2 };
+	if (!m_MidiStage.TryPush(Stage))
+		__atomic_add_fetch(&m_nStageDrops, 1, __ATOMIC_RELAXED);
 }
 
 void CNukedSC55Synth::HandleMIDISysExMessage(const u8* pData, size_t nSize)
@@ -795,11 +784,16 @@ void CNukedSC55Synth::HandleMIDISysExMessage(const u8* pData, size_t nSize)
 	if (!m_pEmulator || nSize == 0)
 		return;
 
-	// The emulator expects the complete message including the leading
-	// 0xF0 and trailing 0xF7; it parses the stream itself.
-	m_Lock.Acquire();
-	m_pEmulator->PostMIDI(std::span<const uint8_t>(pData, nSize));
-	m_Lock.Release();
+	// Lock-free MIDI input: stage byte by byte; the audio thread
+	// drains them in order. No m_Lock. The emulator expects the
+	// complete message including the leading 0xF0 and trailing 0xF7;
+	// it parses the stream itself.
+	for (size_t i = 0; i < nSize; ++i)
+	{
+		const TMidiStage Stage{ 0, pData[i], 0, 0 };
+		if (!m_MidiStage.TryPush(Stage))
+			__atomic_add_fetch(&m_nStageDrops, 1, __ATOMIC_RELAXED);
+	}
 }
 
 bool CNukedSC55Synth::IsActive()
@@ -819,34 +813,49 @@ void CNukedSC55Synth::AllSoundOff()
 {
 	if (m_pEmulator)
 	{
-		// CC 120 (All Sound Off) and CC 123 (All Notes Off) on every
-		// channel; the firmware handles them like real hardware.
-		m_Lock.Acquire();
-		for (u8 nChannel = 0; nChannel < 16; ++nChannel)
-		{
-			const u8 SoundOff[3] = { static_cast<u8>(0xB0 | nChannel), 120, 0 };
-			const u8 NotesOff[3] = { static_cast<u8>(0xB0 | nChannel), 123, 0 };
-			m_pEmulator->PostMIDI(std::span<const uint8_t>(SoundOff, sizeof(SoundOff)));
-			m_pEmulator->PostMIDI(std::span<const uint8_t>(NotesOff, sizeof(NotesOff)));
-		}
-		m_Lock.Release();
+		// Lock-free MIDI input: stage the control entry; the
+		// drain posts CC 120 + CC 123 on every channel, clears
+		// note tracking, and resets the monitor, all on the
+		// audio thread. No m_Lock.
+		const TMidiStage Stage{ 2, 0, 0, 0 };
+		if (!m_MidiStage.TryPush(Stage))
+			__atomic_add_fetch(&m_nStageDrops, 1, __ATOMIC_RELAXED);
 	}
-
-	// Sounding-note tracking (see IsActive): an All Sound Off
-	// clears every held/sustained note.
-	m_nHeldNotes = 0;
-	m_bSustain = false;
-	m_bSustainedNotes = false;
-
-	// Reset MIDI monitor
-	CSynthBase::AllSoundOff();
 }
 
 void CNukedSC55Synth::SetMasterVolume(u8 nVolume)
 {
 	// The emulated firmware owns its internal levels; mt32-pi's master
 	// volume is applied as an output scale in Render(), like the gain.
+	// Only the target is stored here; RenderFrames ramps the applied
+	// volume toward it (see NextVolumeScale()).
 	m_nVolume = nVolume;
+}
+
+float CNukedSC55Synth::NextVolumeScale()
+{
+	const float fScale = m_nGain * m_fVolumeApplied;
+	if (m_nVolumeRampFrames > 0)
+	{
+		m_fVolumeApplied += m_fVolumeRampStep;
+		if (--m_nVolumeRampFrames == 0)
+			m_fVolumeApplied = m_fVolumeRampTarget;
+	}
+	return fScale;
+}
+
+void CNukedSC55Synth::ResetVolumeRamp()
+{
+	// Fade-in on synth switch: start from silence so the next
+	// Render ramps up to the target instead of starting at full
+	// volume mid-signal. The ramp itself is (re)started in
+	// RenderFrames when it sees the target differs; forcing the
+	// ramp target to an impossible value here guarantees that.
+	m_Lock.Acquire();
+	m_fVolumeApplied = 0.0f;
+	m_fVolumeRampTarget = -1.0f;
+	m_nVolumeRampFrames = 0;
+	m_Lock.Release();
 }
 
 void CNukedSC55Synth::ResetFirState()
@@ -899,22 +908,323 @@ const char* CNukedSC55Synth::CycleResampler()
 	return pName;
 }
 
+void CNukedSC55Synth::DrainMidiStage()
+{
+	// Audio thread only, called from RenderFrames after acquiring
+	// m_Lock, before stepping. Staged bytes/messages land in the
+	// emulated UART exactly as if the MIDI handler had posted them
+	// directly, in the same order. Note tracking and the MIDI
+	// monitor move to the drain too, so all note state stays on
+	// the audio thread.
+	TMidiStage Stage;
+	while (m_MidiStage.TryPop(Stage))
+	{
+		if (Stage.nKind == 0)
+		{
+			m_pEmulator->PostMIDI(Stage.nB0);
+		}
+		else if (Stage.nKind == 1)
+		{
+			const u8 nStatus = Stage.nB0;
+			const u8 nData1  = Stage.nB1;
+			const u8 nData2  = Stage.nB2;
+
+			// System Reset (0xFF): the SC-55 firmware handles
+			// it as a quick parameter reset, not a reboot.
+			// Clear the held-note tracking to match the
+			// firmware's voices-off, then post the single byte.
+			// (DOSMID sends the illegal CC110=255 value raw;
+			// a host-side ResetForRestart() here rebooted the
+			// firmware and opened every Descent 2 song with a
+			// 2-3 s hole.)
+			if (nStatus == 0xFF)
+			{
+				m_nHeldNotes = 0;
+				m_bSustain = false;
+				m_bSustainedNotes = false;
+				m_pEmulator->PostMIDI(nStatus);
+				CSynthBase::HandleMIDIShortMessage(
+					static_cast<u32>(nStatus) |
+					(static_cast<u32>(nData1) << 8) |
+					(static_cast<u32>(nData2) << 16));
+				continue;
+			}
+
+			// Sounding-note tracking for power management: a
+			// note held, or held by the sustain pedal, keeps
+			// IsActive() true through quiet passages, so the
+			// clock cannot drop to power-save mid-performance.
+			// Note-off for a note that was sustained releases
+			// the sustain hold only when the pedal is already
+			// up; pedal-up releases all sustained notes at once.
+			if (nStatus < 0xF0)
+			{
+				const u8 nType = nStatus & 0xF0;
+				if (nType == 0x90 && nData2 > 0)
+					++m_nHeldNotes;
+				else if (nType == 0x80 || (nType == 0x90 && nData2 == 0))
+				{
+					if (m_bSustain && m_nHeldNotes > 0)
+					{
+						--m_nHeldNotes;
+						m_bSustainedNotes = true;
+					}
+					else if (m_nHeldNotes > 0)
+						--m_nHeldNotes;
+				}
+				else if (nType == 0xB0 && nData1 == 64)
+				{
+					m_bSustain = nData2 >= 64;
+					if (!m_bSustain)
+						m_bSustainedNotes = false;
+				}
+			}
+
+			// Post exactly the bytes the message carries; the
+			// emulated UART parses the stream like the real
+			// hardware, so an extra data byte would corrupt the
+			// following message.
+			u8 Bytes[3] = { nStatus, nData1, nData2 };
+			size_t nBytes;
+			if (nStatus < 0xF0)
+				nBytes = ((nStatus & 0xE0) == 0xC0) ? 2 : 3;
+			else if (nStatus == 0xF1 || nStatus == 0xF3)
+				nBytes = 2;
+			else if (nStatus == 0xF2)
+				nBytes = 3;
+			else
+				nBytes = 1;
+			m_pEmulator->PostMIDI(std::span<const uint8_t>(Bytes, nBytes));
+
+			// Update MIDI monitor
+			CSynthBase::HandleMIDIShortMessage(
+				static_cast<u32>(nStatus) |
+				(static_cast<u32>(nData1) << 8) |
+				(static_cast<u32>(nData2) << 16));
+		}
+		else if (Stage.nKind == 2)
+		{
+			// AllSoundOff: CC 120 (All Sound Off) and CC 123
+			// (All Notes Off) on every channel; the firmware
+			// handles them like real hardware.
+			for (u8 nChannel = 0; nChannel < 16; ++nChannel)
+			{
+				const u8 SoundOff[3] = { static_cast<u8>(0xB0 | nChannel), 120, 0 };
+				const u8 NotesOff[3] = { static_cast<u8>(0xB0 | nChannel), 123, 0 };
+				m_pEmulator->PostMIDI(std::span<const uint8_t>(SoundOff, sizeof(SoundOff)));
+				m_pEmulator->PostMIDI(std::span<const uint8_t>(NotesOff, sizeof(NotesOff)));
+			}
+
+			// Sounding-note tracking (see IsActive): an All
+			// Sound Off clears every held/sustained note.
+			m_nHeldNotes = 0;
+			m_bSustain = false;
+			m_bSustainedNotes = false;
+
+			// Reset MIDI monitor
+			CSynthBase::AllSoundOff();
+		}
+	}
+}
+
+size_t CNukedSC55Synth::Prefill(size_t nTargetFill, bool (*pfnShouldStop)(void*), void* pStopContext)
+{
+	if (!m_pEmulator)
+		return 0;
+
+	m_Lock.Acquire();
+
+	// Drain staged MIDI before stepping: all stepping now
+	// happens here (not only in RenderFrames), so events must
+	// land in the emulator before the MCU runs ahead of the
+	// playback position. Without this, an event staged during a
+	// Prefill waits up to a whole DAC block (~5 ms) plus the
+	// ring cushion (~8 ms), landing 8-11 ms late in an MCU that
+	// is already ahead -- audible as a timing shift on dense
+	// passages. DrainMidiStage is the same drain RenderFrames
+	// runs; calling it here is safe because Prefill holds
+	// m_Lock, as RenderFrames does.
+	DrainMidiStage();
+
+	// Step the emulator until the sample ring holds at least
+	// nTargetFill native frames, or the step budget is exhausted.
+	// Same stepping as RenderFrames (split: MCU + peripherals with
+	// cycle publishing for core 3; single-threaded: full Step),
+	// but without producing output -- the caller (AudioTask) has
+	// no room in the DAC queue, so this idle time builds a
+	// cushion for the next Render instead of spinning on
+	// zero-frame Render calls. The budget is sized to the
+	// DEFICIT (frames still needed), not the full target: if the
+	// ring already holds most of the cushion, Prefill only
+	// budgets for the few frames actually missing. Budgeting the
+	// full target every call let a slow emulator block the audio
+	// task for ~65 ms (vs ~22 ms for a Render budget) while the
+	// DAC queue drained.
+	const size_t nDeficit = nTargetFill > m_nSampleRingFill ? nTargetFill - m_nSampleRingFill : 0;
+	const u64 nStepBudget = static_cast<u64>(nDeficit + 2) * StepsPerFrameBudget;
+	u64 nSteps = 0;
+
+	if (m_bSplitActive && m_pSplitState)
+	{
+		mcu_t& MCU = m_pEmulator->GetMCU();
+		ThreadSplitStateCircle& S = *m_pSplitState;
+		unsigned nRingCheckdown = 1;
+		unsigned nPublishCountdown = 0;
+		// Stop-callback check interval: the callback takes
+		// Circle's sound spinlock, so checking it every 16
+		// steps cost ~1% of core 2. Every 64 steps is nearly as
+		// responsive (the DAC block is ~5 ms; 64 steps is a
+		// fraction of that) for a quarter of the cost.
+		unsigned nStopCheckdown = 1;
+		while (m_nSampleRingFill < nTargetFill && nSteps < nStepBudget)
+		{
+			if (--nRingCheckdown == 0)
+			{
+				nRingCheckdown = 16;
+				if (m_nSampleRingFill >= nTargetFill)
+					break;
+			}
+			// Interruptible: if the DAC queue has room, stop
+			// prefill so AudioTask can Render instead of
+			// sitting here while the queue drains.
+			if (--nStopCheckdown == 0)
+			{
+				nStopCheckdown = 64;
+				if (pfnShouldStop && pfnShouldStop(pStopContext))
+					break;
+			}
+			SplitFoldIrq0(S, MCU);
+			m_pEmulator->StepMCU();
+			m_pEmulator->StepPeripherals();
+			++nSteps;
+			if (++nPublishCountdown >= 8)
+			{
+				nPublishCountdown = 0;
+				__atomic_store_n(&S.cycles_pub, MCU.cycles, __ATOMIC_RELEASE);
+				// Wake core 3 if it is sleeping in wfe (it idles
+				// there instead of Yield, which belongs to core 0).
+				SplitSendEvent();
+			}
+		}
+		if (nPublishCountdown != 0)
+		{
+			__atomic_store_n(&S.cycles_pub, MCU.cycles, __ATOMIC_RELEASE);
+			// Wake core 3 if it is sleeping in wfe.
+			SplitSendEvent();
+		}
+	}
+	else
+	{
+		// Stop-callback interval is 64 steps (see the split
+		// path): the callback takes Circle's sound spinlock,
+		// and every 16 steps cost ~1% of core 2.
+		unsigned nStopCheckdown = 1;
+		while (m_nSampleRingFill < nTargetFill && nSteps < nStepBudget)
+		{
+			m_pEmulator->Step();
+			++nSteps;
+			if (--nStopCheckdown == 0)
+			{
+				nStopCheckdown = 64;
+				if (pfnShouldStop && pfnShouldStop(pStopContext))
+					break;
+			}
+		}
+	}
+
+	const size_t nFill = m_nSampleRingFill;
+	m_Lock.Release();
+	return nFill;
+}
+
 size_t CNukedSC55Synth::RenderFrames(float* pOutBuffer, size_t nFrames)
 {
 	if (!m_pEmulator)
 	{
 		memset(pOutBuffer, 0, nFrames * 2 * sizeof(float));
+		// No emulator: output is silence, so the underrun tail
+		// boundary for a later call is zero.
+		m_fLastOutL = 0.0f;
+		m_fLastOutR = 0.0f;
 		return nFrames;
 	}
 
-	const float nScale = m_nGain * (static_cast<float>(m_nVolume) / 100.0f);
-
 	CDiagLog& DiagLog        = CDiagLog::Get();
 	const bool bDiag         = DiagLog.IsEnabled();
-	const u64 nStartUs       = bDiag ? CTimer::Get()->GetClockTicks() : 0;
+	// Start time is captured unconditionally: it drives the
+	// wall-clock Render deadline below, not only the diag.
+	const u64 nStartUs       = CTimer::Get()->GetClockTicks();
 	u64 nUnderrunFrames      = 0;
 
 	m_Lock.Acquire();
+
+	// Sustained-overload rule (review fix, round 4): capture
+	// whether the PREVIOUS call was concealed, before this call's
+	// underrun logic updates m_bConcealed. Mute latches only on
+	// two consecutive concealed/underrun calls (see below).
+	const bool bWasConcealed = m_bConcealed;
+
+	// FIFO overflow recovery (review fix, round 4): a drop means
+	// core 3 stopped draining, so the split is broken (core 3
+	// renders from stale register values). Recover instead of
+	// wedging: park core 3 (spin-wait -- this is the audio core
+	// holding m_Lock, so no scheduler yield), drain the FIFO on
+	// core 2 so every queued register write lands in the pcm
+	// state, then reactivate the split. The old code wedged
+	// permanently and claimed the dropped write was "inherently
+	// recovered" -- wrong on both counts: in split mode only
+	// core 3 applies FIFO writes to the pcm state, so without the
+	// drain the pcm state is left stale; and one core cannot run
+	// both halves in real time, so single-threaded is
+	// near-continuous silence. Wedge ONLY on a park timeout
+	// (core 3 truly dead); then g_splitT stays set and the FIFO
+	// stays full, so no further recovery is attempted. The
+	// !m_bSplitWedged guard stops a wedged split from re-entering
+	// the park wait on every RenderFrames.
+	if (m_bSplitActive && !m_bSplitWedged && m_pSplitState
+	    && m_pSplitState->fifo_resync != m_nLastSplitFifoResync)
+	{
+		m_nLastSplitFifoResync = m_pSplitState->fifo_resync;
+		if (StopSplitPCM(true))
+		{
+			// Core 3 is parked: it touches neither the FIFO
+			// nor the pcm state now, so core 2 can drain the
+			// queued writes itself (FifoDrain applies them to
+			// the live pcm state and advances the tail).
+			// InitSplitState(false) then re-publishes the
+			// state and reactivates without clearing the
+			// sample ring (the queued audio is still valid).
+			m_pSplitState->FifoDrain(m_pEmulator->GetPCM());
+			InitSplitState(false);
+			DiagLog.LogLine("split fifo_resync drops=%llu reactivated",
+			                static_cast<unsigned long long>(m_pSplitState->fifo_drops));
+		}
+		else
+		{
+			// Park timed out: StopSplitPCM already set
+			// m_bSplitWedged and logged splitpark_timeout.
+			DiagLog.LogLine("split fifo_resync drops=%llu park timeout, wedged",
+			                static_cast<unsigned long long>(m_pSplitState->fifo_drops));
+		}
+	}
+
+	// Lock-free MIDI input: drain the staged queue before
+	// stepping, so staged bytes land in the emulated UART ahead
+	// of the MCU ticks that consume them.
+	DrainMidiStage();
+
+	// Volume ramp: if the target moved (SetMasterVolume, or a
+	// ResetVolumeRamp() fade-in from a synth switch), (re)start a
+	// linear ramp from the currently applied volume over
+	// VolumeRampFrames. NextVolumeScale() advances it once per
+	// output frame below.
+	const float fVolumeTarget = static_cast<float>(m_nVolume) / 100.0f;
+	if (fVolumeTarget != m_fVolumeRampTarget)
+	{
+		m_fVolumeRampTarget = fVolumeTarget;
+		m_nVolumeRampFrames = VolumeRampFrames;
+		m_fVolumeRampStep = (fVolumeTarget - m_fVolumeApplied) / static_cast<float>(VolumeRampFrames);
+	}
 
 	// Frames the streaming resampler below will need for this call:
 	// the position advance, plus the interpolation endpoint, the
@@ -923,6 +1233,20 @@ size_t CNukedSC55Synth::RenderFrames(float* pOutBuffer, size_t nFrames)
 	const size_t nNeed = static_cast<size_t>(m_dReadFrac + static_cast<double>(nFrames) * m_dResampleRatio) + 3;
 	u64 nSteps           = 0;
 	const u64 nStepBudget = static_cast<u64>(nFrames * m_dResampleRatio + 2.0) * StepsPerFrameBudget;
+	// Wall-clock Render deadline: the real-time duration of the
+	// requested frames. If stepping has not filled the ring by
+	// then, the synth is falling behind real time; stop stepping
+	// and let the resampler produce what it can (a counted,
+	// concealed underrun) instead of running long and letting
+	// the DAC queue drain to Circle-inserted nulls. Checked
+	// every 16 steps alongside the ring check. Capped at one DMA
+	// block (m_nDMAblockFrames, half the effective chunk size --
+	// the chunk the sound device actually uses, HDMI-rounded):
+	// a full-chunk request means the queue is already empty, yet
+	// an uncapped deadline would allow another 5.3 ms of stepping
+	// while the DAC stays dry.
+	const u64 nDeadlineUs = std::min(static_cast<u64>(nFrames) * 1000000ULL / m_nSampleRate,
+	                                 static_cast<u64>(m_nDMAblockFrames) * 1000000ULL / m_nSampleRate);
 
 	if (m_bSplitActive && m_pSplitState)
 	{
@@ -955,6 +1279,12 @@ size_t CNukedSC55Synth::RenderFrames(float* pOutBuffer, size_t nFrames)
 				nRingCheckdown = 16;
 				if (m_nSampleRingFill >= nNeed)
 					break;
+				// Wall-clock deadline: stop stepping if this
+				// Render has already consumed its real-time
+				// budget; the resampler below will produce what
+				// it can and conceal the shortfall.
+				if (CTimer::Get()->GetClockTicks() - nStartUs >= nDeadlineUs)
+					break;
 			}
 			// Fold a pending voice-end IRQ0 request into
 			// interrupt_pending (core 3 sets the flag; this is
@@ -973,13 +1303,16 @@ size_t CNukedSC55Synth::RenderFrames(float* pOutBuffer, size_t nFrames)
 			{
 				nPublishCountdown = 0;
 				__atomic_store_n(&S.cycles_pub, MCU.cycles, __ATOMIC_RELEASE);
-				S.publishes = S.publishes + 1;
+				// Wake core 3 if it is sleeping in wfe (it idles
+				// there instead of Yield, which belongs to core 0).
+				SplitSendEvent();
 			}
 		}
 		if (nPublishCountdown != 0)
 		{
 			__atomic_store_n(&S.cycles_pub, MCU.cycles, __ATOMIC_RELEASE);
-			S.publishes = S.publishes + 1;
+			// Wake core 3 if it is sleeping in wfe.
+			SplitSendEvent();
 		}
 		if (bDiag)
 			m_nMCUUs += CTimer::Get()->GetClockTicks() - nMCUStartUs;
@@ -989,12 +1322,37 @@ size_t CNukedSC55Synth::RenderFrames(float* pOutBuffer, size_t nFrames)
 		// Single-threaded path (split off, or a non-MK1 romset):
 		// exactly the old stepping, now feeding the same ring and
 		// streaming resampler as the split path.
+		unsigned nDeadlineCheckdown = 1;
 		while (m_nSampleRingFill < nNeed && nSteps < nStepBudget)
 		{
 			m_pEmulator->Step();
 			++nSteps;
+			if (--nDeadlineCheckdown == 0)
+			{
+				nDeadlineCheckdown = 16;
+				if (CTimer::Get()->GetClockTicks() - nStartUs >= nDeadlineUs)
+					break;
+			}
 		}
 	}
+
+	// Clean mute (item F): if a previous call latched m_bMuted,
+	// stay silent until the ring recovers to the prefill target
+	// (MuteRecoverFill). The stepping loop above already ran, so
+	// the fill reflects the post-stepping cushion. While muted
+	// and starved, the resampler is skipped entirely (nRenderFrames
+	// = 0, so nDone stays 0): the ring must build up, not be
+	// drained a partial block at a time, and the output is pure
+	// zeros via the underrun path below (no per-block fade-in/out
+	// cycling). On recovery the mute clears and the render below
+	// runs normally; m_bConcealed is still true from the mute
+	// entry, so the existing fade-in ramps the first
+	// ConcealFadeFrames back up from zero -- one fade-in, not
+	// one per block.
+	const bool bMutedStarved = m_bMuted && m_nSampleRingFill < MuteRecoverFill;
+	if (m_bMuted && !bMutedStarved)
+		m_bMuted = false;
+	const size_t nRenderFrames = bMutedStarved ? 0 : nFrames;
 
 	// Streaming resampler: the window (m_SampleA, m_SampleB) brackets
 	// the next output position (m_dReadFrac relative to A). The lerp
@@ -1028,7 +1386,7 @@ size_t CNukedSC55Synth::RenderFrames(float* pOutBuffer, size_t nFrames)
 		// nNeed above already covers FIR consumption (4/3 per output
 		// plus margin); the 66-sample history warms up from zeros
 		// on the first call (inaudible: the emulator starts silent).
-		for (; nDone < nFrames; ++nDone)
+		for (; nDone < nRenderFrames; ++nDone)
 		{
 			const unsigned nPhase = m_FirPhase;
 			const size_t nM = (4 * m_FirOutIndex - nPhase) / 3;
@@ -1058,8 +1416,9 @@ size_t CNukedSC55Synth::RenderFrames(float* pOutBuffer, size_t nFrames)
 				nAccL += nCoeff * m_FirHist[nSlot * 2];
 				nAccR += nCoeff * m_FirHist[nSlot * 2 + 1];
 			}
-			pOutBuffer[nDone * 2] = nAccL * nScale;
-			pOutBuffer[nDone * 2 + 1] = nAccR * nScale;
+			const float fScale = NextVolumeScale();
+			pOutBuffer[nDone * 2] = nAccL * fScale;
+			pOutBuffer[nDone * 2 + 1] = nAccR * fScale;
 			++m_FirOutIndex;
 			m_FirPhase = (m_FirPhase + 1) % 3;
 		}
@@ -1071,7 +1430,7 @@ size_t CNukedSC55Synth::RenderFrames(float* pOutBuffer, size_t nFrames)
 		// (m_dReadFrac relative to A); slides like the lerp
 		// window but 4-wide. Prime duplicates A into prev
 		// (frac starts at 0, so the first output is exactly A).
-		for (; nDone < nFrames; ++nDone)
+		for (; nDone < nRenderFrames; ++nDone)
 		{
 			if (!m_bCubicValid)
 			{
@@ -1088,14 +1447,21 @@ size_t CNukedSC55Synth::RenderFrames(float* pOutBuffer, size_t nFrames)
 			bool bStarved = false;
 			while (m_dReadFrac >= 1.0)
 			{
-				m_CubicPrev = m_CubicA;
-				m_CubicA = m_CubicB;
-				m_CubicB = m_CubicNext;
-				if (!DequeueOne(m_CubicNext))
+				// Dequeue BEFORE shifting: if the ring is dry,
+				// the window and m_dReadFrac are untouched, so the
+				// retry re-attempts the same slide. Shifting first
+				// (as before) skipped one native sample and
+				// duplicated the stale Next on the retry.
+				TSplitSample Next;
+				if (!DequeueOne(Next))
 				{
 					bStarved = true;
 					break;
 				}
+				m_CubicPrev = m_CubicA;
+				m_CubicA = m_CubicB;
+				m_CubicB = m_CubicNext;
+				m_CubicNext = Next;
 				m_dReadFrac -= 1.0;
 			}
 			if (bStarved)
@@ -1108,15 +1474,16 @@ size_t CNukedSC55Synth::RenderFrames(float* pOutBuffer, size_t nFrames)
 			const float w1 = 1.0f - 2.5f * t2 + 1.5f * t3;
 			const float w2 = 0.5f * t + 2.0f * t2 - 1.5f * t3;
 			const float w3 = -0.5f * t2 + 0.5f * t3;
-			pOutBuffer[nDone * 2] = (w0 * m_CubicPrev.nLeft + w1 * m_CubicA.nLeft + w2 * m_CubicB.nLeft + w3 * m_CubicNext.nLeft) * nScale;
-			pOutBuffer[nDone * 2 + 1] = (w0 * m_CubicPrev.nRight + w1 * m_CubicA.nRight + w2 * m_CubicB.nRight + w3 * m_CubicNext.nRight) * nScale;
+			const float fScale = NextVolumeScale();
+			pOutBuffer[nDone * 2] = (w0 * m_CubicPrev.nLeft + w1 * m_CubicA.nLeft + w2 * m_CubicB.nLeft + w3 * m_CubicNext.nLeft) * fScale;
+			pOutBuffer[nDone * 2 + 1] = (w0 * m_CubicPrev.nRight + w1 * m_CubicA.nRight + w2 * m_CubicB.nRight + w3 * m_CubicNext.nRight) * fScale;
 
 			m_dReadFrac += m_dResampleRatio;
 		}
 	}
 	else
 	{
-		for (; nDone < nFrames; ++nDone)
+		for (; nDone < nRenderFrames; ++nDone)
 		{
 			if (!m_bWindowValid)
 			{
@@ -1142,29 +1509,100 @@ size_t CNukedSC55Synth::RenderFrames(float* pOutBuffer, size_t nFrames)
 				break;
 
 			const float nFrac = static_cast<float>(m_dReadFrac);
-			pOutBuffer[nDone * 2]     = (m_SampleA.nLeft + (m_SampleB.nLeft - m_SampleA.nLeft) * nFrac) * nScale;
-			pOutBuffer[nDone * 2 + 1] = (m_SampleA.nRight + (m_SampleB.nRight - m_SampleA.nRight) * nFrac) * nScale;
+			const float fScale = NextVolumeScale();
+			pOutBuffer[nDone * 2]     = (m_SampleA.nLeft + (m_SampleB.nLeft - m_SampleA.nLeft) * nFrac) * fScale;
+			pOutBuffer[nDone * 2 + 1] = (m_SampleA.nRight + (m_SampleB.nRight - m_SampleA.nRight) * nFrac) * fScale;
 
 			m_dReadFrac += m_dResampleRatio;
 		}
 	}
+	// Fade-in on resume: if the previous call ended starved (faded
+	// out), ramp the first ConcealFadeFrames of this call back up
+	// from zero so the resumed signal does not step up.
+	if (m_bConcealed && nDone > 0)
+	{
+		const size_t nFadeIn = nDone < ConcealFadeFrames ? nDone : ConcealFadeFrames;
+		for (size_t j = 0; j < nFadeIn; ++j)
+		{
+			const float fGain = static_cast<float>(j + 1) / static_cast<float>(nFadeIn + 1);
+			pOutBuffer[j * 2]     *= fGain;
+			pOutBuffer[j * 2 + 1] *= fGain;
+		}
+	}
+
 	if (nDone < nFrames)
 	{
-		// Underrun (emulator too slow, or still booting): silence for
-		// the rest of the call; the next call re-primes from whatever
-		// the ring holds then.
-		for (size_t j = nDone; j < nFrames; ++j)
+		// Underrun (emulator too slow, or still booting): conceal
+		// instead of stepping to hard zero. Fade out over the last
+		// ConcealFadeFrames produced frames so the signal ramps to
+		// silence smoothly. The resampler state (read frac, window,
+		// FIR history, cubic window) is KEPT -- the next call
+		// resumes from where it left off instead of re-priming
+		// (which stepped on the way back in). The next call fades
+		// back in (above).
+		// When only a few frames were produced (nDone below
+		// ConcealFadeFrames), skip the fade-out: squeezing it
+		// into those frames drops the level sharply (with three
+		// frames it falls to 25% in three samples). The tail
+		// decay below starts from the last produced sample at
+		// full value and ramps it down smoothly instead.
+		if (nDone >= ConcealFadeFrames)
+		{
+			const size_t nFadeOut = ConcealFadeFrames;
+			for (size_t j = 0; j < nFadeOut; ++j)
+			{
+				const float fGain = 1.0f - static_cast<float>(j + 1) / static_cast<float>(nFadeOut + 1);
+				const size_t nIdx = nDone - nFadeOut + j;
+				pOutBuffer[nIdx * 2]     *= fGain;
+				pOutBuffer[nIdx * 2 + 1] *= fGain;
+			}
+		}
+		// Decay the gap forward from the boundary value instead
+		// of writing hard zeros. The boundary is the faded last
+		// produced sample (nDone > 0), or the stored last sample
+		// of the previous call (nDone == 0 -- nothing was produced
+		// this call, so the old fade-out had nothing to fade and
+		// the signal would otherwise step straight to zero). The
+		// previous block is already in the DAC queue and cannot be
+		// faded, so the tail must start from where the signal
+		// actually was. Decay over min(gap, ConcealFadeFrames),
+		// then zeros.
+		const float fBoundaryL = nDone > 0 ? pOutBuffer[(nDone - 1) * 2] : m_fLastOutL;
+		const float fBoundaryR = nDone > 0 ? pOutBuffer[(nDone - 1) * 2 + 1] : m_fLastOutR;
+		const size_t nGap = nFrames - nDone;
+		const size_t nTail = nGap < ConcealFadeFrames ? nGap : ConcealFadeFrames;
+		for (size_t j = 0; j < nTail; ++j)
+		{
+			const float fGain = 1.0f - static_cast<float>(j + 1) / static_cast<float>(nTail + 1);
+			pOutBuffer[(nDone + j) * 2]     = fBoundaryL * fGain;
+			pOutBuffer[(nDone + j) * 2 + 1] = fBoundaryR * fGain;
+		}
+		for (size_t j = nDone + nTail; j < nFrames; ++j)
 		{
 			pOutBuffer[j * 2]     = 0.0f;
 			pOutBuffer[j * 2 + 1] = 0.0f;
 		}
 		nUnderrunFrames += nFrames - nDone;
-		m_dReadFrac = 0.0;
-		m_bWindowValid = false;
-		if (m_bFirActive)
-			ResetFirState();
-		else if (m_bCubicActive)
-			m_bCubicValid = false;
+		m_bConcealed = true;
+		// Enter clean mute (item F, review fix round 4): latch
+		// muted ONLY when the previous call was also concealed
+		// (bWasConcealed) -- i.e. two consecutive underruns, so
+		// the overload is sustained. The old check latched on
+		// every underrun: it runs in the same call that just
+		// drained the ring, so fill < nNeed is always true after
+		// any underrun, and a one-off shortfall of a few frames
+		// became silence until the idle prefill rebuilt 512
+		// frames (~8-10 ms). A one-off underrun (ring refilled
+		// by the next call) never latches now: bWasConcealed is
+		// false. The fade-out above is the single fade-out; the
+		// exit (fill >= MuteRecoverFill) fades back in once via
+		// m_bConcealed.
+		if (!m_bMuted && bWasConcealed && m_nSampleRingFill < nNeed)
+			m_bMuted = true;
+	}
+	else
+	{
+		m_bConcealed = false;
 	}
 
 	if (bDiag)
@@ -1184,6 +1622,16 @@ size_t CNukedSC55Synth::RenderFrames(float* pOutBuffer, size_t nFrames)
 			++m_Stats.nMisses;
 		m_Stats.nUnderrunFrames += nUnderrunFrames;
 		m_StatsLock.Release();
+	}
+
+	// Remember the last output sample for the next call's
+	// underrun tail (see the gap decay above). This is the
+	// value the DAC already holds, so a following starved call
+	// can decay forward from it instead of stepping to zero.
+	if (nFrames > 0)
+	{
+		m_fLastOutL = pOutBuffer[(nFrames - 1) * 2];
+		m_fLastOutR = pOutBuffer[(nFrames - 1) * 2 + 1];
 	}
 
 	m_Lock.Release();
@@ -1303,7 +1751,7 @@ void CNukedSC55Synth::UpdateLCD(CLCD& LCD, unsigned int nTicks)
 				// when invalid (0 = no reading).
 				if (nTempC != 0)
 				{
-					DiagLog.LogLine("window synth=nuked pct=%llu avg_us=%llu max_us=%llu miss_pct=%llu underrun_frames=%llu temp_c=%u core2_pct=%llu core3_pct=%llu fifo_full_waits=%llu fifo_drops=%llu ring_drops=%llu max_lag=%llu",
+					DiagLog.LogLine("window synth=nuked pct=%llu avg_us=%llu max_us=%llu miss_pct=%llu underrun_frames=%llu temp_c=%u core2_pct=%llu core3_pct=%llu fifo_full_waits=%llu fifo_drops=%llu ring_drops=%llu max_lag=%llu stage_drops=%llu",
 					                static_cast<unsigned long long>(nPct),
 					                static_cast<unsigned long long>(nAvgUs),
 					                static_cast<unsigned long long>(Stats.nMaxUs),
@@ -1315,11 +1763,12 @@ void CNukedSC55Synth::UpdateLCD(CLCD& LCD, unsigned int nTicks)
 					                static_cast<unsigned long long>(nFifoFullWaits),
 					                static_cast<unsigned long long>(nFifoDrops),
 					                static_cast<unsigned long long>(m_nSampleRingDrops),
-					                static_cast<unsigned long long>(S.max_pcm_lag));
+					                static_cast<unsigned long long>(S.max_pcm_lag),
+				                static_cast<unsigned long long>(__atomic_load_n(&m_nStageDrops, __ATOMIC_RELAXED)));
 				}
 				else
 				{
-					DiagLog.LogLine("window synth=nuked pct=%llu avg_us=%llu max_us=%llu miss_pct=%llu underrun_frames=%llu core2_pct=%llu core3_pct=%llu fifo_full_waits=%llu fifo_drops=%llu ring_drops=%llu max_lag=%llu",
+					DiagLog.LogLine("window synth=nuked pct=%llu avg_us=%llu max_us=%llu miss_pct=%llu underrun_frames=%llu core2_pct=%llu core3_pct=%llu fifo_full_waits=%llu fifo_drops=%llu ring_drops=%llu max_lag=%llu stage_drops=%llu",
 					                static_cast<unsigned long long>(nPct),
 					                static_cast<unsigned long long>(nAvgUs),
 					                static_cast<unsigned long long>(Stats.nMaxUs),
@@ -1330,7 +1779,8 @@ void CNukedSC55Synth::UpdateLCD(CLCD& LCD, unsigned int nTicks)
 					                static_cast<unsigned long long>(nFifoFullWaits),
 					                static_cast<unsigned long long>(nFifoDrops),
 					                static_cast<unsigned long long>(m_nSampleRingDrops),
-					                static_cast<unsigned long long>(S.max_pcm_lag));
+					                static_cast<unsigned long long>(S.max_pcm_lag),
+				                static_cast<unsigned long long>(__atomic_load_n(&m_nStageDrops, __ATOMIC_RELAXED)));
 				}
 				m_nLastSplitFifoFullWaits = S.fifo_full_waits;
 				m_nLastSplitFifoDrops = S.fifo_drops;
@@ -1352,7 +1802,7 @@ void CNukedSC55Synth::UpdateLCD(CLCD& LCD, unsigned int nTicks)
 
 								if (nTempC != 0)
 				{
-					DiagLog.LogLine("window synth=nuked pct=%llu avg_us=%llu max_us=%llu miss_pct=%llu underrun_frames=%llu temp_c=%u emu_pct=%llu mcu_pct=%llu pcm_pct=%llu insn_per_sec=%llu",
+					DiagLog.LogLine("window synth=nuked pct=%llu avg_us=%llu max_us=%llu miss_pct=%llu underrun_frames=%llu temp_c=%u emu_pct=%llu mcu_pct=%llu pcm_pct=%llu insn_per_sec=%llu stage_drops=%llu",
 					                static_cast<unsigned long long>(nPct),
 					                static_cast<unsigned long long>(nAvgUs),
 					                static_cast<unsigned long long>(Stats.nMaxUs),
@@ -1362,11 +1812,12 @@ void CNukedSC55Synth::UpdateLCD(CLCD& LCD, unsigned int nTicks)
 					                static_cast<unsigned long long>(nWindowUs > 0 ? nTotalDelta * 100 / nWindowUs : 0),
 					                static_cast<unsigned long long>(nTotalDelta > 0 ? (nTotalDelta - nPCMDelta) * 100 / nTotalDelta : 0),
 					                static_cast<unsigned long long>(nTotalDelta > 0 ? nPCMDelta * 100 / nTotalDelta : 0),
-					                static_cast<unsigned long long>(nWindowUs > 0 ? nInsnDelta * 1000000ULL / nWindowUs : 0));
+					                static_cast<unsigned long long>(nWindowUs > 0 ? nInsnDelta * 1000000ULL / nWindowUs : 0),
+				                static_cast<unsigned long long>(__atomic_load_n(&m_nStageDrops, __ATOMIC_RELAXED)));
 				}
 				else
 				{
-					DiagLog.LogLine("window synth=nuked pct=%llu avg_us=%llu max_us=%llu miss_pct=%llu underrun_frames=%llu emu_pct=%llu mcu_pct=%llu pcm_pct=%llu insn_per_sec=%llu",
+					DiagLog.LogLine("window synth=nuked pct=%llu avg_us=%llu max_us=%llu miss_pct=%llu underrun_frames=%llu emu_pct=%llu mcu_pct=%llu pcm_pct=%llu insn_per_sec=%llu stage_drops=%llu",
 					                static_cast<unsigned long long>(nPct),
 					                static_cast<unsigned long long>(nAvgUs),
 					                static_cast<unsigned long long>(Stats.nMaxUs),
@@ -1375,7 +1826,8 @@ void CNukedSC55Synth::UpdateLCD(CLCD& LCD, unsigned int nTicks)
 					                static_cast<unsigned long long>(nWindowUs > 0 ? nTotalDelta * 100 / nWindowUs : 0),
 					                static_cast<unsigned long long>(nTotalDelta > 0 ? (nTotalDelta - nPCMDelta) * 100 / nTotalDelta : 0),
 					                static_cast<unsigned long long>(nTotalDelta > 0 ? nPCMDelta * 100 / nTotalDelta : 0),
-					                static_cast<unsigned long long>(nWindowUs > 0 ? nInsnDelta * 1000000ULL / nWindowUs : 0));
+					                static_cast<unsigned long long>(nWindowUs > 0 ? nInsnDelta * 1000000ULL / nWindowUs : 0),
+				                static_cast<unsigned long long>(__atomic_load_n(&m_nStageDrops, __ATOMIC_RELAXED)));
 				}
 			}
 		}

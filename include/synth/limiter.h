@@ -65,6 +65,9 @@ public:
 
 	CLimiter()
 		: m_nDelayPos(0)
+		, m_nDequeHead(0)
+		, m_nDequeTail(0)
+		, m_nSeq(0)
 		, m_fGain(1.0f)
 		, m_fRampTarget(1.0f)
 		, m_fRampStep(0.0f)
@@ -93,21 +96,36 @@ public:
 			const float fInR = pBuffer[i * 2 + 1];
 			const float fPeakIn = MaxAbs(fInL, fInR);
 
-			// Window max: peaks of the frames currently in the
-			// delay line plus the incoming frame.
+			// Window max via a monotonic deque (sliding-window
+			// maximum): the deque holds (seq, peak) pairs for the
+			// peaks currently in the delay line, in decreasing
+			// peak order (front = max). This is O(1) amortized
+			// per frame, replacing the old O(240) rescan of the
+			// whole delay line for every output frame (~11.5M
+			// compares/sec on core 2). The deque stores a
+			// sequence number with each peak (not the buffer
+			// position) because positions are reused as the
+			// circular delay line wraps; seq numbers are unique
+			// and increasing, so staleness is exact. The deque
+			// is read BEFORE it is updated for this frame: at
+			// this point it represents the delay line as it
+			// stands (the previous 240 frames), and the window
+			// max is the larger of its front and the incoming
+			// peak. The deque is updated after the frame is
+			// written into the delay line, below.
 			float fWindowMax = fPeakIn;
-			for (size_t k = 0; k < LookaheadFrames; ++k)
+			if (m_nDequeTail != m_nDequeHead)
 			{
-				if (m_DelayPeak[k] > fWindowMax)
-					fWindowMax = m_DelayPeak[k];
+				const float fDequeMax = m_Deque[m_nDequeHead].fPeak;
+				if (fDequeMax > fWindowMax)
+					fWindowMax = fDequeMax;
 			}
+			// Fast path: when the window max is at or below the
+			// ceiling, Ceiling / fWindowMax would be >= 1.0 and
+			// clamp to 1.0 anyway, so skip the divide.
 			float fTarget = 1.0f;
-			if (fWindowMax > 0.0f)
-			{
+			if (fWindowMax > Ceiling)
 				fTarget = Ceiling / fWindowMax;
-				if (fTarget > 1.0f)
-					fTarget = 1.0f;
-			}
 
 			// Gain law: ramp down over the lookahead window on
 			// attack, exponential release on the way back up.
@@ -116,7 +134,26 @@ public:
 				if (!m_bRampActive || fTarget < m_fRampTarget)
 				{
 					m_fRampTarget = fTarget;
-					m_fRampStep = (fTarget - m_fGain) / static_cast<float>(LookaheadFrames);
+					// Steeper-step rule (review fix, round 4): size
+					// the ramp for the full lookahead, but keep the
+					// steeper downward step if a ramp is already
+					// running. m_fRampStep is negative on attack,
+					// so m_fRampStep < fStep keeps the steeper
+					// (more negative) step. The previous argmax
+					// sizing was a no-op: the ramp restarts only
+					// when a larger peak arrives, and that peak is
+					// always the incoming frame, so the argmax exit
+					// was always the full 240 frames away. The real
+					// problem is a bigger newer peak dominating the
+					// window while an older smaller peak exits
+					// soon: the ramp must descend at least as fast
+					// as the already-running ramp, or the safety
+					// cap has to jump the gain down in one sample
+					// when the older peak exits.
+					float fStep = (fTarget - m_fGain) / static_cast<float>(LookaheadFrames);
+					if (m_bRampActive && m_fRampStep < fStep)
+						fStep = m_fRampStep;
+					m_fRampStep = fStep;
 					m_bRampActive = true;
 				}
 				m_fGain += m_fRampStep;
@@ -135,9 +172,12 @@ public:
 
 			// Safety cap: never let the exiting frame exceed the
 			// ceiling, even if a ramp restart lagged behind.
+			// Fast path: when the exiting peak is at or below the
+			// ceiling, Ceiling / fPeakOut would be >= 1.0 and can
+			// never bind below the gain (<= 1.0), so skip it.
 			const float fPeakOut = m_DelayPeak[m_nDelayPos];
 			float fGainOut = m_fGain;
-			if (fPeakOut > 0.0f)
+			if (fPeakOut > Ceiling)
 			{
 				const float fCap = Ceiling / fPeakOut;
 				if (fCap < fGainOut)
@@ -150,8 +190,19 @@ public:
 				}
 			}
 
-			pBuffer[i * 2] = m_DelayL[m_nDelayPos] * fGainOut;
-			pBuffer[i * 2 + 1] = m_DelayR[m_nDelayPos] * fGainOut;
+			// Fast path: multiplying by exactly 1.0 is an identity
+			// in IEEE float, so copy the delayed frame out
+			// without the multiply when the gain is untouched.
+			if (fGainOut == 1.0f)
+			{
+				pBuffer[i * 2] = m_DelayL[m_nDelayPos];
+				pBuffer[i * 2 + 1] = m_DelayR[m_nDelayPos];
+			}
+			else
+			{
+				pBuffer[i * 2] = m_DelayL[m_nDelayPos] * fGainOut;
+				pBuffer[i * 2 + 1] = m_DelayR[m_nDelayPos] * fGainOut;
+			}
 			if (pGainTrace != nullptr)
 				pGainTrace[i] = fGainOut;
 
@@ -164,6 +215,37 @@ public:
 			m_DelayR[m_nDelayPos] = fInR;
 			m_DelayPeak[m_nDelayPos] = fPeakIn;
 			m_nDelayPos = (m_nDelayPos + 1) % LookaheadFrames;
+
+			// Deque update for the incoming peak (seq m_nSeq):
+			// drop entries from the back while their peak is
+			// <= the new peak (they can never be the max, the
+			// new peak is >= and newer), then push the new
+			// entry. Drop the front while it has aged out of
+			// the window the delay line now holds (the frame
+			// just written plus the previous 239): an entry
+			// is out when its seq is >= LookaheadFrames
+			// behind the current one.
+			while (m_nDequeTail != m_nDequeHead)
+			{
+				const size_t nBack = (m_nDequeTail + DequeCapacity - 1) % DequeCapacity;
+				if (m_Deque[nBack].fPeak <= fPeakIn)
+					m_nDequeTail = nBack;
+				else
+					break;
+			}
+			m_Deque[m_nDequeTail].nSeq = m_nSeq;
+			m_Deque[m_nDequeTail].fPeak = fPeakIn;
+			m_nDequeTail = (m_nDequeTail + 1) % DequeCapacity;
+
+			while (m_nDequeTail != m_nDequeHead)
+			{
+				const uint32_t nAge = m_nSeq - m_Deque[m_nDequeHead].nSeq;
+				if (nAge >= LookaheadFrames)
+					m_nDequeHead = (m_nDequeHead + 1) % DequeCapacity;
+				else
+					break;
+			}
+			++m_nSeq;
 		}
 	}
 
@@ -194,6 +276,23 @@ private:
 	float m_DelayR[LookaheadFrames];
 	float m_DelayPeak[LookaheadFrames];
 	size_t m_nDelayPos;
+
+	// Sliding-window maximum for the lookahead window (see
+	// Process()). The deque holds (seq, peak) pairs for the
+	// peaks currently in the delay line, in decreasing peak
+	// order (front = max). Capacity 256 holds the 240-frame
+	// window plus one transient push; head == tail means
+	// empty, so at most 255 entries are ever live.
+	static constexpr size_t DequeCapacity = 256;
+	struct TDequeEntry
+	{
+		uint32_t nSeq;
+		float fPeak;
+	};
+	TDequeEntry m_Deque[DequeCapacity];
+	size_t m_nDequeHead;
+	size_t m_nDequeTail;
+	uint32_t m_nSeq;
 	float m_fGain;
 	float m_fRampTarget;
 	float m_fRampStep;

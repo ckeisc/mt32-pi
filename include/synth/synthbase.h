@@ -48,8 +48,27 @@ public:
 	virtual bool IsActive() = 0;
 	virtual void AllSoundOff() { m_MIDIMonitor.AllNotesOff(); };
 	virtual void SetMasterVolume(u8 nVolume) = 0;
+	// Fade-in on synth switch: reset the applied volume to silence
+	// so the next Render ramps up to the target instead of starting
+	// at full volume mid-signal. Default no-op; Nuked and MU50
+	// override it (they apply master volume as an output scale).
+	// Called by CMT32Pi::SwitchSynth before the new synth becomes
+	// current, so the audio thread is not rendering it yet.
+	virtual void ResetVolumeRamp() {}
 	virtual size_t Render(s16* pOutBuffer, size_t nFrames) = 0;
 	virtual size_t Render(float* pOutBuffer, size_t nFrames) = 0;
+	// Prefill: step the emulator toward a target output cushion
+	// while the DAC queue is full (no room to write), so idle time
+	// builds a cushion instead of spinning on zero-frame Render
+	// calls. Default is a no-op (synths without a prefillable
+	// ring); Nuked overrides it. Returns the ring fill after
+	// prefill (native frames), or 0 if not supported.
+	// pfnShouldStop (optional) is polled during the prefill; when
+	// it returns true the prefill stops early so the caller can
+	// Render instead -- this keeps Prefill from holding the
+	// audio thread while the DAC queue drains. pStopContext is
+	// passed through to the callback.
+	virtual size_t Prefill(size_t /* nTargetFill */, bool (* /* pfnShouldStop */)(void*) = nullptr, void* /* pStopContext */ = nullptr) { return 0; }
 	virtual void ReportStatus() const = 0;
 	virtual void UpdateLCD(CLCD& LCD, unsigned int nTicks) = 0;
 	void SetUserInterface(CUserInterface* pUI) { m_pUI = pUI; }

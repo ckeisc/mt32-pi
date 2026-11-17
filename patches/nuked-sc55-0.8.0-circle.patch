@@ -102,7 +102,7 @@ index f2728ca..7592ab9 100644
  
  void Dis_SCB_F(DisassembleDecoder& decoder, uint8_t byte, DisassembledInstruction& instr)
 diff --git a/src/backend/emu.cpp b/src/backend/emu.cpp
-index 976c02c..dcb1a92 100644
+index 976c02c..637cf69 100644
 --- a/src/backend/emu.cpp
 +++ b/src/backend/emu.cpp
 @@ -17,10 +17,12 @@
@@ -156,7 +156,7 @@ index 976c02c..dcb1a92 100644
  bool Emulator::StartLCD()
  {
      return LCD_Start(*m_lcd);
-@@ -159,11 +192,68 @@ void Emulator::PostSystemReset(EMU_SystemReset reset)
+@@ -159,11 +192,71 @@ void Emulator::PostSystemReset(EMU_SystemReset reset)
      }
  }
  
@@ -166,9 +166,12 @@ index 976c02c..dcb1a92 100644
 +    NukedProfileData g_nukedProfile;
 +}
 +
++bool g_bNukedProfileEnabled = false;
++
 +void NukedProfileSetClock(NukedProfileClockFn pFn)
 +{
 +    g_nukedProfileClock = pFn;
++    g_bNukedProfileEnabled = (pFn != nullptr);
 +}
 +
 +NukedProfileClockFn NukedProfileClock()
@@ -1313,7 +1316,7 @@ index 5207950..d57dfd2 100644
  class LCD_Backend
  {
 diff --git a/src/backend/mcu.cpp b/src/backend/mcu.cpp
-index 41e6b9f..1d10ca5 100644
+index 41e6b9f..6c0c109 100644
 --- a/src/backend/mcu.cpp
 +++ b/src/backend/mcu.cpp
 @@ -20,11 +20,14 @@
@@ -1349,7 +1352,7 @@ index 41e6b9f..1d10ca5 100644
                  }
                  else if (address >= 0xff80)
                  {
-@@ -643,6 +646,7 @@ uint32_t MCU_Read32(mcu_t& mcu, uint32_t address)
+@@ -643,12 +646,20 @@ uint32_t MCU_Read32(mcu_t& mcu, uint32_t address)
  
  void MCU_Write(mcu_t& mcu, uint32_t address, uint8_t value)
  {
@@ -1357,7 +1360,20 @@ index 41e6b9f..1d10ca5 100644
      uint8_t page = (address >> 16) & 0xf;
      address &= 0xffff;
      if (page == 0)
-@@ -678,7 +682,7 @@ void MCU_Write(mcu_t& mcu, uint32_t address, uint8_t value)
+     {
+         if (address & 0x8000)
+         {
++            // Firmware write to the memory-mapped I/O region: it may
++            // change peripheral state (UART/analog/timer/GA), so
++            // invalidate the peripheral gate (item 1) -- the next
++            // StepPeripherals runs the full checks and recomputes.
++            // RAM writes (< 0x8000) do not touch peripherals and do
++            // not invalidate, so the gate stays closed in the hot loop.
++            mcu.next_periph_attention = mcu.cycles;
+             if (!mcu.is_mk1)
+             {
+                 uint16_t base = mcu.is_jv880 ? 0xf000u : 0xe000u;
+@@ -678,7 +689,7 @@ void MCU_Write(mcu_t& mcu, uint32_t address, uint8_t value)
                  }
                  else if (address >= (base | 0x000u) && address < (base | 0x400u))
                  {
@@ -1366,7 +1382,7 @@ index 41e6b9f..1d10ca5 100644
                  }
                  else if (!mcu.is_scb55 && address >= 0xec00 && address < 0xf000)
                  {
-@@ -706,7 +710,7 @@ void MCU_Write(mcu_t& mcu, uint32_t address, uint8_t value)
+@@ -706,7 +717,7 @@ void MCU_Write(mcu_t& mcu, uint32_t address, uint8_t value)
              {
                  if (address >= 0xe000 && address < 0xe040)
                  {
@@ -1375,7 +1391,7 @@ index 41e6b9f..1d10ca5 100644
                  }
                  else if (address >= 0xff80)
                  {
-@@ -784,14 +788,38 @@ void MCU_Write16(mcu_t& mcu, uint32_t address, uint16_t value)
+@@ -784,14 +795,38 @@ void MCU_Write16(mcu_t& mcu, uint32_t address, uint16_t value)
      MCU_Write(mcu, address + 1, (uint8_t)(value & 0xff));
  }
  
@@ -1418,7 +1434,31 @@ index 41e6b9f..1d10ca5 100644
  
      if (mcu.sr & STATUS_T)
      {
-@@ -896,7 +924,7 @@ void MCU_UpdateUART_TX(mcu_t& mcu)
+@@ -847,6 +882,13 @@ void MCU_Reset(mcu_t& mcu)
+ 
+     MCU_DeviceReset(mcu);
+ 
++    // Review fix (round 4): a reset reopens the peripheral gate
++    // (item 1). next_periph_attention = 0 means "attention now",
++    // so the next MCU_StepPeripherals runs the full checks (and
++    // refreshes timer.cycles) instead of trusting a stale
++    // next-attention carried over from before the reset.
++    mcu.next_periph_attention = 0;
++
+     if (mcu.is_mk1)
+     {
+         mcu.ga_int_enable = 255;
+@@ -857,6 +899,9 @@ void MCU_PostUART(mcu_t& mcu, uint8_t data)
+ {
+     mcu.uart_buffer[mcu.uart_write_ptr] = data;
+     mcu.uart_write_ptr = (mcu.uart_write_ptr + 1) % uart_buffer_size;
++    // A MIDI byte arrived: the UART RX may need attention at
++    // uart_rx_delay, so invalidate the peripheral gate (item 1).
++    mcu.next_periph_attention = mcu.cycles;
+ }
+ 
+ void MCU_UpdateUART_RX(mcu_t& mcu)
+@@ -896,22 +941,102 @@ void MCU_UpdateUART_TX(mcu_t& mcu)
      // fprintf(stderr, "tx:%x\n", mcu.dev_register[DEV_TDR]);
  }
  
@@ -1426,15 +1466,27 @@ index 41e6b9f..1d10ca5 100644
 +void MCU_StepMCU(mcu_t& mcu)
  {
      if (!mcu.ex_ignore)
-         MCU_Interrupt_Handle(mcu);
-@@ -904,15 +932,21 @@ void MCU_Step(mcu_t& mcu)
+-        MCU_Interrupt_Handle(mcu);
++    {
++        // Fast path (item 1): nothing pending, skip the
++        // prioritiser. The pending state only changes when a
++        // peripheral sets a request or the firmware triggers an
++        // exception/trapa, so an empty check here is exact: with
++        // nothing pending the handler would do nothing (trapa
++        // empty, exception none, NMI absent, empty pending loop).
++        if (mcu.trapa_pending.begin() != mcu.trapa_pending.end()
++            || mcu.exception_pending >= 0
++            || mcu.interrupt_pending.begin() != mcu.interrupt_pending.end())
++            MCU_Interrupt_Handle(mcu);
++    }
+     else
          mcu.ex_ignore = 0;
  
      if (!mcu.sleep)
 +    {
          MCU_ReadInstruction(mcu);
  
-+        if (NukedProfileClock())
++        if (g_bNukedProfileEnabled)
 +            ++NukedProfile().nInstructions;
 +    }
 +
@@ -1445,31 +1497,109 @@ index 41e6b9f..1d10ca5 100644
 +}
  
 -    PCM_Update(*mcu.pcm, mcu.cycles);
--
++// Next peripheral attention (item 1): the earliest cycle at which any
++// per-step peripheral check could do work. The timer contributes its
++// own next_attention (cycles/2 -> cycles); UART RX/TX contribute their
++// delay cycles when enabled and pending; analog contributes its end
++// time when a conversion is running. Returns mcu.cycles (due now)
++// when the sub-MCU path applies, so that path is never gated; when
++// analog has a conversion to start (end_time 0 means the next call
++// sets it); and when the GA LCD counter is running -- the counter
++// decrements once per StepPeripherals CALL, not per cycle, so a
++// cycle-based next event cannot express it: gating while it runs
++// would pause the countdown and delay the GA interrupt by up to
++// ~250x (the counter would take counter*(counter+1)/2 steps to
++// expire instead of counter steps). The countdown is brief (500
++// steps), so the gate simply stays open while it runs.
++static uint64_t MCU_NextPeriphAttention(mcu_t& mcu)
++{
++    // Sub-MCU models run SM_Update, whose next event is not tracked
++    // here: never gate them.
++    if (!mcu.is_mk1 && !mcu.is_jv880 && !mcu.is_scb55)
++        return mcu.cycles;
++    // GA LCD counter: per-call countdown, not cycle-based -- never
++    // gate while it is running (see the header comment).
++    if (mcu.is_mk1 && mcu.ga_lcd_counter != 0)
++        return mcu.cycles;
++    uint64_t next = ~0ULL; // infinity: nothing due
++    // Timer: next_attention is in cycles/2.
++    uint64_t timer_next = mcu.timer->next_attention * 2;
++    if (timer_next < next)
++        next = timer_next;
++    // UART RX: a byte is latched when cycles reach uart_rx_delay.
++    if ((mcu.dev_register[DEV_SCR] & 16) != 0
++        && mcu.uart_write_ptr != mcu.uart_read_ptr
++        && (mcu.dev_register[DEV_SSR] & 0x40) == 0)
++    {
++        if (mcu.uart_rx_delay < next)
++            next = mcu.uart_rx_delay;
++    }
++    // UART TX: completion is signalled when cycles reach uart_tx_delay.
++    if ((mcu.dev_register[DEV_SCR] & 32) != 0
++        && (mcu.dev_register[DEV_SSR] & 0x80) == 0)
++    {
++        if (mcu.uart_tx_delay < next)
++            next = mcu.uart_tx_delay;
++    }
++    // Analog: a running conversion completes at analog_end_time.
++    if ((mcu.dev_register[DEV_ADCSR] & 0x20) != 0)
++    {
++        if (mcu.analog_end_time == 0)
++            return mcu.cycles; // due now: sets end_time on next call
++        if (mcu.analog_end_time < next)
++            next = mcu.analog_end_time;
++    }
++    return next;
++}
++
 +void MCU_StepPeripherals(mcu_t& mcu)
 +{
++    // Fast path (item 1): one compare. Nothing is due until
++    // next_periph_attention, so skip the timer/UART/analog/LCD
++    // checks entirely. The gate is invalidated on any firmware
++    // write to the I/O region and on MIDI byte arrival, so a state
++    // change outside the step loop always reopens it.
++    if (mcu.cycles < mcu.next_periph_attention)
++        return;
+ 
      TIMER_Clock(*mcu.timer, mcu.cycles);
  
-     if (!mcu.is_mk1 && !mcu.is_jv880 && !mcu.is_scb55)
-@@ -939,6 +973,13 @@ void MCU_Step(mcu_t& mcu)
+@@ -937,6 +1062,15 @@ void MCU_Step(mcu_t& mcu)
+             }
+         }
      }
- }
- 
++
++    mcu.next_periph_attention = MCU_NextPeriphAttention(mcu);
++}
++
 +void MCU_Step(mcu_t& mcu)
 +{
 +    MCU_StepMCU(mcu);
 +    PCM_Update(*mcu.pcm, mcu.cycles);
 +    MCU_StepPeripherals(mcu);
-+}
-+
+ }
+ 
  void MCU_PatchROM(mcu_t& mcu)
- {
-     (void)mcu;
 diff --git a/src/backend/mcu.h b/src/backend/mcu.h
-index 6737cd6..94846de 100644
+index 6737cd6..61c5e91 100644
 --- a/src/backend/mcu.h
 +++ b/src/backend/mcu.h
-@@ -302,6 +302,28 @@ void MCU_Init(mcu_t& mcu, submcu_t& sm, pcm_t& pcm, mcu_timer_t& timer, lcd_t& l
+@@ -225,6 +225,14 @@ struct mcu_t {
+     BoundedOrderedBitSet<INTERRUPT_SOURCE_MAX, MCU_Interrupt_Source> interrupt_pending;
+     BoundedOrderedBitSet<16> trapa_pending;
+     uint64_t cycles = 0;
++    // Next peripheral attention (item 1): the earliest cycle at which
++    // any per-step peripheral check could do work. MCU_StepPeripherals
++    // skips all checks while cycles is below this. Recomputed after
++    // every full run; invalidated (set to cycles) on any firmware
++    // write to the memory-mapped I/O region and on MIDI byte arrival,
++    // so a state change outside the step loop can never be missed.
++    // 0 = attention now (gate open), the initial value.
++    uint64_t next_periph_attention = 0;
+ 
+     uint8_t rom1[ROM1_SIZE]{};
+     uint8_t rom2[ROM2_SIZE]{};
+@@ -302,6 +310,28 @@ void MCU_Init(mcu_t& mcu, submcu_t& sm, pcm_t& pcm, mcu_timer_t& timer, lcd_t& l
  void MCU_Reset(mcu_t& mcu);
  void MCU_PatchROM(mcu_t& mcu);
  void MCU_Step(mcu_t& mcu);
@@ -1499,10 +1629,42 @@ index 6737cd6..94846de 100644
  void MCU_ErrorTrap(mcu_t& mcu);
  
 diff --git a/src/backend/mcu_timer.cpp b/src/backend/mcu_timer.cpp
-index 4916ad5..9823793 100644
+index 4916ad5..7a1eaa6 100644
 --- a/src/backend/mcu_timer.cpp
 +++ b/src/backend/mcu_timer.cpp
-@@ -376,28 +376,134 @@ inline void TIMER_ClockTmr(mcu_timer_t& timer)
+@@ -138,7 +138,18 @@ void TIMER_WriteFRT(mcu_timer_t& timer, uint32_t address, uint8_t data)
+ 
+         const uint8_t stride = timer.frt_step_table[frt.tcr & (FRT_TCR_CKS0 | FRT_TCR_CKS1)];
+ 
+-        frt.deadline = AlignForward(timer.cycles, stride);
++        // Review fix (round 4): do NOT use timer.cycles here. It
++        // is only refreshed by TIMER_Clock, which the peripheral
++        // gate (item 1) skips while nothing is due -- so after a
++        // quiet stretch it is stale and the new deadline aligns
++        // to an old value, shifting the timer phase by a few
++        // ticks. Use the live MCU cycles instead, converted to
++        // the timer's time base (ClockLazy sets timer.cycles =
++        // cycles/2, so the ungated build saw mcu.cycles/2 at a
++        // write). The gate is invalidated on any I/O write, but
++        // that only reopens it for the NEXT step; this write
++        // handler runs before TIMER_Clock in the current step.
++        frt.deadline = AlignForward(timer.mcu->cycles / 2, stride);
+         frt.stride   = stride;
+ 
+         break;
+@@ -242,7 +253,10 @@ void TIMER_WriteTMR(mcu_timer_t& timer, uint32_t address, uint8_t data)
+         }
+         else
+         {
+-            tmr.deadline = AlignForward(timer.cycles, stride);
++            // Review fix (round 4): same stale-timer.cycles issue
++            // as the FRT TCR handler above -- use the live MCU
++            // cycles in the timer's time base (cycles/2).
++            tmr.deadline = AlignForward(timer.mcu->cycles / 2, stride);
+         }
+ 
+         tmr.stride = stride;
+@@ -376,28 +390,133 @@ inline void TIMER_ClockTmr(mcu_timer_t& timer)
          MCU_Interrupt_SetRequest(*timer.mcu, INTERRUPT_SOURCE_TIMER_CMIB, 1);
  }
  
@@ -1621,7 +1783,6 @@ index 4916ad5..9823793 100644
 +    timer.cycles = target_cycles;
 +    if (target_cycles < timer.next_attention)
 +    {
-+        timer.lazy_skips++;
 +        return;
 +    }
 +    MaterializeAll(timer, target_cycles);
@@ -1664,10 +1825,10 @@ index c883521..2b77501 100644
      frt_t   frt[3]{};
 diff --git a/src/backend/nuked_profile.h b/src/backend/nuked_profile.h
 new file mode 100644
-index 0000000..9ea3a05
+index 0000000..eab1f70
 --- /dev/null
 +++ b/src/backend/nuked_profile.h
-@@ -0,0 +1,26 @@
+@@ -0,0 +1,32 @@
 +#pragma once
 +
 +// mt32-pi diagnostics profiling (not part of upstream Nuked-SC55).
@@ -1693,6 +1854,12 @@ index 0000000..9ea3a05
 +
 +void NukedProfileSetClock(NukedProfileClockFn pFn);
 +NukedProfileClockFn NukedProfileClock();
++// Cached enabled flag, set by NukedProfileSetClock. The per-step
++// path (mcu.cpp) tests this directly -- one load + branch --
++// instead of calling NukedProfileClock() every step. Equivalent
++// to (NukedProfileClock() != nullptr); set once at Initialize,
++// before any stepping, and never changed after.
++extern bool g_bNukedProfileEnabled;
 +NukedProfileData& NukedProfile();
 diff --git a/src/backend/pcm.cpp b/src/backend/pcm.cpp
 index b8a4e27..af1eedc 100644
@@ -2479,10 +2646,10 @@ index 15f9a17..269a363 100644
  void PCM_GetConfig(PCM_Config& config, uint8_t config_byte);
 diff --git a/src/backend/split_thread_circle.h b/src/backend/split_thread_circle.h
 new file mode 100644
-index 0000000..ee9abaf
+index 0000000..83dfea3
 --- /dev/null
 +++ b/src/backend/split_thread_circle.h
-@@ -0,0 +1,348 @@
+@@ -0,0 +1,432 @@
 +/*
 + * mt32-pi dual-core Nuked-SC55 split: ROMACCLZ sync (trim + FIFO).
 + *
@@ -2515,8 +2682,16 @@ index 0000000..ee9abaf
 + * The state layout keeps the trim cache-line discipline: each writer
 + * group's fields sit on their own 64-byte lines, separated by 64-byte
 + * spacing (spacing, not base alignment, is what keeps two groups off
-+ * one hardware line). There is deliberately no sev/wfe handling here:
-+ * no wait-for-event exists on this path to lose a wakeup for.
++ * one hardware line). Core 3 idles with wfe/sev, not Yield():
++ * CScheduler::Yield() belongs to core 0 (it has no core check and no
++ * lock, so from core 3 it can save core 3's registers into the main
++ * task's slot and resume a network task on core 3 while core 0 also
++ * runs scheduler tasks). Core 3 spins briefly (SplitPause), then
++ * sleeps with wfe; core 2 sends sev after each cycles_pub store and
++ * core 0 after setting m_bSplitActive. No lost wake-up: sev sets a
++ * latch on every core, so a sev landing between core 3's check and
++ * its wfe makes the wfe return immediately, and core 3 re-checks
++ * for work after every wake.
 + */
 +
 +#ifndef _split_thread_circle_h
@@ -2531,18 +2706,44 @@ index 0000000..ee9abaf
 +#include "pcm.h"
 +
 +// Local cross-core barrier ("dmb ish": inner-shareable, the right
-+// domain for visibility between cores of one SoC).
++// domain for visibility between cores of one SoC). On a non-ARM host
++// (unit tests) this is a compiler barrier; the test is single-threaded
++// and cross-core ordering is not under test.
 +static inline void SplitDMB()
 +{
++#ifdef __aarch64__
 +    __asm__ volatile ("dmb ish" ::: "memory");
++#else
++    __asm__ volatile ("" ::: "memory");
++#endif
 +}
 +
 +// Scheduler-free pause: ARM YIELD hint. Used inside lock spins and
 +// the PCM task's idle backoff; the fork's task loop yields to the
 +// scheduler separately when the PCM task has no work at all.
++// On a non-ARM host this is a compiler barrier (no pause instruction).
 +static inline void SplitPause()
 +{
++#ifdef __aarch64__
 +    __asm__ volatile ("yield" ::: "memory");
++#else
++    __asm__ volatile ("" ::: "memory");
++#endif
++}
++
++// Send an event to wake a core sleeping in wfe. Core 2 calls this
++// after each cycles_pub store and core 0 after setting
++// m_bSplitActive, so core 3 (which idles with wfe) wakes when there
++// is work or a reactivation. A single instruction; the cost on the
++// binding core (core 2) is negligible against the MCU stepping.
++// On a non-ARM host this is a compiler barrier (no sev instruction).
++static inline void SplitSendEvent()
++{
++#ifdef __aarch64__
++    __asm__ volatile ("sev" ::: "memory");
++#else
++    __asm__ volatile ("" ::: "memory");
++#endif
 +}
 +
 +// Trim split state. See the file comment for the layout discipline.
@@ -2578,6 +2779,14 @@ index 0000000..ee9abaf
 +    alignas(64) volatile uint64_t fifo_head{0};       // FIFO producer index (core 2)
 +    uint64_t fifo_tail_cache{0};                      // core-2 private copy of fifo_tail
 +    volatile uint64_t fifo_drops{0};                  // stores dropped after a bounded full-wait (core 3 dead); must be 0
++    // Split-integrity failure (item E): set on every FIFO drop. A
++    // drop means core 3 has stopped draining (it drains every tick),
++    // so the split is already broken and core 3 is rendering from
++    // stale register values. The synth parks core 3, drains the
++    // FIFO on core 2 (FifoDrain) and reactivates the split on
++    // sight (see nukedsc55synth.cpp); it wedges only if the park
++    // times out (core 3 truly dead).
++    volatile uint64_t fifo_resync{0};
 +
 +    // Batch discipline: a tick is at most (31+1)*25 = 800 cycles, and
 +    // a batch renders at most 128 ticks (the 128-sample bound).
@@ -2589,6 +2798,25 @@ index 0000000..ee9abaf
 +    static constexpr uint32_t SplitFifoSize = 4096;
 +    static constexpr uint32_t SplitFifoMask = SplitFifoSize - 1;
 +    alignas(64) PCMDeferredStore fifo[SplitFifoSize]{};
++
++    // Constant-time read-your-own-write overlay (item 3): the newest
++    // pending store per (ram, channel, index), so FifoLookup is a
++    // table read instead of a newest-to-oldest FIFO scan (which is
++    // slowest exactly when core 3 lags and the FIFO is deep).
++    // Core-2-private: only core 2 writes it (FifoPush) and reads it
++    // (FifoLookup); core 3 never touches it. Validity is derived
++    // from the push sequence, not a flag: an entry is pending iff
++    // its seq is in [fifo_tail_cache, fifo_head). A stale entry
++    // (seq below the drained tail, or from a previous split
++    // session) fails that range check. The seq defaults to ~0
++    // (never a real push position): a zero seq would alias the
++    // first push (seq 0) and make every never-pushed register
++    // read as a pending store of value 0. InitFromPCM resets the
++    // tables to this default so a previous session's seqs can
++    // never alias into the new session's range.
++    struct FifoLastValue { uint32_t value{0}; uint64_t seq{~0ULL}; };
++    FifoLastValue lastRam1[32][8]{};
++    FifoLastValue lastRam2[32][16]{};
 +
 +    // Apply every pending deferred store, core 3, tick boundary. One
 +    // ACQUIRE load of the producer index per tick in the common
@@ -2634,6 +2862,11 @@ index 0000000..ee9abaf
 +                    if (CTimer::Get()->GetClockTicks() - t0 >= 20000ULL)
 +                    {
 +                        fifo_drops = fifo_drops + 1;
++                        // Split-integrity failure (item E): flag it
++                        // so the synth wedges the split and falls
++                        // back to single-threaded. A FIFO full for
++                        // 20 ms means core 3 has stopped draining.
++                        fifo_resync = fifo_resync + 1;
 +                        return;
 +                    }
 +                } while (nHead - fifo_tail_cache >= SplitFifoSize);
@@ -2641,28 +2874,34 @@ index 0000000..ee9abaf
 +        }
 +        fifo[nHead & SplitFifoMask] = st;
 +        __atomic_store_n(&fifo_head, nHead + 1, __ATOMIC_RELEASE);
++        // Record the newest pending store for this register, so
++        // FifoLookup is a constant-time table read. The seq is the
++        // push position; FifoLookup checks it against the drained
++        // tail to decide whether this store is still pending.
++        if (st.is_ram2)
++            lastRam2[st.channel][st.index] = FifoLastValue{st.value, nHead};
++        else
++            lastRam1[st.channel][st.index] = FifoLastValue{st.value, nHead};
 +        const uint64_t nDepth = nHead + 1 - fifo_tail_cache;
 +        if (nDepth > fifo_hw)
 +            fifo_hw = nDepth;
 +    }
 +
 +    // Core-2 read-your-own-write overlay: the newest pending store to
-+    // (ram, channel, index), if any. Scans newest to oldest; the FIFO
-+    // is usually empty or a few records deep.
++    // (ram, channel, index), if any. Constant-time table read: the
++    // entry holds the newest push to this register, and it is pending
++    // iff its seq is in [fifo_tail_cache, fifo_head). Equivalent to
++    // the old newest-to-oldest FIFO scan, but O(1) instead of O(depth).
 +    bool FifoLookup(bool bRam2, uint8_t nChannel, uint8_t nIndex, uint32_t* pValue)
 +    {
 +        const uint64_t nHead = fifo_head;
 +        fifo_tail_cache = __atomic_load_n(&fifo_tail, __ATOMIC_ACQUIRE);
-+        uint64_t n = nHead;
-+        while (n != fifo_tail_cache)
++        const FifoLastValue& e = bRam2 ? lastRam2[nChannel][nIndex]
++                                       : lastRam1[nChannel][nIndex];
++        if (e.seq >= fifo_tail_cache && e.seq < nHead)
 +        {
-+            --n;
-+            const PCMDeferredStore& st = fifo[n & SplitFifoMask];
-+            if ((st.is_ram2 != 0) == bRam2 && st.channel == nChannel && st.index == nIndex)
-+            {
-+                *pValue = st.value;
-+                return true;
-+            }
++            *pValue = e.value;
++            return true;
 +        }
 +        return false;
 +    }
@@ -2692,6 +2931,18 @@ index 0000000..ee9abaf
 +        fifo_tail_cache = 0;
 +        fifo_hw = 0;
 +        core3_phase = 0;
++        // Reset the last-value tables to the default (seq ~0,
++        // never a real push): a previous session's seqs must not
++        // alias into this session's [tail, head) range.
++        // (The seq range check alone would fail stale entries only
++        // while head is below the old seq; resetting is exact.)
++        for (uint32_t ch = 0; ch < 32; ++ch)
++        {
++            for (uint32_t ix = 0; ix < 8; ++ix)
++                lastRam1[ch][ix] = FifoLastValue{};
++            for (uint32_t ix = 0; ix < 16; ++ix)
++                lastRam2[ch][ix] = FifoLastValue{};
++        }
 +    }
 +};
 +

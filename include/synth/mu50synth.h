@@ -90,6 +90,7 @@ public:
 	virtual bool IsActive() override;
 	virtual void AllSoundOff() override;
 	virtual void SetMasterVolume(u8 nVolume) override;
+	void ResetVolumeRamp() override;
 	virtual size_t Render(s16* pOutBuffer, size_t nFrames) override;
 	virtual size_t Render(float* pOutBuffer, size_t nFrames) override;
 	virtual void ReportStatus() const override;
@@ -119,7 +120,7 @@ public:
 	// (sweep + cutoff cap) in the SWP00 core. Call before the SWP
 	// thread starts; afterwards the flag is read-only.
 	void SetFilter0277(bool b0277);
-	void PCMTaskIteration();
+	bool PCMTaskIteration();
 	bool ParkSwp(); // request park, wait for ack; false on timeout
 	void UnparkSwp();
 	// Test-only atomic snapshots (safe from any thread).
@@ -170,10 +171,22 @@ private:
 	// nNativeRender frames on entry. Returns the new fractional
 	// carry. Audio-thread only.
 	double ResamplePulledBlock(float* pOutBuffer, size_t nOutDone, size_t nBlockOut, double dBlockStart, size_t nNativeRender);
+	// Volume scale for the next output frame (m_nGain * applied
+	// volume), advancing the ramp by one frame. Called exactly once
+	// per output frame, in order, from ResamplePulledBlock.
+	float NextVolumeScale();
 
 	// Wait for the oldest pending block's frames, pull them into
 	// m_NativeScratch, and resample them. Audio-thread only.
 	void ResamplePendingFront(float* pOutBuffer);
+
+	// Clear the resampler history (item D): the FIR history, cubic
+	// prev/leftover frames, carry and primed flag carry stale samples
+	// from the previous MU50 session across a switch, so the new
+	// session would play them under its fade-in. Called from
+	// SplitActivate (switch-to-MU50). Mirrors the constructor's
+	// zero-init of these fields.
+	void ResetResamplerState();
 
 	// Advance the H8 by the emulated cycles for nNativeFrames of
 	// audio (10 MHz / 44.1 kHz). Single-core mode: caller must hold
@@ -251,6 +264,20 @@ private:
 
 	float m_nGain;
 	u8 m_nVolume;
+
+	// Master-volume ramp (same shape as Nuked): SetMasterVolume only
+	// stores the target; the applied volume chases it over ~5 ms so
+	// a volume change is a smooth ramp, not a gain step at the next
+	// Render call. Advanced once per output frame by
+	// NextVolumeScale(), so it spans ResamplePulledBlock calls.
+	// Audio-thread only; ResetVolumeRamp() is called by SwitchSynth
+	// before this synth becomes current, so the audio thread is not
+	// rendering it yet.
+	static constexpr size_t VolumeRampFrames = 240; // ~5 ms at 48 kHz
+	float m_fVolumeApplied;    // currently applied volume, 0.0-1.0
+	float m_fVolumeRampTarget; // target the current ramp heads toward
+	float m_fVolumeRampStep;   // per-frame step toward the target
+	size_t m_nVolumeRampFrames; // frames remaining in the current ramp
 
 	// Cubic Catmull-Rom resampler state (same 4-tap weights as
 	// Nuked's cubic resampler; implemented locally so Nuked's files
@@ -428,6 +455,16 @@ private:
 	bool m_bSwpActive;       // false = parked (__atomic)
 	bool m_bSwpParkAck;      // SWP set (__atomic)
 	bool m_bAudioBusy;       // audio in RenderResampledSplit (__atomic)
+	// Resampler reset pending (review fix, round 4): set by
+	// SplitActivate on core 0 (__atomic RELEASE), performed and
+	// cleared by the audio thread at the top of its next Render
+	// (__atomic ACQUIRE/RELEASE). SplitActivate runs on core 0
+	// after m_pCurrentSynth has been swapped, so resetting the
+	// resampler state there directly would race core 2, which
+	// can be inside the resampler while its history/carry are
+	// zeroed. The audio thread owns the resampler state, so it
+	// performs the reset itself.
+	bool m_bResamplerResetPending; // (__atomic)
 	s16 m_SwpScratch[2 * kNativeScratchFrames]; // SWP-thread only
 	// Audio-side pending resample blocks (lag-2 pipeline: at most 2).
 	struct TPendingBlock
