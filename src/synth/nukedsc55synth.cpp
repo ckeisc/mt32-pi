@@ -1170,7 +1170,8 @@ size_t CNukedSC55Synth::RenderFrames(float* pOutBuffer, size_t nFrames)
 	// concealed underrun) instead of running long and letting
 	// the DAC queue drain to Circle-inserted nulls. Checked
 	// every 16 steps alongside the ring check. Capped at one DMA
-	// block (m_nDMAblockFrames, half the configured chunk size):
+	// block (m_nDMAblockFrames, half the effective chunk size --
+	// the chunk the sound device actually uses, HDMI-rounded):
 	// a full-chunk request means the queue is already empty, yet
 	// an uncapped deadline would allow another 5.3 ms of stepping
 	// while the DAC stays dry.

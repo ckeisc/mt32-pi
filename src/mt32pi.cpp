@@ -528,7 +528,15 @@ bool CMT32Pi::InitNukedSC55Synth()
 	else if (strcasecmp(m_pConfig->NukedResampler, "linear") == 0)
 		Resampler = TNukedResampler::Linear;
 
-	m_pNukedSC55Synth = new CNukedSC55Synth(m_pConfig->AudioSampleRate, m_pConfig->NukedGain, m_pConfig->NukedOversampling, Resampler, m_pConfig->AudioChunkSize);
+	// The Render deadline cap is one DMA block (chunk/2). The
+	// chunk the sound device actually uses is the effective
+	// one -- HDMI rounds it to a multiple of 384 first, so the
+	// configured AudioChunkSize (256) would cap the deadline
+	// at 128 frames against a real 192-frame block. The queue
+	// size is the effective chunk, so pass that.
+	const unsigned int nEffectiveChunkSize = m_pSound ? m_pSound->GetQueueSizeFrames()
+	                                                  : m_pConfig->AudioChunkSize;
+	m_pNukedSC55Synth = new CNukedSC55Synth(m_pConfig->AudioSampleRate, m_pConfig->NukedGain, m_pConfig->NukedOversampling, Resampler, nEffectiveChunkSize);
 	if (!m_pNukedSC55Synth->Initialize())
 	{
 		LOGWARN("Nuked-SC55 init failed; no complete SC-55 ROM set present?");
@@ -792,41 +800,50 @@ void CMT32Pi::AudioTask()
 				m_Limiter.ResetWindowStats();
 				// DAC null frames in this window, by cumulative
 				// accounting: attempted consumption (elapsed time
-				// x the configured sample rate) minus frames
-				// actually written. The cumulative null count is
-				// the high-water mark of the deficit -- nulls
-				// already played are not undone when the task
-				// later catches up. In-flight frames are not
-				// starvation: the block rendered but not yet
-				// written (nFrames), and the frames sitting in
-				// the DAC queue (GetQueueFramesAvail is the
-				// filled count), are counted toward "written"
-				// so a one-block pipeline bias (up to ~128
-				// frames either way) does not report phantom
-				// nulls or hide a single-block starvation.
-				// The first window is the baseline: any constant
-				// startup / pipeline offset is absorbed there,
-				// and only growth above it is reported.
+				// x the configured sample rate) minus frames the
+				// DAC really took (written - queue fill). The
+				// frames sitting in the queue are the part the
+				// DAC has not consumed, so they belong on the
+				// attempted side:
+				//   nulls = attempted - (written - queue fill)
+				//         = attempted - written + queue fill.
+				// The block rendered but not yet written
+				// (nFrames) has no bearing on nulls already
+				// played and is dropped. The estimate is signed:
+				// the DMA phase can put the first window on
+				// either side of zero. The first window is the
+				// baseline: any startup / pipeline offset is
+				// absorbed there, and only growth above it is
+				// reported. The DAC pulls in whole DMA blocks
+				// while elapsed time is continuous, so the
+				// estimate wobbles by up to one block with no
+				// starvation -- growth of less than one DMA
+				// block (chunk/2) is jitter and is not reported.
 				if (m_bAudioFlowing && m_nAudioStartUs != 0)
 				{
 					const u64 nElapsedUs = nNowUs - m_nAudioStartUs;
-					const u64 nAttempted = nElapsedUs * static_cast<u64>(m_pConfig->AudioSampleRate) / 1000000ULL;
-					const u64 nQueueFill = m_pSound->GetQueueFramesAvail();
-					const u64 nWrittenEff = m_nTotalFramesWritten + nQueueFill + nFrames;
-					if (nAttempted > nWrittenEff)
-					{
-						const u64 nDeficit = nAttempted - nWrittenEff;
-						if (nDeficit > m_nDacNullFrames)
-							m_nDacNullFrames = nDeficit;
-					}
+					const s64 nAttempted = static_cast<s64>(nElapsedUs * static_cast<u64>(m_pConfig->AudioSampleRate) / 1000000ULL);
+					const s64 nQueueFill = static_cast<s64>(m_pSound->GetQueueFramesAvail());
+					const s64 nEstimate = nAttempted + nQueueFill - static_cast<s64>(m_nTotalFramesWritten);
 					if (!m_bDacNullBaselineSet)
 					{
-						m_nDacNullBaseline = m_nDacNullFrames;
+						// First window: the baseline IS this
+						// estimate, and the high-water mark
+						// starts here too -- the DMA phase can
+						// put the estimate below zero, so an
+						// initial high-water mark of 0 would
+						// leave a phantom growth of -baseline.
+						m_nDacNullBaseline = nEstimate;
+						m_nDacNullFrames = nEstimate;
 						m_bDacNullBaselineSet = true;
 					}
+					else if (nEstimate > m_nDacNullFrames)
+						m_nDacNullFrames = nEstimate;
 				}
-				const u64 nCumulativeNulls = (m_nDacNullFrames > m_nDacNullBaseline)
-				                             ? (m_nDacNullFrames - m_nDacNullBaseline) : 0;
+				const s64 nGrowth = m_nDacNullFrames - m_nDacNullBaseline;
+				const u64 nBlockFrames = nQueueSizeFrames / 2;
+				const u64 nCumulativeNulls = (nGrowth >= static_cast<s64>(nBlockFrames))
+				                             ? static_cast<u64>(nGrowth) : 0;
 				const u64 nDacNullFrames = nCumulativeNulls - m_nDacLastNullFrames;
 				m_nDacLastNullFrames = nCumulativeNulls;
 				m_nLimiterWindowStartUs = nNowUs;

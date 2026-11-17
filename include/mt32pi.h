@@ -247,25 +247,34 @@ private:
 	// attempted to consume T * (configured sample rate) frames.
 	// If that exceeds the frames actually written, the
 	// difference is null frames Circle had to insert.
-	// m_nDacNullFrames is the cumulative null-frame count; the
-	// window line reports the delta. m_nAudioStartUs is set on
-	// the first Write; the initial queue fill puts written
-	// ahead of attempted consumption, so startup does not
-	// false-trigger.
-	// In-flight frames are not starvation: the block rendered
-	// but not yet written, and the frames sitting in the DAC
-	// queue, are counted toward "written" so a one-block
-	// pipeline bias (up to ~128 frames either way) does not
-	// report phantom nulls or hide a single-block starvation.
-	// m_nDacNullBaseline is the high-water mark at the first
-	// window; only growth above it is reported, so any constant
+	// The frames the DAC really took are (written - queue
+	// fill): the frames sitting in the queue are the part the
+	// DAC has not consumed, so they belong on the attempted
+	// side: nulls = attempted - (written - queue fill)
+	//              = attempted - written + queue fill.
+	// The block rendered but not yet written (nFrames) has no
+	// bearing on nulls already played and is dropped. The
+	// estimate is signed (s64): the DMA phase can put the
+	// first window on either side of zero, so a negative
+	// baseline is real and must be captured, not clamped.
+	// m_nDacNullFrames is the high-water mark of that signed
+	// estimate; the window line reports the delta. The DAC
+	// pulls in whole DMA blocks while elapsed time is
+	// continuous, so the estimate wobbles by up to one block
+	// with no starvation -- growth of less than one DMA block
+	// (chunk/2, 128 frames at the default 256 chunk) above
+	// the first-window baseline is jitter and is not
+	// reported. A single-block starvation is the smallest
+	// thing this counter reports.
+	// m_nDacNullBaseline is the signed estimate at the first
+	// window; only growth above it is reported, so any
 	// startup / pipeline offset is absorbed there.
 	// NOTE: with an I2S slave DAC (e.g. Pisound) or HDMI, the
 	// DAC clock is not the Pi's timer, so this count drifts by
 	// a few frames per second and is approximate in those modes.
-	u64 m_nDacNullFrames = 0;
+	s64 m_nDacNullFrames = 0;
 	u64 m_nDacLastNullFrames = 0;
-	u64 m_nDacNullBaseline = 0;
+	s64 m_nDacNullBaseline = 0;
 	bool m_bDacNullBaselineSet = false;
 	u64 m_nTotalFramesWritten = 0;
 	u64 m_nAudioStartUs = 0;
