@@ -292,11 +292,15 @@ private:
 	// Three native stereo frames carried across blocks: the frame
 	// before the boundary (cubic's prev tap) plus the pair
 	// straddling it. Without the prev frame, the first output of
-	// each block would lose its fourth tap.
+	// each block would lose its fourth tap. Native frames are
+	// 18-bit DAC samples (full scale 0x20000) in s32: the libmu50
+	// 32-bit render keeps the two low DAC bits the 16-bit render
+	// discards, and the float conversion applies the make-up trim
+	// to the full 18-bit value.
 	static constexpr size_t kNativeScratchFrames = 1024;
-	s16 m_PrevSample[2];
-	s16 m_LeftoverSample[2][2];
-	s16 m_NativeScratch[2 * kNativeScratchFrames];
+	s32 m_PrevSample[2];
+	s32 m_LeftoverSample[2][2];
+	s32 m_NativeScratch[2 * kNativeScratchFrames];
 	float m_FloatScratch[1024];
 
 	// Kaiser FIR resampler state (high-quality option, mirroring
@@ -307,8 +311,9 @@ private:
 	// m_FirHistory holds the 32 native frames immediately before
 	// the current block's first effective frame (index 0), so the
 	// FIR tap at effective index k<0 reads m_FirHistory[32+k].
+	// s32: native frames are 18-bit DAC samples (see above).
 	TMU50Resampler m_Resampler;
-	s16 m_FirHistory[32][2];
+	s32 m_FirHistory[32][2];
 
 	// M1: W-event FIFO + native sample ring (single-core refactor;
 	// no cores yet). The audio core pushes cycle-stamped W records
@@ -371,6 +376,14 @@ private:
 	// double-buffer would remove the race entirely.
 	u8 m_StateSnapVoice[32][5];
 	u32 m_StateSnapCounter;
+	// Finding 3: publish sequence of the block this snapshot
+	// reflects (TPublishedBlock nSeq of the block just rendered).
+	// Seqlock-protected like the voice data above: written between
+	// the odd/even m_nStateSeq bumps, read with the snapshot.
+	// The audio thread compares it with the per-voice key-on /
+	// release sequences in m_VoiceOverlay to decide whether the
+	// snapshot already includes a key-on (else the overlay wins).
+	u64 m_nStateSnapBlockSeq;
 	u32 m_nStateSeq;
 	// Last-good snapshot copy, audio-side only (Copilot review on
 	// PR #12): the last successfully seqlock-read snapshot. If a
@@ -382,11 +395,45 @@ private:
 	// == 0, boot only) ever uses the echo.
 	u8 m_LastGoodVoice[32][5];
 	u32 m_LastGoodCounter;
+	// Finding 3: publish sequence of the block the last-good copy
+	// reflects (m_nStateSnapBlockSeq at the clean read that saved
+	// it). The last-good fallback path applies the same overlay
+	// logic as the clean-read path, against this sequence.
+	u64 m_nLastGoodBlockSeq;
 	bool m_bLastGoodValid;
+	// Finding 3: per-voice post-key-on overlay (audio-thread only).
+	// OnH8SwpWrite records each key-on (control registers
+	// 0x08-0x0b) with the publish sequence of the block that will
+	// carry it (m_nNextPublishSeq + 1) and the five status bytes
+	// the core reports right after keyon(), computed from the
+	// SWP shadow (libmu50::KeyOnStatus). Until a snapshot with a
+	// block sequence >= nKeyOnSeq arrives, OnH8SwpRead answers
+	// from Status instead of the stale snapshot, so the firmware
+	// never sees a fresh voice as finished (DECAY_DONE / 0xFF).
+	// A decay-speed write with bit 7 set after the key-on marks
+	// the voice released (nReleaseSeq / bReleased); the read then
+	// reports the envelope byte with the mode forced to DECAY.
+	// The overlay value is static for up to two blocks, so a very
+	// fast attack completing inside that window is reported as
+	// "still attacking" slightly longer than on hardware -- errs
+	// on the safe side.
+	struct TVoiceOverlay
+	{
+		u64 nKeyOnSeq = 0; // publish seq of the key-on's block; 0 = none
+		u64 nReleaseSeq = 0; // publish seq of the last release write
+		bool bReleased = false; // a release write came after the key-on
+		u8 Status[5] = {}; // filter, envelope, glo, panl, panr
+	};
+	TVoiceOverlay m_VoiceOverlay[32];
+	// Finding 3: Route A hybrid flag, audio-side copy for the
+	// overlay filter formula (SetFilter0277 forwards it to the
+	// core; the overlay needs the same value). Set before the SWP
+	// thread starts, then read-only.
+	bool m_bFilter0277;
 	struct TNativeFrame
 	{
-		s16 nLeft;
-		s16 nRight;
+		s32 nLeft;
+		s32 nRight;
 	};
 	CRingBuffer<TNativeFrame, 16384> m_NativeRing;
 	// M2 split-mode published blocks (SPSC: audio publishes, SWP
@@ -403,6 +450,14 @@ private:
 		size_t nFifoSnap;
 		size_t nFrames;
 		u64 nSeq;
+		// Finding 2: H8 cycle span of the block's AdvanceH8 --
+		// cycles at the start of the advance, and cycles actually
+		// advanced (0 when halted). The SWP thread maps each
+		// W event's cycle stamp to a frame offset within the block
+		// from this span instead of applying all of the block's
+		// writes at frame 0.
+		u64 nStartCycle;
+		u64 nCycles;
 	};
 	mu50spsc::TSpscQueue<TPublishedBlock, 16> m_PublishedBlocks;
 	// M2 MIDI staging (split mode only): MIDI-thread produces,
@@ -433,6 +488,14 @@ private:
 	u64 m_nRenderedEnqueued; // SWP: frames successfully enqueued
 	u64 m_nConsumed;         // audio: frames dequeued
 	u64 m_nPublishedCycles;  // audio: H8 cycles at last publish
+	// Audio-only cycle span of the last AdvanceH8 call (Finding 2):
+	// H8 cycles at the start of the advance, and cycles actually
+	// advanced (0 when halted or when the advance was carry-only).
+	// Single-core RenderResampled maps W events to frame offsets
+	// from this span; split mode carries the same span in the
+	// published block.
+	u64 m_nLastAdvanceStartCycle;
+	u64 m_nLastAdvanceCycles;
 	// M3 split diag + true underruns (__atomic access everywhere):
 	// m_nUnderrunFrames counts every ring-empty-at-pull silence
 	// insertion (split pull shortfall + park-abort silence +
@@ -465,7 +528,7 @@ private:
 	// zeroed. The audio thread owns the resampler state, so it
 	// performs the reset itself.
 	bool m_bResamplerResetPending; // (__atomic)
-	s16 m_SwpScratch[2 * kNativeScratchFrames]; // SWP-thread only
+	s32 m_SwpScratch[2 * kNativeScratchFrames]; // SWP-thread only
 	// Audio-side pending resample blocks (lag-2 pipeline: at most 2).
 	struct TPendingBlock
 	{

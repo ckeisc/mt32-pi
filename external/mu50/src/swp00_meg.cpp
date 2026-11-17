@@ -4,14 +4,18 @@
 #include <algorithm>
 
 namespace libmu50::detail {
-void MegState::reset() noexcept {
- reverb_.fill(0);chorus_.fill(0);variation_.fill(0);offsets_.fill(0);constants_.fill(0);buffer_offset_=0;control_=0;
- rev_vol_=cho_vol_=var_vol_=0;var_lfo_phase_=cho_lfo_phase_=0;
+void MegState::clear_effect_state() noexcept {
+ reverb_.fill(0);chorus_.fill(0);variation_.fill(0);
  var_lfo_h1_=var_lfo_h2_=var_lfo1a_=var_lfo2a_=var_lfo3a_=var_lfo4a_=0;
  vf1_=vf2_=vf3_=vfl1_=vfl2_=vfl3_=vfr1_=vfr2_=vfr3_=0;
  vf21_=vf22a_=vf22b_=vf23a_=vf23b_=vf24_=vf31_=vf32_=0;
  vflp1_=vflp2_=vflp3_=vflp4_=vflp5_=vflp6_=vfrp1_=vfrp2_=vfrp3_=vfrp4_=vfrp5_=vfrp6_=0;
  vh1_=vh2_=vh3_=vh4_=cfl1_=cfl2_=cfl3_=cfr1_=cfr2_=cfr3_=rf1_=rf2_=rf3_=rha_=rhb_=rhc_=rhd_=0;
+}
+void MegState::reset() noexcept {
+ clear_effect_state();offsets_.fill(0);constants_.fill(0);buffer_offset_=0;control_=0;
+ rev_vol_=cho_vol_=var_vol_=0;var_lfo_phase_=cho_lfo_phase_=0;
+ muted_=false;wet_gain_=kWetGainFull;
 }
 void MegState::write_offset(std::uint16_t a,std::uint8_t v) noexcept {if(a<0x180||a>0x1ff)return;auto i=std::size_t(a-0x180);auto&w=offsets_[i>>1];unsigned s=(i&1)?0:8;w=std::uint16_t((w&~(0xffu<<s))|(std::uint16_t(v)<<s));}
 std::uint8_t MegState::read_offset(std::uint16_t a)const noexcept {if(a<0x180||a>0x1ff)return 0xff;auto i=std::size_t(a-0x180);return std::uint8_t(offsets_[i>>1]>>((i&1)?0:8));}
@@ -42,6 +46,14 @@ MegState::s32 MegState::Delay::lfo2(int off,s32 o)const noexcept {
 }
 
 std::array<std::int32_t,2> MegState::process(const VoiceMix& in) noexcept {
+ // MEG mute (control bit 1): on the 1->0 edge the networks restart from
+ // cleared delay memories and filter histories; the wet returns fade
+ // over ~64 samples at both edges so neither edge steps the output.
+ const bool muted=(control_&0x02)!=0;
+ if(muted!=muted_){muted_=muted;if(!muted)clear_effect_state();}
+ const s32 wet_target=muted?0:kWetGainFull;
+ if(wet_gain_<wet_target)wet_gain_=std::min<s32>(wet_gain_+kWetGainStep,wet_target);
+ else if(wet_gain_>wet_target)wet_gain_=std::max<s32>(wet_gain_-kWetGainStep,wet_target);
  Delay br{*this,&reverb_,nullptr,nullptr},bc{*this,nullptr,&chorus_,nullptr},bv{*this,nullptr,nullptr,&variation_};
  s32 dl=in.dry_l,dr=in.dry_r,rev=in.reverb,cl=in.chorus_l,cr=in.chorus_r,vl=in.variation_l,vr=in.variation_r;
  var_vol_=m9(var_vol_,0xbd)+constants_[0xbc];vl=m7(vl,0x04);vr=m7(vr,0x07);s32 vo_l=0,vo_r=0;
@@ -90,7 +102,7 @@ std::array<std::int32_t,2> MegState::process(const VoiceMix& in) noexcept {
  br.put(0x30,m9(br.get(0x21),0x29)+m9(br.get(0x18),0x2a));br.put(0x33,m9(br.get(0x1b),0x33)+rf);s32 r1=m7(br.get(0x33),0x2b)+m7(br.get(0x18),0x2c),r2=m7(br.get(0x27),0x3a)+m7(r1,0x3b);br.put(0x3f,m9(br.get(0x39),0x38)+m9(r1,0x39));
  br.put(0x5d,m9(rha_,0x59)+m9(br.get(0x24),0x5a)+m9(r2,0x5b));rha_=br.get(0x24);br.put(0x63,m9(rhb_,0x5c)+m9(br.get(0x54),0x5d)+m9(r2,0x5e));rhb_=br.get(0x54);br.put(0x69,m9(rhc_,0x62)+m9(br.get(0x5a),0x63)+m9(r2,0x64));rhc_=br.get(0x63);br.put(0x6c,m9(rhd_,0x65)+m9(br.get(0x60),0x66)+m9(r2,0x67));rhd_=br.get(0x66);
  s32 bl=m9(br.get(0x00)+br.get(0x03)+br.get(0x06)+br.get(0x09),0x1c)+m9(br.get(0xbd),0x1b);br.put(0x48,m9(br.get(0x36),0x45)+m9(bl,0x46));s32 rol=m7(br.get(0x36),0x47)+m7(bl,0x48);s32 rr=m9(br.get(0x0c)+br.get(0x0f)+br.get(0x12)+br.get(0x15),0x21)+m9(br.get(0xbd),0x20);br.put(0x48,m9(br.get(0x36),0x51)+m9(rr,0x52));s32 ror=m7(br.get(0x36),0x53)+m7(rr,0x54);
- dl=m7(dl,0xbe);dr=m7(dr,0x01);if(!no_reverb_){dl+=m9v(rol,rev_vol_);dr+=m9v(ror,rev_vol_);}if(!no_chorus_){dl+=m9v(m9(co_l,0x17),cho_vol_);dr+=m9v(m9(co_r,0x0e),cho_vol_);}if(!no_variation_){dl+=m9v(m9(vo_l,0x18),var_vol_);dr+=m9v(m9(vo_r,0x0f),var_vol_);}buffer_offset_--;
+ dl=m7(dl,0xbe);dr=m7(dr,0x01);if(!no_reverb_){dl+=m9v(m9v(rol,rev_vol_),wet_gain_);dr+=m9v(m9v(ror,rev_vol_),wet_gain_);}if(!no_chorus_){dl+=m9v(m9v(m9(co_l,0x17),cho_vol_),wet_gain_);dr+=m9v(m9v(m9(co_r,0x0e),cho_vol_),wet_gain_);}if(!no_variation_){dl+=m9v(m9v(m9(vo_l,0x18),var_vol_),wet_gain_);dr+=m9v(m9v(m9(vo_r,0x0f),var_vol_),wet_gain_);}buffer_offset_--;
  // 0.277 output staging: put_int(i, dry, 32768) delivers int16 = clamp(dry)
  // directly, so the full-domain dry is returned (the host clamps). The HEAD
  // port's >>6 here would lose 6 bits against a 0.277 golden.

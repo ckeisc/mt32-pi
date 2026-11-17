@@ -17,6 +17,12 @@ public:
     std::uint8_t read_constant(std::uint16_t) const noexcept;
     void set_control(std::uint8_t v) noexcept { control_=v; }
     std::uint8_t control() const noexcept { return control_; }
+    // MEG mute (control bit 1; MAME logs it as "mute" in meg_control_w
+    // but neither MAME nor this port acted on it). While set, the
+    // reverb/chorus/variation returns are faded to zero; the dry path
+    // is untouched. On the 1->0 edge the effect delay memories and
+    // filter histories are cleared so a stale tail cannot recirculate
+    // after the firmware reprograms the effect constants.
     // Ablation toggles (diagnosis only, default off). When set, the
     // named effect's output contribution is zeroed (networks still
     // advance; cross-feeds from a disabled effect are also zeroed).
@@ -46,10 +52,18 @@ private:
     s32 alfo(u32,s32,int,int,bool) const noexcept; s32 lfo_mod(s32,int) const noexcept;
     s32 lfo_scale(s32,int) const noexcept; s32 lfo_wrap_reg(s32,int) const noexcept;
     static s32 saturate(s32) noexcept;
+    // Clear the three effect delay memories and every MEG filter
+    // history (variation/chorus/reverb filter states and filtered-LFO
+    // states). Constants, offsets, the delay write pointer, the
+    // rev/cho/var volume smoothers and the LFO phases are left alone.
+    void clear_effect_state() noexcept;
+    static constexpr s32 kWetGainFull=512; // Q9 unity for the wet fade
+    static constexpr s32 kWetGainStep=8;   // 512/64: ~64-sample fades
     std::array<s32,kReverbWords> reverb_{}; std::array<s32,kChorusWords> chorus_{}; std::array<s32,kVariationWords> variation_{};
     std::array<std::uint16_t,0x40> offsets_{}; std::array<std::uint16_t,0xc0> constants_{};
     u32 buffer_offset_=0; std::uint8_t control_=0;
     bool no_reverb_=false, no_chorus_=false, no_variation_=false;
+    bool muted_=false; s32 wet_gain_=kWetGainFull;
     s32 rev_vol_=0,cho_vol_=0,var_vol_=0; u32 var_lfo_phase_=0,cho_lfo_phase_=0;
     s32 var_lfo_h1_=0,var_lfo_h2_=0,var_lfo1a_=0,var_lfo2a_=0,var_lfo3a_=0,var_lfo4a_=0;
     s32 vf1_=0,vf2_=0,vf3_=0,vfl1_=0,vfl2_=0,vfl3_=0,vfr1_=0,vfr2_=0,vfr3_=0;

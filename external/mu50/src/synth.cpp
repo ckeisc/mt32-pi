@@ -231,7 +231,7 @@ Status Synth::sysex(const std::uint8_t*, std::size_t) {
     return {Error::unsupported_operation, "MU50 MIDI SysEx and tone-map handling are not implemented"};
 }
 
-Status Synth::render(std::int16_t* output, std::size_t frames) {
+Status Synth::render(std::int32_t* output, std::size_t frames) {
     if (frames && !output)
         return {Error::invalid_argument, "Output buffer is null"};
     if (impl_->config.sample_rate != kNativeRate)
@@ -249,20 +249,43 @@ Status Synth::render(std::int16_t* output, std::size_t frames) {
         // MAME HEAD output staging: the MEG runs on the full 16.6
         // voice buses, and its dry output is converted to a signed
         // 18-bit ADC sample by >>6 with clamp to ±0x20000
-        // (put_int_clamp), then to host signed 16-bit PCM by >>2.
-        // Running the MEG on unshifted buses (instead of pre-shifting
-        // >>6 in render_one) lets the distortion stage's saturate()
-        // in variation variant 0x80 engage exactly as in HEAD. The
-        // final clamp_s16 handles the 0x20000>>2 = 0x8000 edge (one
-        // above int16 max).
+        // (put_int_clamp). Running the MEG on unshifted buses
+        // (instead of pre-shifting >>6 in render_one) lets the
+        // distortion stage's saturate() in variation variant 0x80
+        // engage exactly as in HEAD. This 32-bit render returns
+        // that 18-bit DAC sample as-is (full scale 0x20000); the
+        // 16-bit render below applies the >>2 truncation.
         auto adc = [](std::int64_t v) -> std::int32_t {
             v >>= 6;
             if (v > 0x20000) v = 0x20000;
             if (v < -0x20000) v = -0x20000;
             return static_cast<std::int32_t>(v);
         };
-        output[2 * i] = clamp_s16(adc(routed[0]) >> 2);
-        output[2 * i + 1] = clamp_s16(adc(routed[1]) >> 2);
+        output[2 * i] = adc(routed[0]);
+        output[2 * i + 1] = adc(routed[1]);
+    }
+    return {};
+}
+
+Status Synth::render(std::int16_t* output, std::size_t frames) {
+    // 16-bit PCM via the 18-bit render, in chunks: the >>2 discards
+    // the two low DAC bits, exactly as the old direct path did
+    // (clamp_s16(adc >> 2)), so this is bit-identical to it. The
+    // final clamp_s16 handles the 0x20000>>2 = 0x8000 edge (one
+    // above int16 max).
+    constexpr std::size_t kChunkFrames = 512;
+    std::int32_t buf[2 * kChunkFrames];
+    std::size_t done = 0;
+    while (done < frames) {
+        const std::size_t chunk = std::min(kChunkFrames, frames - done);
+        Status st = render(buf, chunk);
+        if (!st)
+            return st;
+        for (std::size_t i = 0; i < chunk; ++i) {
+            output[2 * (done + i)] = clamp_s16(buf[2 * i] >> 2);
+            output[2 * (done + i) + 1] = clamp_s16(buf[2 * i + 1] >> 2);
+        }
+        done += chunk;
     }
     return {};
 }
