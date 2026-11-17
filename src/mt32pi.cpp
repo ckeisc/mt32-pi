@@ -556,6 +556,33 @@ void CMT32Pi::MainTask()
 
 	LOGNOTE("Main task on Core 0 starting up");
 
+	// SoundFont is the initial synth but its .sf2 is still
+	// loading on Core 1: wait for it (bounded) so we never
+	// activate an unloaded synth. For any other initial synth
+	// this is skipped entirely -- the main loop starts at once.
+	// On load failure, fall back to another working synth, as in
+	// Initialize().
+	if (m_pCurrentSynth == m_pSoundFontSynth &&
+	    !m_pSoundFontSynth->WaitForLoad())
+	{
+		LOGERR("SoundFont failed to load; falling back to another synth");
+		m_pCurrentSynth = nullptr;
+
+		if (m_pMT32Synth)
+			m_pCurrentSynth = m_pMT32Synth;
+		else if (m_pEmuSCSynth)
+			m_pCurrentSynth = m_pEmuSCSynth;
+		else if (m_pNukedSC55Synth)
+			m_pCurrentSynth = m_pNukedSC55Synth;
+		else if (m_pMU50Synth)
+			m_pCurrentSynth = m_pMU50Synth;
+		else
+		{
+			LOGPANIC("No synths available; ROMs/SoundFonts not found");
+			return;
+		}
+	}
+
 	Awaken();
 
 	while (m_bRunning)
@@ -971,6 +998,18 @@ void CMT32Pi::Run(unsigned nCore)
 			return MainTask();
 
 		case 1:
+			// Background SoundFont load: parse the .sf2 here on
+			// Core 1 while the other cores run, so the ~3 s load
+			// does not delay boot or the main loop. The scheduler
+			// belongs to Core 0, so this cannot be a CTask, and
+			// Cores 2/3 are the audio path -- Core 1 (UI) is the
+			// only core with slack. The LCD and MiSTer polling
+			// stall for the load at boot, while MIDI (Core 0) and
+			// audio (Core 2) are unaffected. Selecting SoundFont
+			// before the load finishes waits for it (see
+			// SwitchSynth).
+			if (m_pSoundFontSynth)
+				m_pSoundFontSynth->LoadSoundFont();
 			return UITask();
 
 		case 2:
@@ -1159,8 +1198,11 @@ void CMT32Pi::UpdateUSB(bool bStartup)
 				LCDLog(TLCDLogType::Spinner, "SoundFont rescan");
 				if (m_pSoundFontSynth)
 					m_pSoundFontSynth->GetSoundFontManager().ScanSoundFonts();
-				else
-					InitSoundFontSynth();
+				else if (InitSoundFontSynth())
+					// Runtime re-init (after boot): no background
+					// load task runs now, so load synchronously
+					// as before.
+					m_pSoundFontSynth->LoadSoundFont();
 
 				if (!m_pEmuSCSynth)
 				{
@@ -1646,6 +1688,15 @@ void CMT32Pi::SwitchSynth(TSynth NewSynth)
 	if (pNewSynth == m_pCurrentSynth)
 	{
 		LCDLog(TLCDLogType::Warning, "Already active!");
+		return;
+	}
+
+	// SoundFont still loading on Core 1: wait for it (bounded)
+	// rather than activating an unloaded synth.
+	if (pNewSynth == m_pSoundFontSynth &&
+	    !m_pSoundFontSynth->WaitForLoad())
+	{
+		LCDLog(TLCDLogType::Warning, "SF load failed!");
 		return;
 	}
 
