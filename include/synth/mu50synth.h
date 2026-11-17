@@ -455,6 +455,16 @@ private:
 	bool m_bSwpActive;       // false = parked (__atomic)
 	bool m_bSwpParkAck;      // SWP set (__atomic)
 	bool m_bAudioBusy;       // audio in RenderResampledSplit (__atomic)
+	// Resampler reset pending (review fix, round 4): set by
+	// SplitActivate on core 0 (__atomic RELEASE), performed and
+	// cleared by the audio thread at the top of its next Render
+	// (__atomic ACQUIRE/RELEASE). SplitActivate runs on core 0
+	// after m_pCurrentSynth has been swapped, so resetting the
+	// resampler state there directly would race core 2, which
+	// can be inside the resampler while its history/carry are
+	// zeroed. The audio thread owns the resampler state, so it
+	// performs the reset itself.
+	bool m_bResamplerResetPending; // (__atomic)
 	s16 m_SwpScratch[2 * kNativeScratchFrames]; // SWP-thread only
 	// Audio-side pending resample blocks (lag-2 pipeline: at most 2).
 	struct TPendingBlock

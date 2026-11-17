@@ -196,7 +196,12 @@ private:
 	// bClearRing discards queued audio (reset path); activation
 	// keeps the priming frames (continuous boot audio). Refuses
 	// to activate when wedged.
-	bool StopSplitPCM();
+	// Park core 3. bSpinWait spins with SplitPause() instead of
+	// CScheduler::Yield() in the wait loop: the audio core (core 2)
+	// must not yield the scheduler while holding m_Lock in
+	// RenderFrames (the FIFO-resync path). Core-0 callers keep
+	// the scheduler yield (default false).
+	bool StopSplitPCM(bool bSpinWait = false);
 	void InitSplitState(bool bClearRing);
 
 	// Core-3 diag heartbeat line: gated on the

@@ -383,7 +383,7 @@ void CNukedSC55Synth::OnSample(s32 nLeft, s32 nRight)
 	m_nWrittenFrames = m_nWrittenFrames + 1;
 }
 
-bool CNukedSC55Synth::StopSplitPCM()
+bool CNukedSC55Synth::StopSplitPCM(bool bSpinWait)
 {
 	if (!m_bSplitActive)
 		return true;
@@ -427,7 +427,16 @@ bool CNukedSC55Synth::StopSplitPCM()
 		// after the first sev (or read a stale flag), so a single
 		// sev does not close the race.
 		SplitSendEvent();
-		CScheduler::Get()->Yield();
+		// Wait primitive depends on the caller: the audio core
+		// (core 2, RenderFrames, m_Lock held) spins with the
+		// scheduler-free SplitPause (a YIELD hint) so it never
+		// yields the scheduler -- and the audio task -- while
+		// holding the lock. Core-0 callers yield the scheduler
+		// (the original behaviour; core 0 is the scheduler core).
+		if (bSpinWait)
+			SplitPause();
+		else
+			CScheduler::Get()->Yield();
 	}
 	SplitDMB();
 	g_splitT = nullptr;
@@ -1149,24 +1158,54 @@ size_t CNukedSC55Synth::RenderFrames(float* pOutBuffer, size_t nFrames)
 
 	m_Lock.Acquire();
 
-	// FIFO overflow recovery (item E): a drop means core 3 stopped
-	// draining, so the split is already broken (core 3 renders from
-	// stale register values). Wedge it and fall back to
-	// single-threaded now: in single-threaded mode SplitPCMWrite
-	// calls PCM_Write directly, so the dropped write's effect is
-	// inherently recovered (the live pcm state is the single source
-	// of truth). StopSplitPCM parks core 3 first; a timeout wedges
-	// the split the same way (the existing park-timeout path). The
+	// Sustained-overload rule (review fix, round 4): capture
+	// whether the PREVIOUS call was concealed, before this call's
+	// underrun logic updates m_bConcealed. Mute latches only on
+	// two consecutive concealed/underrun calls (see below).
+	const bool bWasConcealed = m_bConcealed;
+
+	// FIFO overflow recovery (review fix, round 4): a drop means
+	// core 3 stopped draining, so the split is broken (core 3
+	// renders from stale register values). Recover instead of
+	// wedging: park core 3 (spin-wait -- this is the audio core
+	// holding m_Lock, so no scheduler yield), drain the FIFO on
+	// core 2 so every queued register write lands in the pcm
+	// state, then reactivate the split. The old code wedged
+	// permanently and claimed the dropped write was "inherently
+	// recovered" -- wrong on both counts: in split mode only
+	// core 3 applies FIFO writes to the pcm state, so without the
+	// drain the pcm state is left stale; and one core cannot run
+	// both halves in real time, so single-threaded is
+	// near-continuous silence. Wedge ONLY on a park timeout
+	// (core 3 truly dead); then g_splitT stays set and the FIFO
+	// stays full, so no further recovery is attempted. The
 	// !m_bSplitWedged guard stops a wedged split from re-entering
 	// the park wait on every RenderFrames.
 	if (m_bSplitActive && !m_bSplitWedged && m_pSplitState
 	    && m_pSplitState->fifo_resync != m_nLastSplitFifoResync)
 	{
 		m_nLastSplitFifoResync = m_pSplitState->fifo_resync;
-		DiagLog.LogLine("split fifo_resync drops=%llu wedging single-threaded",
-		                static_cast<unsigned long long>(m_pSplitState->fifo_drops));
-		m_bSplitWedged = true;
-		StopSplitPCM();
+		if (StopSplitPCM(true))
+		{
+			// Core 3 is parked: it touches neither the FIFO
+			// nor the pcm state now, so core 2 can drain the
+			// queued writes itself (FifoDrain applies them to
+			// the live pcm state and advances the tail).
+			// InitSplitState(false) then re-publishes the
+			// state and reactivates without clearing the
+			// sample ring (the queued audio is still valid).
+			m_pSplitState->FifoDrain(m_pEmulator->GetPCM());
+			InitSplitState(false);
+			DiagLog.LogLine("split fifo_resync drops=%llu reactivated",
+			                static_cast<unsigned long long>(m_pSplitState->fifo_drops));
+		}
+		else
+		{
+			// Park timed out: StopSplitPCM already set
+			// m_bSplitWedged and logged splitpark_timeout.
+			DiagLog.LogLine("split fifo_resync drops=%llu park timeout, wedged",
+			                static_cast<unsigned long long>(m_pSplitState->fifo_drops));
+		}
 	}
 
 	// Lock-free MIDI input: drain the staged queue before
@@ -1545,15 +1584,20 @@ size_t CNukedSC55Synth::RenderFrames(float* pOutBuffer, size_t nFrames)
 		}
 		nUnderrunFrames += nFrames - nDone;
 		m_bConcealed = true;
-		// Enter clean mute (item F): if the ring still cannot fill
-		// even one requested block (fill < nNeed), the overload is
-		// sustained -- latch muted so following calls output pure
-		// zeros (resampler skipped) instead of fading out/in every
-		// block. The fade-out above is the single fade-out; the
+		// Enter clean mute (item F, review fix round 4): latch
+		// muted ONLY when the previous call was also concealed
+		// (bWasConcealed) -- i.e. two consecutive underruns, so
+		// the overload is sustained. The old check latched on
+		// every underrun: it runs in the same call that just
+		// drained the ring, so fill < nNeed is always true after
+		// any underrun, and a one-off shortfall of a few frames
+		// became silence until the idle prefill rebuilt 512
+		// frames (~8-10 ms). A one-off underrun (ring refilled
+		// by the next call) never latches now: bWasConcealed is
+		// false. The fade-out above is the single fade-out; the
 		// exit (fill >= MuteRecoverFill) fades back in once via
-		// m_bConcealed. A one-off underrun (ring refilled by the
-		// next call) never latches: fill >= nNeed by then.
-		if (!m_bMuted && m_nSampleRingFill < nNeed)
+		// m_bConcealed.
+		if (!m_bMuted && bWasConcealed && m_nSampleRingFill < nNeed)
 			m_bMuted = true;
 	}
 	else

@@ -171,6 +171,7 @@ CMU50Synth::CMU50Synth(unsigned nSampleRate, float nGain, TMU50Resampler Resampl
 	  m_bSwpActive(true),
 	  m_bSwpParkAck(false),
 	  m_bAudioBusy(false),
+	  m_bResamplerResetPending(false),
 	  m_SwpScratch{},
 	  m_Pending{},
 	  m_nPendingCount(0)
@@ -1669,7 +1670,14 @@ void CMU50Synth::SplitActivate()
 {
 	if (!m_bSplitMode || !m_pSynth)
 		return;
-	ResetResamplerState();
+	// Review fix (round 4): do NOT reset the resampler state
+	// here. SplitActivate runs on core 0 after m_pCurrentSynth
+	// has been swapped, and ResetResamplerState() takes no lock,
+	// so core 2 can be inside the resampler while its history
+	// and carry are zeroed. Flag it instead; the audio thread
+	// performs the reset at the top of its next Render, where it
+	// owns the resampler state (see Render).
+	__atomic_store_n(&m_bResamplerResetPending, true, __ATOMIC_RELEASE);
 	UnparkSwp();
 }
 
@@ -1741,6 +1749,18 @@ size_t CMU50Synth::Render(float* pOutBuffer, size_t nFrames)
 			m_nDiagWindowStartUs = nStartUs;
 		++m_nDiagCalls;
 		m_nDiagOutputFrames += nFrames;
+	}
+	// Deferred resampler reset (review fix, round 4): SplitActivate
+	// (core 0) flags it instead of resetting directly, because
+	// core 2 can be inside the resampler when SplitActivate runs.
+	// The audio thread owns the resampler state, so it performs
+	// the reset here, at the top of its next Render, before any
+	// resampling in this call. Clear the flag after the reset so a
+	// second SplitActivate re-arms it.
+	if (__atomic_load_n(&m_bResamplerResetPending, __ATOMIC_ACQUIRE))
+	{
+		ResetResamplerState();
+		__atomic_store_n(&m_bResamplerResetPending, false, __ATOMIC_RELEASE);
 	}
 	RenderResampled(pOutBuffer, nFrames);
 	if (bDiag)
