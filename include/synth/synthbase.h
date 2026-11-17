@@ -57,6 +57,13 @@ public:
 	virtual void ResetVolumeRamp() {}
 	virtual size_t Render(s16* pOutBuffer, size_t nFrames) = 0;
 	virtual size_t Render(float* pOutBuffer, size_t nFrames) = 0;
+	// Prefill: step the emulator toward a target output cushion
+	// while the DAC queue is full (no room to write), so idle time
+	// builds a cushion instead of spinning on zero-frame Render
+	// calls. Default is a no-op (synths without a prefillable
+	// ring); Nuked overrides it. Returns the ring fill after
+	// prefill (native frames), or 0 if not supported.
+	virtual size_t Prefill(size_t /* nTargetFill */) { return 0; }
 	virtual void ReportStatus() const = 0;
 	virtual void UpdateLCD(CLCD& LCD, unsigned int nTicks) = 0;
 	void SetUserInterface(CUserInterface* pUI) { m_pUI = pUI; }

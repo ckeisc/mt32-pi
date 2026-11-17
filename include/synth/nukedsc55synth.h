@@ -232,8 +232,10 @@ private:
 
 	// Streaming resampler window: the two queued frames bracketing
 	// the next output position (m_dReadFrac relative to the first).
-	// Invalid until primed from the ring (first call, or after an
-	// underrun); a failed prime means the whole call is silence.
+	// Invalid until primed from the ring (first call only); an
+	// underrun keeps the window (concealment) so the next call
+	// resumes from where it left off. A failed prime means the
+	// whole call is silence.
 	TSplitSample m_SampleA;
 	TSplitSample m_SampleB;
 	bool m_bWindowValid;
@@ -258,9 +260,9 @@ private:
 
 	// Cubic Catmull-Rom resampler window (4 samples bracketing the
 	// output position, m_dReadFrac relative to m_CubicA). Primed
-	// from the ring (first call, or after an underrun); m_CubicPrev
-	// duplicates m_CubicA on prime (frac starts at 0, so the first
-	// output is exactly m_CubicA regardless).
+	// from the ring (first call only); an underrun keeps the window
+	// (concealment). m_CubicPrev duplicates m_CubicA on prime (frac
+	// starts at 0, so the first output is exactly m_CubicA regardless).
 	TSplitSample m_CubicPrev;
 	TSplitSample m_CubicA;
 	TSplitSample m_CubicB;
@@ -268,6 +270,26 @@ private:
 	bool m_bCubicValid;
 	bool m_bCubicActive;
 	TNukedResampler m_Resampler;
+
+	// Underrun concealment (pop-free playback): when the ring
+	// starves mid-call, the output fades out over the last
+	// ConcealFadeFrames produced frames instead of stepping to
+	// hard zero, and the resampler state (read frac, window, FIR
+	// history, cubic window) is KEPT so the next call resumes
+	// from where it left off. On the next call after a starved
+	// one, the first ConcealFadeFrames fade back in from zero.
+	// m_bConcealed is true when the previous RenderFrames call
+	// ended starved (faded out). 96 frames = 2 ms at 48 kHz.
+	static constexpr size_t ConcealFadeFrames = 96;
+	bool m_bConcealed;
+
+	// Prefill: step the emulator until the sample ring holds at
+	// least nTargetFill native frames (or the step budget is
+	// exhausted). Called from AudioTask when the DAC queue is
+	// full, so idle time builds a cushion instead of spinning
+	// on zero-frame Render calls. Returns the ring fill after
+	// prefill.
+	size_t Prefill(size_t nTargetFill) override;
 
 	CRingBuffer<TSplitSample, SplitRingFrames> m_SampleRing;
 	volatile size_t m_nSampleRingFill;

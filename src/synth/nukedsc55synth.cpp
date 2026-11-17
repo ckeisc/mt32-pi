@@ -284,6 +284,7 @@ CNukedSC55Synth::CNukedSC55Synth(unsigned nSampleRate, float nGain, bool bOversa
 	  m_bCubicValid(false),
 	  m_bCubicActive(false),
 	  m_Resampler(Resampler),
+	  m_bConcealed(false),
 	  m_SampleRing{},
 	  m_nSampleRingFill(0),
 	  m_nSampleRingDrops(0),
@@ -983,6 +984,69 @@ void CNukedSC55Synth::DrainMidiStage()
 	}
 }
 
+size_t CNukedSC55Synth::Prefill(size_t nTargetFill)
+{
+	if (!m_pEmulator)
+		return 0;
+
+	m_Lock.Acquire();
+
+	// Step the emulator until the sample ring holds at least
+	// nTargetFill native frames, or the step budget is exhausted.
+	// Same stepping as RenderFrames (split: MCU + peripherals with
+	// cycle publishing for core 3; single-threaded: full Step),
+	// but without producing output -- the caller (AudioTask) has
+	// no room in the DAC queue, so this idle time builds a
+	// cushion for the next Render instead of spinning on
+	// zero-frame Render calls.
+	const u64 nStepBudget = static_cast<u64>(nTargetFill + 2) * StepsPerFrameBudget;
+	u64 nSteps = 0;
+
+	if (m_bSplitActive && m_pSplitState)
+	{
+		mcu_t& MCU = m_pEmulator->GetMCU();
+		ThreadSplitStateCircle& S = *m_pSplitState;
+		unsigned nRingCheckdown = 1;
+		unsigned nPublishCountdown = 0;
+		while (m_nSampleRingFill < nTargetFill && nSteps < nStepBudget)
+		{
+			if (--nRingCheckdown == 0)
+			{
+				nRingCheckdown = 16;
+				if (m_nSampleRingFill >= nTargetFill)
+					break;
+			}
+			SplitFoldIrq0(S, MCU);
+			m_pEmulator->StepMCU();
+			m_pEmulator->StepPeripherals();
+			++nSteps;
+			if (++nPublishCountdown >= 8)
+			{
+				nPublishCountdown = 0;
+				__atomic_store_n(&S.cycles_pub, MCU.cycles, __ATOMIC_RELEASE);
+				S.publishes = S.publishes + 1;
+			}
+		}
+		if (nPublishCountdown != 0)
+		{
+			__atomic_store_n(&S.cycles_pub, MCU.cycles, __ATOMIC_RELEASE);
+			S.publishes = S.publishes + 1;
+		}
+	}
+	else
+	{
+		while (m_nSampleRingFill < nTargetFill && nSteps < nStepBudget)
+		{
+			m_pEmulator->Step();
+			++nSteps;
+		}
+	}
+
+	const size_t nFill = m_nSampleRingFill;
+	m_Lock.Release();
+	return nFill;
+}
+
 size_t CNukedSC55Synth::RenderFrames(float* pOutBuffer, size_t nFrames)
 {
 	if (!m_pEmulator)
@@ -1251,23 +1315,49 @@ size_t CNukedSC55Synth::RenderFrames(float* pOutBuffer, size_t nFrames)
 			m_dReadFrac += m_dResampleRatio;
 		}
 	}
+	// Fade-in on resume: if the previous call ended starved (faded
+	// out), ramp the first ConcealFadeFrames of this call back up
+	// from zero so the resumed signal does not step up.
+	if (m_bConcealed && nDone > 0)
+	{
+		const size_t nFadeIn = nDone < ConcealFadeFrames ? nDone : ConcealFadeFrames;
+		for (size_t j = 0; j < nFadeIn; ++j)
+		{
+			const float fGain = static_cast<float>(j + 1) / static_cast<float>(nFadeIn + 1);
+			pOutBuffer[j * 2]     *= fGain;
+			pOutBuffer[j * 2 + 1] *= fGain;
+		}
+	}
+
 	if (nDone < nFrames)
 	{
-		// Underrun (emulator too slow, or still booting): silence for
-		// the rest of the call; the next call re-primes from whatever
-		// the ring holds then.
+		// Underrun (emulator too slow, or still booting): conceal
+		// instead of stepping to hard zero. Fade out over the last
+		// ConcealFadeFrames produced frames so the signal ramps to
+		// silence smoothly, then zero the rest. The resampler state
+		// (read frac, window, FIR history, cubic window) is KEPT --
+		// the next call resumes from where it left off instead of
+		// re-priming (which stepped on the way back in). The next
+		// call fades back in (above).
+		const size_t nFadeOut = nDone < ConcealFadeFrames ? nDone : ConcealFadeFrames;
+		for (size_t j = 0; j < nFadeOut; ++j)
+		{
+			const float fGain = 1.0f - static_cast<float>(j + 1) / static_cast<float>(nFadeOut + 1);
+			const size_t nIdx = nDone - nFadeOut + j;
+			pOutBuffer[nIdx * 2]     *= fGain;
+			pOutBuffer[nIdx * 2 + 1] *= fGain;
+		}
 		for (size_t j = nDone; j < nFrames; ++j)
 		{
 			pOutBuffer[j * 2]     = 0.0f;
 			pOutBuffer[j * 2 + 1] = 0.0f;
 		}
 		nUnderrunFrames += nFrames - nDone;
-		m_dReadFrac = 0.0;
-		m_bWindowValid = false;
-		if (m_bFirActive)
-			ResetFirState();
-		else if (m_bCubicActive)
-			m_bCubicValid = false;
+		m_bConcealed = true;
+	}
+	else
+	{
+		m_bConcealed = false;
 	}
 
 	if (bDiag)

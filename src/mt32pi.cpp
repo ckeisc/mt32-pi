@@ -724,6 +724,22 @@ void CMT32Pi::AudioTask()
 		const size_t nFrames = nQueueSizeFrames - m_pSound->GetQueueFramesAvail();
 		const size_t nWriteBytes = nFrames * nBytesPerFrame;
 
+		if (nFrames == 0)
+		{
+			// DAC queue full: no room to write. Instead of
+			// spinning on a zero-frame Render (which steps
+			// only ~3 frames and pollutes the Render stats),
+			// prefill the emulator toward a target fill of
+			// ~1.5 blocks (512 native frames = 384 output
+			// frames, 8 ms at 48 kHz). This idle time builds
+			// a cushion so the next Render does not starve.
+			// Prefill is a no-op for synths without a
+			// prefillable ring. Then loop back to re-check
+			// the queue.
+			m_pCurrentSynth->Prefill(512);
+			continue;
+		}
+
 		m_pCurrentSynth->Render(FloatBuffer, nFrames);
 
 		// Shared lookahead limiter: the single choke point for
