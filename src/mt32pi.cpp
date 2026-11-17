@@ -528,7 +528,7 @@ bool CMT32Pi::InitNukedSC55Synth()
 	else if (strcasecmp(m_pConfig->NukedResampler, "linear") == 0)
 		Resampler = TNukedResampler::Linear;
 
-	m_pNukedSC55Synth = new CNukedSC55Synth(m_pConfig->AudioSampleRate, m_pConfig->NukedGain, m_pConfig->NukedOversampling, Resampler);
+	m_pNukedSC55Synth = new CNukedSC55Synth(m_pConfig->AudioSampleRate, m_pConfig->NukedGain, m_pConfig->NukedOversampling, Resampler, m_pConfig->AudioChunkSize);
 	if (!m_pNukedSC55Synth->Initialize())
 	{
 		LOGWARN("Nuked-SC55 init failed; no complete SC-55 ROM set present?");
@@ -792,23 +792,43 @@ void CMT32Pi::AudioTask()
 				m_Limiter.ResetWindowStats();
 				// DAC null frames in this window, by cumulative
 				// accounting: attempted consumption (elapsed time
-				// x 48 kHz) minus frames actually written. The
-				// cumulative null count is the high-water mark of
-				// the deficit -- nulls already played are not
-				// undone when the task later catches up.
+				// x the configured sample rate) minus frames
+				// actually written. The cumulative null count is
+				// the high-water mark of the deficit -- nulls
+				// already played are not undone when the task
+				// later catches up. In-flight frames are not
+				// starvation: the block rendered but not yet
+				// written (nFrames), and the frames sitting in
+				// the DAC queue (GetQueueFramesAvail is the
+				// filled count), are counted toward "written"
+				// so a one-block pipeline bias (up to ~128
+				// frames either way) does not report phantom
+				// nulls or hide a single-block starvation.
+				// The first window is the baseline: any constant
+				// startup / pipeline offset is absorbed there,
+				// and only growth above it is reported.
 				if (m_bAudioFlowing && m_nAudioStartUs != 0)
 				{
 					const u64 nElapsedUs = nNowUs - m_nAudioStartUs;
-					const u64 nAttempted = nElapsedUs * 48000ULL / 1000000ULL;
-					if (nAttempted > m_nTotalFramesWritten)
+					const u64 nAttempted = nElapsedUs * static_cast<u64>(m_pConfig->AudioSampleRate) / 1000000ULL;
+					const u64 nQueueFill = m_pSound->GetQueueFramesAvail();
+					const u64 nWrittenEff = m_nTotalFramesWritten + nQueueFill + nFrames;
+					if (nAttempted > nWrittenEff)
 					{
-						const u64 nDeficit = nAttempted - m_nTotalFramesWritten;
+						const u64 nDeficit = nAttempted - nWrittenEff;
 						if (nDeficit > m_nDacNullFrames)
 							m_nDacNullFrames = nDeficit;
 					}
+					if (!m_bDacNullBaselineSet)
+					{
+						m_nDacNullBaseline = m_nDacNullFrames;
+						m_bDacNullBaselineSet = true;
+					}
 				}
-				const u64 nDacNullFrames = m_nDacNullFrames - m_nDacLastNullFrames;
-				m_nDacLastNullFrames = m_nDacNullFrames;
+				const u64 nCumulativeNulls = (m_nDacNullFrames > m_nDacNullBaseline)
+				                             ? (m_nDacNullFrames - m_nDacNullBaseline) : 0;
+				const u64 nDacNullFrames = nCumulativeNulls - m_nDacLastNullFrames;
+				m_nDacLastNullFrames = nCumulativeNulls;
 				m_nLimiterWindowStartUs = nNowUs;
 				DiagLog.LogLine("window limiter limited=%llu min_gain_milli=%u dac_null_frames=%llu",
 				                static_cast<unsigned long long>(nLimited),

@@ -248,7 +248,7 @@ const char* FriendlyModelName(Romset Romset)
 
 } // namespace
 
-CNukedSC55Synth::CNukedSC55Synth(unsigned nSampleRate, float nGain, bool bOversampling, TNukedResampler Resampler)
+CNukedSC55Synth::CNukedSC55Synth(unsigned nSampleRate, float nGain, bool bOversampling, TNukedResampler Resampler, unsigned nChunkSize)
 	: CSynthBase(nSampleRate),
 	  m_pSplitState(nullptr),
 	  m_bSplitActive(false),
@@ -265,6 +265,7 @@ CNukedSC55Synth::CNukedSC55Synth(unsigned nSampleRate, float nGain, bool bOversa
 	  m_fVolumeRampStep(0.0f),
 	  m_nVolumeRampFrames(0),
 	  m_nNativeRate(0),
+	  m_nDMAblockFrames(nChunkSize / 2 ? nChunkSize / 2 : 128),
 	  m_dResampleRatio(1.0),
 	  m_dReadFrac(0.0),
 	  m_nWrittenFrames(0),
@@ -393,6 +394,14 @@ bool CNukedSC55Synth::StopSplitPCM()
 	// the PCM task has parked, nothing touches the backend anymore.
 	m_bSplitActive = false;
 	SplitDMB();
+	// Wake core 3 if it is sleeping in wfe: it must run one
+	// PCMTaskIteration to take the parked branch and ack idle.
+	// Without this sev, a sleeping core 3 never wakes -- core 2
+	// has moved to the new synth, so no further sev arrives --
+	// the wait below runs to its 5 s timeout with m_Lock held,
+	// and the split is wedged permanently (Claude review
+	// 2026-11-16 round 3).
+	SplitSendEvent();
 	// Bounded wait (5 s of wall clock): a parked task acks within
 	// milliseconds, so a timeout means core 3 is wedged inside a
 	// batch. On timeout the split is marked wedged and g_splitT is
@@ -413,6 +422,10 @@ bool CNukedSC55Synth::StopSplitPCM()
 			                        static_cast<unsigned long long>(m_pSplitState ? m_pSplitState->fifo_tail : 0));
 			return false;
 		}
+		// Re-send sev each pass: core 3 may have re-entered wfe
+		// after the first sev (or read a stale flag), so a single
+		// sev does not close the race.
+		SplitSendEvent();
 		CScheduler::Get()->Yield();
 	}
 	SplitDMB();
@@ -1157,11 +1170,12 @@ size_t CNukedSC55Synth::RenderFrames(float* pOutBuffer, size_t nFrames)
 	// concealed underrun) instead of running long and letting
 	// the DAC queue drain to Circle-inserted nulls. Checked
 	// every 16 steps alongside the ring check. Capped at one DMA
-	// block (128 frames): a 256-frame request means the queue is
-	// already empty, yet an uncapped deadline would allow
-	// another 5.3 ms of stepping while the DAC stays dry.
+	// block (m_nDMAblockFrames, half the configured chunk size):
+	// a full-chunk request means the queue is already empty, yet
+	// an uncapped deadline would allow another 5.3 ms of stepping
+	// while the DAC stays dry.
 	const u64 nDeadlineUs = std::min(static_cast<u64>(nFrames) * 1000000ULL / m_nSampleRate,
-	                                 static_cast<u64>(128) * 1000000ULL / m_nSampleRate);
+	                                 static_cast<u64>(m_nDMAblockFrames) * 1000000ULL / m_nSampleRate);
 
 	if (m_bSplitActive && m_pSplitState)
 	{

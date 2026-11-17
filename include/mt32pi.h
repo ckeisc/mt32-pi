@@ -243,16 +243,30 @@ private:
 	// between the check and Write -- the diag f_sync sits in
 	// exactly that gap -- and it counts harmless momentary
 	// empties right after a DMA pull). The DAC consumes one
-	// frame per sample period (48 kHz), so in elapsed time T it
-	// has attempted to consume T*48000 frames. If that exceeds
-	// the frames actually written, the difference is null frames
-	// Circle had to insert. m_nDacNullFrames is the cumulative
-	// null-frame count; the window line reports the delta.
-	// m_nAudioStartUs is set on the first Write; the initial
-	// queue fill puts written ahead of attempted consumption,
-	// so startup does not false-trigger.
+	// frame per sample period, so in elapsed time T it has
+	// attempted to consume T * (configured sample rate) frames.
+	// If that exceeds the frames actually written, the
+	// difference is null frames Circle had to insert.
+	// m_nDacNullFrames is the cumulative null-frame count; the
+	// window line reports the delta. m_nAudioStartUs is set on
+	// the first Write; the initial queue fill puts written
+	// ahead of attempted consumption, so startup does not
+	// false-trigger.
+	// In-flight frames are not starvation: the block rendered
+	// but not yet written, and the frames sitting in the DAC
+	// queue, are counted toward "written" so a one-block
+	// pipeline bias (up to ~128 frames either way) does not
+	// report phantom nulls or hide a single-block starvation.
+	// m_nDacNullBaseline is the high-water mark at the first
+	// window; only growth above it is reported, so any constant
+	// startup / pipeline offset is absorbed there.
+	// NOTE: with an I2S slave DAC (e.g. Pisound) or HDMI, the
+	// DAC clock is not the Pi's timer, so this count drifts by
+	// a few frames per second and is approximate in those modes.
 	u64 m_nDacNullFrames = 0;
 	u64 m_nDacLastNullFrames = 0;
+	u64 m_nDacNullBaseline = 0;
+	bool m_bDacNullBaselineSet = false;
 	u64 m_nTotalFramesWritten = 0;
 	u64 m_nAudioStartUs = 0;
 	bool m_bAudioFlowing = false;

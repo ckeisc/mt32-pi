@@ -1576,15 +1576,27 @@ bool CMU50Synth::ParkSwp()
 {
 	__atomic_store_n(&m_bSwpParkAck, false, __ATOMIC_RELEASE);
 	__atomic_store_n(&m_bSwpActive, false, __ATOMIC_RELEASE);
-	// The worker loop calls PCMTaskIteration continuously (yielding
-	// on idle), so the ack arrives within microseconds; the bound
-	// below is a wedge guard, not a timing assumption. Park must be
+	// Wake core 3 if it is sleeping in wfe: it must run one
+	// PCMTaskIteration to take the parked branch and ack. Without
+	// this sev, a sleeping core 3 never wakes -- the worker loop
+	// idles in wfe when there is no work, it does not call
+	// PCMTaskIteration continuously -- and the spin below runs to
+	// its bound (same gap as Nuked StopSplitPCM; Claude review
+	// 2026-11-16 round 3).
+	__asm__ volatile ("sev" ::: "memory");
+	// The worker loop calls PCMTaskIteration on wake, so the ack
+	// arrives within microseconds of the sev; the bound below is
+	// a wedge guard, not a timing assumption. Park must be
 	// called while the worker thread is running -- parking a joined
 	// thread can never ack, and correctly times out.
 	for (unsigned nSpins = 0; nSpins < 10000000U; ++nSpins)
 	{
 		if (__atomic_load_n(&m_bSwpParkAck, __ATOMIC_ACQUIRE))
 			return true;
+		// Re-send sev periodically: core 3 may have re-entered
+		// wfe after the first sev (or read a stale flag).
+		if ((nSpins & 1023U) == 0)
+			__asm__ volatile ("sev" ::: "memory");
 		mu50spsc::CpuRelax();
 	}
 	return false;

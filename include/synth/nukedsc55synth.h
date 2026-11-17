@@ -62,7 +62,7 @@ public:
 
 	CONFIG_ENUM(TH8Engine, ENUM_NUKEDH8ENGINE);
 
-	CNukedSC55Synth(unsigned nSampleRate, float nGain, bool bOversampling, TNukedResampler Resampler);
+	CNukedSC55Synth(unsigned nSampleRate, float nGain, bool bOversampling, TNukedResampler Resampler, unsigned nChunkSize);
 	virtual ~CNukedSC55Synth() override;
 
 	// Dual-core split: true while the PCM task (core 3) may be
@@ -226,6 +226,12 @@ private:
 	size_t m_nVolumeRampFrames; // frames remaining in the current ramp
 
 	unsigned m_nNativeRate;
+	// One DMA block, in output frames: half the configured audio
+	// chunk size (256 -> 128). The Render wall-clock deadline is
+	// capped at one DMA block; deriving it from the chunk size
+	// keeps the cap correct if the chunk size ever changes
+	// (Claude review 2026-11-16 round 3).
+	unsigned m_nDMAblockFrames;
 	double m_dResampleRatio;	// Native frames consumed per output frame
 	double m_dReadFrac;		// Fractional carry of the streaming resampler
 	volatile u64 m_nWrittenFrames;	// Total native frames produced (callback)
