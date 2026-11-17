@@ -235,86 +235,22 @@ private:
 	// snapshot for split mode. RenderChunk renders one segment of
 	// nChunk frames starting at frame nDone and returns false on
 	// render failure; it is called once per segment (never per
-	// frame). A template parameter (review round 2, item 4), not
+	// frame).
+	// A template parameter (review round 2, item 4), not
 	// std::function: the call is inlined, no indirection. Returns
 	// the frames rendered (== nFrames on success, < nFrames if a
 	// render failed); the caller owns all post-loop work (draining
 	// at/past-end writes, silence for a failed render, snapshot
 	// publishing).
+	// Defined in mu50synth.cpp, not here: the header only
+	// forward-declares libmu50::Synth, and the body calls
+	// m_pSynth->write_register, which needs the complete type
+	// (only mu50synth.cpp includes the real libmu50 header).
+	// Both callers live in that TU, so the template is
+	// instantiated there.
 	template <class RenderChunkFn>
 	size_t RenderSegments(size_t nFrames, u64 nStartCycle, u64 nCycles,
-	                      size_t nFifoSnap, RenderChunkFn&& RenderChunk)
-	{
-		// Stale-snapshot guard (review round 2, issue 2): the same
-		// hazard as DrainWEventsUpTo -- if the out-index already passed
-		// this block's snapshot (the idle drain ran after it was
-		// published), the per-iteration OutIndex() != nFifoSnap check
-		// below would wrap the whole ring and treat later blocks'
-		// writes as this block's. Clamp the snapshot to the current
-		// out-index so the block renders with no writes (they were
-		// already applied, early, by the idle drain). A snapshot that
-		// is still ahead is untouched: consumption only moves the
-		// out-index toward it, so the entry check stays valid.
-		if (!FifoSnapAhead(nFifoSnap))
-			nFifoSnap = m_WEventFifo.OutIndex();
-		size_t nDone = 0;
-		while (nDone < nFrames)
-		{
-			// Next event belonging to this block, if any.
-			TWEvent Event{};
-			bool bHasEvent = false;
-			size_t nOff = nFrames;
-			if (m_WEventFifo.OutIndex() != nFifoSnap &&
-			    m_WEventFifo.TryPeek(Event))
-			{
-				bHasEvent = true;
-				nOff = EventFrameOffset(Event.nCycle, nStartCycle,
-				                        nCycles, nFrames);
-			}
-			if (bHasEvent && nOff <= nDone)
-			{
-				// Event at (or before) the current frame: apply
-				// now, with no zero-length segment (also covers an
-				// out-of-order stamp).
-				if (m_pSynth)
-					m_pSynth->write_register(Event.nAddr, Event.nData);
-				m_WEventFifo.Pop();
-				continue;
-			}
-			const size_t nTarget = bHasEvent ? nOff : nFrames;
-			const size_t nChunk = Utility::Min(nTarget - nDone,
-			                                   Utility::Min(nFrames - nDone, kNativeScratchFrames));
-			if (!RenderChunk(nDone, nChunk))
-				return nDone;
-			nDone += nChunk;
-			if (bHasEvent && nDone == nOff)
-			{
-				if (m_pSynth)
-					m_pSynth->write_register(Event.nAddr, Event.nData);
-				m_WEventFifo.Pop();
-			}
-		}
-		return nDone;
-	}
-
-	// Map a cycle-stamped W event to the native frame within its
-	// block (Finding 2): the firmware issued the write at nCycle,
-	// inside the block's [nStartCycle, nStartCycle + nCycles) span,
-	// so it takes effect that many frames into the block instead of
-	// at frame 0. 0 when the block advanced no cycles (halted /
-	// carry-only) or the event predates the block; nFrames when
-	// at/past the block end (the caller drains those after the
-	// loop). d * nFrames cannot overflow: d < nCycles (~54k max)
-	// and nFrames <= 1024.
-	static size_t EventFrameOffset(u64 nCycle, u64 nStartCycle, u64 nCycles, size_t nFrames)
-	{
-		if (nCycles == 0 || nCycle <= nStartCycle)
-			return 0;
-		const u64 nDelta = nCycle - nStartCycle;
-		if (nDelta >= nCycles)
-			return nFrames;
-		return static_cast<size_t>(nDelta * nFrames / nCycles);
-	}
+	                      size_t nFifoSnap, RenderChunkFn&& RenderChunk);
 
 	// Drain the MIDI staging queue into SCI1 (split mode, audio
 	// thread only, called at each AdvanceH8).

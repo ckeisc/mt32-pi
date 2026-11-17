@@ -93,6 +93,24 @@ constexpr float kNativeToFloat   = kNativeTrim / kNativeFullScale;
 // H8 CPU clock (10 MHz) per libmu50 native audio frame (44.1 kHz).
 constexpr double H8CyclesPerNativeFrame = 10000000.0 / 44100.0;
 
+// Map a cycle-stamped W event to the native frame within its block
+// (Finding 2): the firmware issued the write at nCycle, inside the
+// block's [nStartCycle, nStartCycle + nCycles) span, so it takes
+// effect that many frames into the block instead of at frame 0.
+// 0 when the block advanced no cycles (halted / carry-only) or the
+// event predates the block; nFrames when at/past the block end
+// (the caller drains those after the loop). d * nFrames cannot
+// overflow: d < nCycles (~54k max) and nFrames <= 1024.
+size_t EventFrameOffset(u64 nCycle, u64 nStartCycle, u64 nCycles, size_t nFrames)
+{
+	if (nCycles == 0 || nCycle <= nStartCycle)
+		return 0;
+	const u64 nDelta = nCycle - nStartCycle;
+	if (nDelta >= nCycles)
+		return nFrames;
+	return static_cast<size_t>(nDelta * nFrames / nCycles);
+}
+
 // Wake the SWP core from wfe (ARM only). On the host the worker
 // thread never sleeps in wfe, so this is a no-op there. The bare
 // `sev` asm does not assemble on x86, so it must be guarded --
@@ -1603,6 +1621,62 @@ double CMU50Synth::ResamplePulledBlock(float* pOutBuffer, size_t nOutDone,
 	}
 	return dEndPos - static_cast<double>(nConsumed);
 
+}
+
+template <class RenderChunkFn>
+size_t CMU50Synth::RenderSegments(size_t nFrames, u64 nStartCycle, u64 nCycles,
+                                  size_t nFifoSnap, RenderChunkFn&& RenderChunk)
+{
+	// Stale-snapshot guard (review round 2, issue 2): the same
+	// hazard as DrainWEventsUpTo -- if the out-index already passed
+	// this block's snapshot (the idle drain ran after it was
+	// published), the per-iteration OutIndex() != nFifoSnap check
+	// below would wrap the whole ring and treat later blocks'
+	// writes as this block's. Clamp the snapshot to the current
+	// out-index so the block renders with no writes (they were
+	// already applied, early, by the idle drain). A snapshot that
+	// is still ahead is untouched: consumption only moves the
+	// out-index toward it, so the entry check stays valid.
+	if (!FifoSnapAhead(nFifoSnap))
+		nFifoSnap = m_WEventFifo.OutIndex();
+	size_t nDone = 0;
+	while (nDone < nFrames)
+	{
+		// Next event belonging to this block, if any.
+		TWEvent Event{};
+		bool bHasEvent = false;
+		size_t nOff = nFrames;
+		if (m_WEventFifo.OutIndex() != nFifoSnap &&
+		    m_WEventFifo.TryPeek(Event))
+		{
+			bHasEvent = true;
+			nOff = EventFrameOffset(Event.nCycle, nStartCycle,
+			                        nCycles, nFrames);
+		}
+		if (bHasEvent && nOff <= nDone)
+		{
+			// Event at (or before) the current frame: apply
+			// now, with no zero-length segment (also covers an
+			// out-of-order stamp).
+			if (m_pSynth)
+				m_pSynth->write_register(Event.nAddr, Event.nData);
+			m_WEventFifo.Pop();
+			continue;
+		}
+		const size_t nTarget = bHasEvent ? nOff : nFrames;
+		const size_t nChunk = Utility::Min(nTarget - nDone,
+		                                   Utility::Min(nFrames - nDone, kNativeScratchFrames));
+		if (!RenderChunk(nDone, nChunk))
+			return nDone;
+		nDone += nChunk;
+		if (bHasEvent && nDone == nOff)
+		{
+			if (m_pSynth)
+				m_pSynth->write_register(Event.nAddr, Event.nData);
+			m_WEventFifo.Pop();
+		}
+	}
+	return nDone;
 }
 
 void CMU50Synth::RenderResampled(float* pOutBuffer, size_t nFrames)
