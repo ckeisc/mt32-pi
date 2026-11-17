@@ -25,6 +25,7 @@
 
 #include <circle/types.h>
 
+#include <functional>
 #include <vector>
 
 #include "synth/synthbase.h"
@@ -201,6 +202,27 @@ private:
 	// concurrent, since modes are exclusive.
 	void DrainWEventsUpTo(size_t nSnap);
 	void DrainWEvents();
+
+	// Shared per-write segment loop (Finding 2; review item 9):
+	// walk a block of nFrames in segments split at each pending
+	// write's frame offset (from the block's cycle span
+	// [nStartCycle, nStartCycle + nCycles)), applying each write
+	// at its offset instead of draining up front, so a
+	// damp-then-key-on pair in one block gets samples for the damp
+	// to act. nFifoSnap bounds which writes belong to this block:
+	// the live in-index for single-core (the H8 is not running
+	// during the loop, so it is stable), the published block's
+	// snapshot for split mode. RenderChunk renders one segment of
+	// nChunk frames starting at frame nDone and returns false on
+	// render failure; it is called once per segment (never per
+	// frame), so the std::function call overhead is negligible.
+	// Returns the frames rendered (== nFrames on success, <
+	// nFrames if a render failed); the caller owns all post-loop
+	// work (draining at/past-end writes, silence for a failed
+	// render, snapshot publishing).
+	size_t RenderSegments(size_t nFrames, u64 nStartCycle, u64 nCycles,
+	                      size_t nFifoSnap,
+	                      const std::function<bool(size_t nDone, size_t nChunk)>& RenderChunk);
 
 	// Drain the MIDI staging queue into SCI1 (split mode, audio
 	// thread only, called at each AdvanceH8).
@@ -425,6 +447,15 @@ private:
 		u8 Status[5] = {}; // filter, envelope, glo, panl, panr
 	};
 	TVoiceOverlay m_VoiceOverlay[32];
+	// Finding 7: which voices have had a glo (0x2e) / pan (0x2f)
+	// write since construction, one bit per (voice, reg): bit
+	// (chan*2 + (reg == 0x2f)). The shadow seeds glo/pan at 0xff
+	// (the MixerBlock's effective reset target, needed by the
+	// key-on overlay), but the core's channel_regs reset them to
+	// 0 -- so a split-mode read of a never-written 0x2e/0x2f
+	// must return 0x00, not the shadow's 0xff (see OnH8SwpRead).
+	// Audio thread only; set in OnH8SwpWrite, read in OnH8SwpRead.
+	u64 m_nGloPanWrittenMask = 0;
 	// Finding 3: Route A hybrid flag, audio-side copy for the
 	// overlay filter formula (SetFilter0277 forwards it to the
 	// core; the overlay needs the same value). Set before the SWP

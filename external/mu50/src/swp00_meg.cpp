@@ -15,7 +15,7 @@ void MegState::clear_effect_state() noexcept {
 void MegState::reset() noexcept {
  clear_effect_state();offsets_.fill(0);constants_.fill(0);buffer_offset_=0;control_=0;
  rev_vol_=cho_vol_=var_vol_=0;var_lfo_phase_=cho_lfo_phase_=0;
- muted_=false;wet_gain_=kWetGainFull;
+ muted_=false;wet_gain_=kWetGainFull;clear_pending_=false;
 }
 void MegState::write_offset(std::uint16_t a,std::uint8_t v) noexcept {if(a<0x180||a>0x1ff)return;auto i=std::size_t(a-0x180);auto&w=offsets_[i>>1];unsigned s=(i&1)?0:8;w=std::uint16_t((w&~(0xffu<<s))|(std::uint16_t(v)<<s));}
 std::uint8_t MegState::read_offset(std::uint16_t a)const noexcept {if(a<0x180||a>0x1ff)return 0xff;auto i=std::size_t(a-0x180);return std::uint8_t(offsets_[i>>1]>>((i&1)?0:8));}
@@ -46,14 +46,21 @@ MegState::s32 MegState::Delay::lfo2(int off,s32 o)const noexcept {
 }
 
 std::array<std::int32_t,2> MegState::process(const VoiceMix& in) noexcept {
- // MEG mute (control bit 1): on the 1->0 edge the networks restart from
- // cleared delay memories and filter histories; the wet returns fade
- // over ~64 samples at both edges so neither edge steps the output.
+ // MEG mute (control bit 1): the wet returns fade over ~64 samples
+ // at both edges so neither edge steps the output. On the 1->0 edge
+ // the networks restart from cleared delay memories and filter
+ // histories -- but only once the fade-out has reached zero. Clearing
+ // mid-fade would truncate a still-audible tail into a step, so a
+ // quick off-toggle defers the clear (clear_pending_) and holds the
+ // wet target at zero until the fade completes; the clear then runs
+ // inaudibly at zero gain and the fade-in restarts from clean state.
+ // A long mute clears immediately at the edge (gain already zero).
  const bool muted=(control_&0x02)!=0;
- if(muted!=muted_){muted_=muted;if(!muted)clear_effect_state();}
- const s32 wet_target=muted?0:kWetGainFull;
+ if(muted!=muted_){muted_=muted;if(!muted){if(wet_gain_==0)clear_effect_state();else clear_pending_=true;}}
+ const s32 wet_target=(muted||clear_pending_)?0:kWetGainFull;
  if(wet_gain_<wet_target)wet_gain_=std::min<s32>(wet_gain_+kWetGainStep,wet_target);
  else if(wet_gain_>wet_target)wet_gain_=std::max<s32>(wet_gain_-kWetGainStep,wet_target);
+ if(clear_pending_&&wet_gain_==0){clear_effect_state();clear_pending_=false;}
  Delay br{*this,&reverb_,nullptr,nullptr},bc{*this,nullptr,&chorus_,nullptr},bv{*this,nullptr,nullptr,&variation_};
  s32 dl=in.dry_l,dr=in.dry_r,rev=in.reverb,cl=in.chorus_l,cr=in.chorus_r,vl=in.variation_l,vr=in.variation_r;
  var_vol_=m9(var_vol_,0xbd)+constants_[0xbc];vl=m7(vl,0x04);vr=m7(vr,0x07);s32 vo_l=0,vo_r=0;

@@ -11,24 +11,25 @@
 // from the audio-side register shadow) until a snapshot that includes
 // the key-on arrives.
 //
-// The formulas below are a literal transcription of the core's keyon()
-// + status() functions in external/mu50/src/swp00_0277.cpp (HEAD port):
-//   EnvelopeBlock::keyon/status, FilterBlock::keyon/status/info_w,
-//   MixerBlock::keyon/status_glo/status_panl/status_panr/pan_w.
-// No render state is consulted: keyon() sets every status-relevant
-// field from the registers alone, except the filter sweep flag (see
-// below), so the five bytes are a pure function of the registers.
+// KeyOnStatus is computed by the core's OWN keyon() + status()
+// functions (EnvelopeBlock, FilterBlock, MixerBlock in
+// external/mu50/src/swp00_0277.cpp), run on a scratch Swp0277Core in
+// synth.cpp -- one source of truth, so later core fixes cannot silently
+// drift from a hand transcription here. (PR #15 originally transcribed
+// those functions by hand; the transcription was verified 0-mismatch
+// over 4000 random cases against the core, and the scratch-core
+// implementation reproduces it exactly over the same 4000 cases.)
 //
-// Filter sweep assumption: keyon() with the filter-speed bit 7 clear
-// leaves m_sweep untouched, so a sweep still in flight from a previous
-// key-on on the same voice would report "not done" while this code
-// reports "done" (0xc0 bit set). That only affects the filter byte,
-// only when a voice is re-keyed mid-sweep with bit 7 clear, and only
-// for the <=2 blocks the overlay lives -- the envelope byte (the one
-// the firmware's note-end decision reads) is exact. The overlay value
-// is static for up to two blocks, so a very fast attack completing
-// inside that window is reported as "still attacking" slightly longer
-// than on hardware -- errs on the safe side.
+// Fresh-state assumption: the scratch core is fresh, so a filter sweep
+// still in flight from a previous key-on on the same voice reads as
+// "done", exactly as the old transcription assumed -- keyon() with the
+// filter-speed bit 7 clear leaves m_sweep untouched, so only the filter
+// byte is affected, only when a voice is re-keyed mid-sweep with bit 7
+// clear, and only for the <=2 blocks the overlay lives. The envelope
+// byte (the one the firmware's note-end decision reads) is exact. The
+// overlay value is static for up to two blocks, so a very fast attack
+// completing inside that window is reported as "still attacking"
+// slightly longer than on hardware -- errs on the safe side.
 #pragma once
 
 #include <cstdint>
@@ -52,65 +53,11 @@ struct KeyOnRegs {
 // Post-key-on status bytes, in snapshot order:
 //   out[0] filter, out[1] envelope, out[2] mixer glo,
 //   out[3] mixer panl, out[4] mixer panr.
-inline void KeyOnStatus(const KeyOnRegs& r, std::uint8_t out[5]) noexcept {
-    // Envelope (EnvelopeBlock::keyon + status):
-    //   decay_speed bit 7 set -> immediate release: level 0, DECAY.
-    //   else attack_speed bit 7 set -> normal attack: level =
-    //   attack_level << 4, ATTACK. Else level 0, ATTACK.
-    //   status = (mode << 6) | (level >> 6).
-    std::uint8_t env;
-    if (r.decay_speed & 0x80) {
-        env = static_cast<std::uint8_t>((2 << 6) | 0);
-    } else if (r.attack_speed & 0x80) {
-        env = static_cast<std::uint8_t>((0 << 6) | (r.attack_level >> 2));
-    } else {
-        env = 0;
-    }
-    out[1] = env;
-
-    // Filter (FilterBlock::info_w + keyon + status):
-    //   k_target = level | 0x800 (level = info & 0x7ff), with the
-    //   0277 cap at 0x7c0 when the resonance bits are below 4.
-    //   keyon with speed bit 7 set: HEAD starts the cutoff at 0x800
-    //   and sweeps up (not done); 0277 puts it straight to target
-    //   (still sweeping, hidden timer). Without bit 7 the cutoff
-    //   goes straight to target and the sweep is done (see the
-    //   sweep assumption in the header comment).
-    //   status = (done ? 0xc0 : 0x00) | ((k >> 6) ^ 0x3f).
-    std::uint16_t level = static_cast<std::uint16_t>(r.lpf_info & 0x7ff);
-    if (r.filter_0277 && (r.lpf_info >> 11) < 4 && level > 0x7c0)
-        level = 0x7c0;
-    const std::uint16_t k_target =
-        level ? static_cast<std::uint16_t>(level | 0x800) : 0;
-    std::uint16_t k;
-    bool sweep_done;
-    if (r.lpf_speed & 0x80) {
-        k = r.filter_0277 ? k_target : 0x800;
-        sweep_done = false;
-    } else {
-        k = k_target;
-        sweep_done = true;
-    }
-    out[0] = static_cast<std::uint8_t>(
-        (sweep_done ? 0xc0 : 0x00) | ((k >> 6) ^ 0x3f));
-
-    // Mixer (MixerBlock::keyon + status_*): keyon snaps the current
-    // glo/panl/panr to their targets, so all three report done.
-    //   glo: tglo = glo << 4, status = 0xc0 | (tglo >> 6).
-    out[2] = static_cast<std::uint8_t>(0xc0 | (r.glo >> 2));
-    //   pan: tpanl = (pan << 2) & 0x3c0, tpanr = (pan << 6) & 0x3c0,
-    //   either 0x3c0 maps to 0xfff; status = 0xc0 | (t >> 6).
-    std::uint16_t tpanl =
-        static_cast<std::uint16_t>((r.pan << 2) & 0x3c0);
-    if (tpanl == 0x3c0)
-        tpanl = 0xfff;
-    std::uint16_t tpanr =
-        static_cast<std::uint16_t>((r.pan << 6) & 0x3c0);
-    if (tpanr == 0x3c0)
-        tpanr = 0xfff;
-    out[3] = static_cast<std::uint8_t>(0xc0 | (tpanl >> 6));
-    out[4] = static_cast<std::uint8_t>(0xc0 | (tpanr >> 6));
-}
+// Defined in synth.cpp: runs the core's own keyon()/status() on a
+// scratch Swp0277Core seeded with these registers. No render state is
+// consulted: keyon() sets every status-relevant field from the
+// registers alone, except the filter sweep flag (see above).
+void KeyOnStatus(const KeyOnRegs& r, std::uint8_t out[5]) noexcept;
 
 // Envelope status with the mode forced to DECAY, level bits kept:
 // what a decay-speed write with bit 7 set (EnvelopeBlock::

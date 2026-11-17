@@ -22,7 +22,10 @@ public:
     // reverb/chorus/variation returns are faded to zero; the dry path
     // is untouched. On the 1->0 edge the effect delay memories and
     // filter histories are cleared so a stale tail cannot recirculate
-    // after the firmware reprograms the effect constants.
+    // after the firmware reprograms the effect constants -- but the
+    // clear is deferred until the fade-out has reached zero (see
+    // clear_pending_ in process()): clearing mid-fade would truncate
+    // a still-audible tail into a step.
     // Ablation toggles (diagnosis only, default off). When set, the
     // named effect's output contribution is zeroed (networks still
     // advance; cross-feeds from a disabled effect are also zeroed).
@@ -64,6 +67,11 @@ private:
     u32 buffer_offset_=0; std::uint8_t control_=0;
     bool no_reverb_=false, no_chorus_=false, no_variation_=false;
     bool muted_=false; s32 wet_gain_=kWetGainFull;
+    // Set on the 1->0 mute edge while the fade-out is still in
+    // progress: the effect-state clear is deferred until wet_gain_
+    // reaches zero (process() holds the wet target at zero meanwhile),
+    // so the clear never truncates a still-audible tail.
+    bool clear_pending_=false;
     s32 rev_vol_=0,cho_vol_=0,var_vol_=0; u32 var_lfo_phase_=0,cho_lfo_phase_=0;
     s32 var_lfo_h1_=0,var_lfo_h2_=0,var_lfo1a_=0,var_lfo2a_=0,var_lfo3a_=0,var_lfo4a_=0;
     s32 vf1_=0,vf2_=0,vf3_=0,vfl1_=0,vfl2_=0,vfl3_=0,vfr1_=0,vfr2_=0,vfr3_=0;

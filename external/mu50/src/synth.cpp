@@ -4,6 +4,7 @@
 // decoding mirrors MAME HEAD's rchan/rctrl maps; the voice semantics
 // live in Swp0277Core and the MEG tail in MegState.
 #include "libmu50/synth.hpp"
+#include "libmu50/keyon_status.hpp"
 #include "swp00_0277.hpp"
 #include "swp00_meg.hpp"
 
@@ -13,6 +14,30 @@
 #include <utility>
 
 namespace libmu50 {
+
+// Post-key-on SWP00 voice status (see keyon_status.hpp): runs the
+// core's own keyon()/status() on a scratch Swp0277Core seeded with the
+// audio-side register shadow, so the overlay can never drift from the
+// core. One ~5 KB scratch core per call, on the key-on write path (not
+// the per-sample render path); key-ons arrive at MIDI rates.
+void KeyOnStatus(const KeyOnRegs& r, std::uint8_t out[5]) noexcept {
+    detail::Swp0277Core core;
+    core.set_filter_0277(r.filter_0277);
+    core.set_attack_speed(0, r.attack_speed);
+    core.set_attack_level(0, r.attack_level);
+    core.set_decay_speed(0, r.decay_speed);
+    core.set_lpf_info(0, r.lpf_info);
+    core.set_lpf_speed(0, r.lpf_speed);
+    core.set_glo_level(0, r.glo);
+    core.set_pan(0, r.pan);
+    core.keyon(0);
+    out[0] = core.filter_status(0);
+    out[1] = core.envelope_status(0);
+    out[2] = core.mixer_status_glo(0);
+    out[3] = core.mixer_status_panl(0);
+    out[4] = core.mixer_status_panr(0);
+}
+
 namespace {
 constexpr std::size_t kWaveRomSize = 0x400000;
 constexpr std::uint32_t kNativeRate = 44100;
@@ -268,6 +293,17 @@ Status Synth::render(std::int32_t* output, std::size_t frames) {
 }
 
 Status Synth::render(std::int16_t* output, std::size_t frames) {
+    // Same guards as render(int32_t*) and as the pre-PR#15 direct
+    // path (c4d640c): null output, sample rate and ROM are validated
+    // even for a 0-frame call, so render(nullptr, N) cannot write
+    // through the null pointer and a 0-frame call still reports a
+    // bad rate / missing ROM instead of silently succeeding.
+    if (frames && !output)
+        return {Error::invalid_argument, "Output buffer is null"};
+    if (impl_->config.sample_rate != kNativeRate)
+        return {Error::unsupported_sample_rate, "The SWP00 core currently renders at its native 44100 Hz rate"};
+    if (impl_->wave_rom.empty())
+        return {Error::rom_not_loaded, "Load the MU50 waveform ROM before rendering"};
     // 16-bit PCM via the 18-bit render, in chunks: the >>2 discards
     // the two low DAC bits, exactly as the old direct path did
     // (clamp_s16(adc >> 2)), so this is bit-identical to it. The

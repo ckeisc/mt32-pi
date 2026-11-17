@@ -111,6 +111,18 @@ size_t EventFrameOffset(u64 nCycle, u64 nStartCycle, u64 nCycles, size_t nFrames
 	return static_cast<size_t>(nDelta * nFrames / nCycles);
 }
 
+// Wake the SWP core from wfe (ARM only). On the host the worker
+// thread never sleeps in wfe, so this is a no-op there. The bare
+// `sev` asm does not assemble on x86, so it must be guarded --
+// without this the file cannot build in the host harnesses
+// (mu50spsc.h documents the same ARM/host split).
+inline void WakeSwpCore()
+{
+#if defined(__aarch64__)
+	__asm__ volatile ("sev" ::: "memory");
+#endif
+}
+
 // H8 hook targets: the hook address is the SWP00 window offset
 // (0x0000-0x07ff), which is exactly libmu50's register address.
 // The write hook's cycle is the 10 MHz H8 cycle domain timestamp
@@ -217,15 +229,22 @@ CMU50Synth::CMU50Synth(unsigned nSampleRate, float nGain, TMU50Resampler Resampl
 	  m_Pending{},
 	  m_nPendingCount(0)
 {
-	// Finding 3: seed the per-channel shadow with the core's
-	// reset values for the registers the key-on overlay reads
-	// (Synth::Impl::reset seeds the same values in channel_regs):
+	// Finding 3: seed the per-channel shadow with the EFFECTIVE
+	// reset values for the registers the key-on overlay reads:
 	// phase hi 0x80 (reg 0x08), LPF info 0x27ff (regs 0x20/0x21),
 	// glo 0xff (reg 0x2e) and pan 0xff (reg 0x2f). Without this a
 	// voice the firmware keys on without first writing a register
 	// would get an overlay computed from zeros instead of the
-	// reset values (e.g. filter 0xff instead of 0xc0). Address
-	// decoding mirrors Synth::write_register's rchan window:
+	// reset values (e.g. filter 0xff instead of 0xc0). NOTE: for
+	// 0x08/0x20/0x21 these match Synth::Impl::reset's channel_regs
+	// seeds, but for 0x2e/0x2f they do NOT -- channel_regs resets
+	// glo/pan to 0x00, while the MixerBlock's own m_glo/m_pan
+	// reset to 0xff, which is the value the overlay must use
+	// (a live core reports status 0xff for a never-written
+	// glo/pan). The split-mode read path therefore returns 0x00
+	// for a never-written 0x2e/0x2f via the written-mask
+	// (Finding 7) instead of the shadow's 0xff. Address decoding
+	// mirrors Synth::write_register's rchan window:
 	// addr = ((reg & 0x3e) << 5) | (reg & 1) | (voice << 1).
 	// All other overlay registers reset to 0, matching the shadow.
 	for (unsigned nChan = 0; nChan < 32; ++nChan)
@@ -498,15 +517,42 @@ void CMU50Synth::OnH8SwpWrite(u64 nCycle, u16 nAddr, u8 nData)
 	if (m_pSynth)
 	{
 		const TWEvent Event{ nCycle, nAddr, nData };
+		// Pre-write shadow value (for the overlay target
+		// comparisons below: the shadow is updated next, so the
+		// old value must be captured here).
+		u8 nOldShadow = 0;
 		if (nAddr < sizeof(m_SwpShadow))
-			m_SwpShadow[nAddr] = nData;
-		if (m_bSplitMode)
 		{
-			// Finding 3: track key-ons / releases for the
-			// split-mode 0x01 overlay (audio thread only).
-			// nWriteSeq is the publish sequence of the block
-			// this write will drain into: the block published
-			// at the end of the AdvanceH8 running now.
+			nOldShadow = m_SwpShadow[nAddr];
+			m_SwpShadow[nAddr] = nData;
+		}
+		// Single-core only: apply the state-address write (reg
+		// 0x01) to the core immediately, as well as queueing it.
+		// The firmware writes the state address and then reads
+		// 0x01 to get that voice's status, so a 0x01 read must
+		// observe it -- but draining the whole FIFO on a read
+		// (see OnH8SwpRead) applies every pending voice write
+		// early and collapses damp/key-on timing to frame 0. The
+		// state address has no audio effect, so applying it
+		// eagerly is free; the segment loop re-applies the same
+		// value later (no read can observe the transient, reads
+		// only happen during AdvanceH8). Split mode must NOT do
+		// this: the core is SWP-thread-owned there.
+		if (!m_bSplitMode && nAddr == 0x01)
+			m_pSynth->write_register(nAddr, nData);
+		// Finding 3: track key-ons / releases for the 0x01
+		// overlay (audio thread only, BOTH modes). The overlay
+		// gives a 0x01 read the post-key-on voice state while
+		// the key-on write is still queued for the segment
+		// loop: split mode compares the write sequence against
+		// the snapshot sequence, single-core mode checks
+		// whether the key-on write is still in the FIFO (see
+		// OnH8SwpRead). nWriteSeq is the publish sequence of
+		// the block this write will drain into: the block
+		// published at the end of the AdvanceH8 running now
+		// (split mode only; single-core never publishes, so
+		// the sequence is unused there).
+		{
 			const u64 nWriteSeq = m_nNextPublishSeq + 1;
 			if (nAddr >= 0x08 && nAddr <= 0x0b)
 			{
@@ -547,20 +593,114 @@ void CMU50Synth::OnH8SwpWrite(u64 nCycle, u16 nAddr, u8 nData)
 			}
 			else if (nAddr < 0x800)
 			{
-				// Per-channel window (rchan decode): a decay
-				// speed write (reg 0x28) with bit 7 set forces
-				// the envelope mode to DECAY
-				// (EnvelopeBlock::decay_speed_w) -- the
-				// release. Record it so a read before the
-				// snapshot catches up reports DECAY, not the
-				// snapshot's pre-release mode.
+				// Per-channel window (rchan decode).
 				const u8 nReg = static_cast<u8>(((nAddr >> 5) & 0x3e) | (nAddr & 1));
+				const unsigned nChan = (nAddr >> 1) & 0x1f;
+				TVoiceOverlay& Overlay = m_VoiceOverlay[nChan];
 				if (nReg == 0x28 && (nData & 0x80))
 				{
-					const unsigned nChan = (nAddr >> 1) & 0x1f;
-					TVoiceOverlay& Overlay = m_VoiceOverlay[nChan];
+					// A decay speed write (reg 0x28) with bit
+					// 7 set forces the envelope mode to DECAY
+					// (EnvelopeBlock::decay_speed_w) -- the
+					// release. Record it so a read before the
+					// snapshot catches up reports DECAY, not
+					// the snapshot's pre-release mode.
 					Overlay.nReleaseSeq = nWriteSeq;
 					Overlay.bReleased = true;
+				}
+				// A write to a register whose status byte the
+				// overlay reports clears that byte's done bit
+				// -- but only when the write actually moves the
+				// target the core tracks. The core sets a NEW
+				// target on the write and reports not-done until
+				// the ramp/sweep reaches it (MixerBlock glo_w /
+				// pan_w, FilterBlock info_w), so the overlay
+				// must not keep reporting the old target as done
+				// -- the firmware would otherwise see a fade as
+				// finished while the voice is still ramping and
+				// could steal the voice early. The level bits
+				// are untouched: the write itself does not change
+				// the current level. Comparing the new target
+				// against the old target (from the pre-write
+				// shadow value) is exact whenever the done bit
+				// is set -- then the current level equals the
+				// old target (keyon() sets current = target,
+				// and nothing moves it while the target is
+				// unchanged), so the new done state is exactly
+				// (new target == old target); when the done bit
+				// is already clear the clear is a no-op. A
+				// blind clear would over-clear: e.g. pan
+				// 0x40->0x60 moves panl (0x100->0x180) but
+				// leaves panr at 0x000, so panr must stay done.
+				// Clearing is harmless when the overlay is not
+				// consulted: a never-keyed voice has a zero
+				// Status[], and a snapshot-covered voice only
+				// uses Status[1], which this never touches.
+				switch (nReg)
+				{
+				case 0x20: // LPF info (high byte)
+				case 0x21: // LPF info (low byte)
+				{
+					// Filter target (FilterBlock::info_w):
+					// level = info & 0x7ff, capped at 0x7c0
+					// under the 0277 hybrid when the resonance
+					// bits are below 4; target = level | 0x800
+					// (or 0 when level is 0). The write changes
+					// one byte of the 16-bit pair; the other
+					// byte comes from the shadow (unchanged by
+					// this write).
+					const auto FilterTarget = [&](u16 nInfo) -> u16 {
+						u16 nLevel = static_cast<u16>(nInfo & 0x7ff);
+						if (m_bFilter0277 && (nInfo >> 11) < 4 && nLevel > 0x7c0)
+							nLevel = 0x7c0;
+						return nLevel ? static_cast<u16>(nLevel | 0x800) : 0;
+					};
+					const u16 nAddr20 = static_cast<u16>(0x400 | (nChan << 1));
+					const u16 nAddr21 = static_cast<u16>(0x401 | (nChan << 1));
+					const u16 nNewInfo = static_cast<u16>(
+						((nReg == 0x20 ? nData : m_SwpShadow[nAddr20]) << 8) |
+						(nReg == 0x21 ? nData : m_SwpShadow[nAddr21]));
+					const u16 nOldInfo = static_cast<u16>(
+						((nReg == 0x20 ? nOldShadow : m_SwpShadow[nAddr20]) << 8) |
+						(nReg == 0x21 ? nOldShadow : m_SwpShadow[nAddr21]));
+					if (FilterTarget(nNewInfo) != FilterTarget(nOldInfo))
+						Overlay.Status[0] &= 0x3f; // filter
+					break;
+				}
+				case 0x2e: // glo (master level)
+					// glo_w: target = data << 4 (injective),
+					// so the target moves iff the value does.
+					if (nData != nOldShadow)
+						Overlay.Status[2] &= 0x3f;
+					// Finding 7: record that this voice's glo
+					// has been written (see m_nGloPanWrittenMask).
+					m_nGloPanWrittenMask |= (1ULL << (nChan * 2));
+					break;
+				case 0x2f: // pan
+				{
+					// Pan targets (MixerBlock::pan_w): the two
+					// sides derive from different bits of the
+					// pan byte, so each side clears only when
+					// ITS target moves.
+					const auto PanTargetL = [](u8 nPan) -> u16 {
+						const u16 nT = static_cast<u16>((nPan << 2) & 0x3c0);
+						return nT == 0x3c0 ? 0xfff : nT;
+					};
+					const auto PanTargetR = [](u8 nPan) -> u16 {
+						const u16 nT = static_cast<u16>((nPan << 6) & 0x3c0);
+						return nT == 0x3c0 ? 0xfff : nT;
+					};
+					if (PanTargetL(nData) != PanTargetL(nOldShadow))
+						Overlay.Status[3] &= 0x3f; // panl
+					if (PanTargetR(nData) != PanTargetR(nOldShadow))
+						Overlay.Status[4] &= 0x3f; // panr
+					// Finding 7: record that this voice's pan
+					// has been written.
+					m_nGloPanWrittenMask |= (1ULL << (nChan * 2 + 1));
+					break;
+				}
+				default:
+					break;
 				}
 			}
 		}
@@ -574,7 +714,17 @@ void CMU50Synth::OnH8SwpWrite(u64 nCycle, u16 nAddr, u8 nData)
 			{
 				__atomic_add_fetch(&m_nWqFullWaits, 1, __ATOMIC_RELAXED);
 				while (m_WEventFifo.PendingForProducer() >= m_nWEventFifoCap)
+				{
+					// Wake the SWP core: it may be asleep in
+					// wfe (PCMTask sleeps after 64 idle spins)
+					// with no block published, so no publish
+					// sev is coming -- without this the wait
+					// could outlast the consumer's sleep. On
+					// the host this is a no-op (see
+					// WakeSwpCore).
+					WakeSwpCore();
 					mu50spsc::CpuRelax();
+				}
 			}
 			m_WEventFifo.TryPush(Event);
 		}
@@ -614,20 +764,97 @@ void CMU50Synth::DrainWEvents()
 {
 	// Caller must hold m_Lock (single-core, synchronous).
 	// Applies every pending event in firmware order. Runs before
-	// each block render and before each SWP read, so no read ever
-	// observes a stale register.
+	// each block render and before each non-0x01 SWP read (0x01
+	// reads do not drain; see OnH8SwpRead).
 	DrainWEventsUpTo(m_WEventFifo.InIndex());
 }
 
 u8 CMU50Synth::OnH8SwpRead(u16 nAddr)
 {
-	// Single-core (M1): drain first, then read live register state.
+	// Single-core (M1): read live register state. Register 0x01
+	// (the state readback port, the firmware's only SWP read) is
+	// read WITHOUT draining: draining the whole FIFO here applies
+	// every pending voice write before the block renders, so a
+	// status poll shortly after a damp/key-on pair collapses both
+	// to frame 0 -- the zero-gap click Finding 2 fixed (measured
+	// on the synthetic feed: the E4 note-on landed 116 frames
+	// early in single-core vs split, exactly its key-on offset).
+	// The read still observes the state address: 0x01 writes are
+	// applied eagerly at push time (see OnH8SwpWrite), and the
+	// address has no audio effect. The voice state itself would
+	// lag by up to one block (the key-on is still queued) -- so
+	// the read is corrected with the key-on overlay, exactly as
+	// split mode does: if the voice's key-on write is still in
+	// the FIFO, the live value is pre-key-on and the overlay's
+	// post-key-on byte is returned instead. Without the overlay
+	// the firmware would read a just-keyed voice as DECAY_DONE
+	// (0xFF) and could steal it for the next note. A release
+	// write still queued likewise forces the envelope byte to
+	// DECAY. Reads of any other address keep the old drain-first
+	// behaviour (fresh values; the firmware never reads them in
+	// practice).
 	if (!m_bSplitMode)
 	{
-		DrainWEvents();
+		if (nAddr != 0x01)
+		{
+			DrainWEvents();
+			u8 nValue = 0;
+			if (m_pSynth)
+				m_pSynth->read_register(nAddr, nValue);
+			return nValue;
+		}
 		u8 nValue = 0;
 		if (m_pSynth)
 			m_pSynth->read_register(nAddr, nValue);
+		// State address (control reg 1, kept current by the
+		// eager apply in OnH8SwpWrite): low 5 bits = voice,
+		// high bits = slot (0 filter, 1 sample counter,
+		// 2 envelope, 3 glo, 4 panl, 5 panr). The overlay
+		// covers every slot but the sample counter, with
+		// Status[] indexed [0] filter, [1] envelope,
+		// [2] glo, [3] panl, [4] panr.
+		const u8 nStateAddr = m_SwpShadow[1];
+		const unsigned nChan = nStateAddr & 0x1f;
+		const unsigned nSlot = nStateAddr >> 5;
+		if (nSlot == 0 || (nSlot >= 2 && nSlot <= 5))
+		{
+			const int nStatusIdx = (nSlot == 0) ? 0 : static_cast<int>(nSlot) - 1;
+			const TVoiceOverlay &Overlay = m_VoiceOverlay[nChan];
+			// Is this voice's key-on write still queued? The
+			// key-on is the write to 0x0b-(chan/8) with the
+			// voice's bit set; any such pending write means
+			// the newest key-on has not taken effect yet.
+			const u16 nKeyAddr = static_cast<u16>(0x0b - (nChan >> 3));
+			const u8 nKeyBit = static_cast<u8>(1u << (nChan & 7));
+			TWEvent UnusedEvent;
+			const bool bKeyPending = m_WEventFifo.FindNewest(
+				[&](const TWEvent &E) {
+					return E.nAddr == nKeyAddr && (E.nData & nKeyBit) != 0;
+				},
+				UnusedEvent);
+			if (bKeyPending)
+			{
+				if (nStatusIdx == 1 && Overlay.bReleased)
+					return libmu50::DecayEnvelopeStatus(Overlay.Status[1]);
+				return Overlay.Status[nStatusIdx];
+			}
+			if (nStatusIdx == 1 && Overlay.bReleased)
+			{
+				// Key-on applied, but a release write for
+				// this voice is still queued (it must have
+				// been issued after the key-on: FIFO order).
+				// The live envelope is pre-release; force
+				// DECAY, keeping the live level bits.
+				const u16 nRelAddr = static_cast<u16>(0x500 | (nChan << 1));
+				const bool bRelPending = m_WEventFifo.FindNewest(
+					[&](const TWEvent &E) {
+						return E.nAddr == nRelAddr && (E.nData & 0x80) != 0;
+					},
+					UnusedEvent);
+				if (bRelPending)
+					return libmu50::DecayEnvelopeStatus(nValue);
+			}
+		}
 		return nValue;
 	}
 	// Split: the SWP thread owns live register state, so the audio
@@ -756,7 +983,30 @@ u8 CMU50Synth::OnH8SwpRead(u16 nAddr)
 	if (m_WEventFifo.FindNewest([nAddr](const TWEvent& E) { return E.nAddr == nAddr; }, Event))
 		return Event.nData;
 	if (nAddr < sizeof(m_SwpShadow))
+	{
+		// Finding 7: the shadow seeds glo (0x2e) and pan (0x2f)
+		// at 0xff -- the MixerBlock's effective reset target,
+		// which the key-on overlay needs -- but the core's
+		// channel_regs reset those two registers to 0, so a
+		// read before the first write must return 0x00, not
+		// 0xff. The written-mask records which (voice, reg)
+		// pairs have actually been written; never-written
+		// 0x2e/0x2f read as the channel_regs reset (0x00).
+		// (0x2e/0x2f are the only shadow seeds that differ
+		// from channel_regs reset; 0x08/0x20/0x21 match.)
+		if (nAddr >= 0x400 && nAddr < 0x800)
+		{
+			const u8 nReg = static_cast<u8>(((nAddr >> 5) & 0x3e) | (nAddr & 1));
+			if (nReg == 0x2e || nReg == 0x2f)
+			{
+				const unsigned nChan = (nAddr >> 1) & 0x1f;
+				const u64 nBit = 1ULL << (nChan * 2 + (nReg == 0x2f ? 1 : 0));
+				if ((m_nGloPanWrittenMask & nBit) == 0)
+					return 0x00;
+			}
+		}
 		return m_SwpShadow[nAddr];
+	}
 	return 0;
 }
 
@@ -930,7 +1180,7 @@ void CMU50Synth::AdvanceH8(size_t nNativeFrames)
 		// the block was actually published; a skipped publish
 		// (parked SWP) has no block to render.
 		if (m_bLastPublishOk)
-			__asm__ volatile ("sev" ::: "memory");
+			WakeSwpCore();
 		__atomic_store_n(&m_nPublishedCycles, m_pH8->cycles(), __ATOMIC_RELEASE);
 	}
 }
@@ -1351,6 +1601,50 @@ double CMU50Synth::ResamplePulledBlock(float* pOutBuffer, size_t nOutDone,
 
 }
 
+size_t CMU50Synth::RenderSegments(size_t nFrames, u64 nStartCycle, u64 nCycles,
+                                  size_t nFifoSnap,
+                                  const std::function<bool(size_t nDone, size_t nChunk)>& RenderChunk)
+{
+	size_t nDone = 0;
+	while (nDone < nFrames)
+	{
+		// Next event belonging to this block, if any.
+		TWEvent Event{};
+		bool bHasEvent = false;
+		size_t nOff = nFrames;
+		if (m_WEventFifo.OutIndex() != nFifoSnap &&
+		    m_WEventFifo.TryPeek(Event))
+		{
+			bHasEvent = true;
+			nOff = EventFrameOffset(Event.nCycle, nStartCycle,
+			                        nCycles, nFrames);
+		}
+		if (bHasEvent && nOff <= nDone)
+		{
+			// Event at (or before) the current frame: apply
+			// now, with no zero-length segment (also covers an
+			// out-of-order stamp).
+			if (m_pSynth)
+				m_pSynth->write_register(Event.nAddr, Event.nData);
+			m_WEventFifo.Pop();
+			continue;
+		}
+		const size_t nTarget = bHasEvent ? nOff : nFrames;
+		const size_t nChunk = Utility::Min(nTarget - nDone,
+		                                   Utility::Min(nFrames - nDone, kNativeScratchFrames));
+		if (!RenderChunk(nDone, nChunk))
+			return nDone;
+		nDone += nChunk;
+		if (bHasEvent && nDone == nOff)
+		{
+			if (m_pSynth)
+				m_pSynth->write_register(Event.nAddr, Event.nData);
+			m_WEventFifo.Pop();
+		}
+	}
+	return nDone;
+}
+
 void CMU50Synth::RenderResampled(float* pOutBuffer, size_t nFrames)
 {
 	// Split mode: the lag-2 pipeline (no m_Lock; see
@@ -1406,64 +1700,35 @@ void CMU50Synth::RenderResampled(float* pOutBuffer, size_t nFrames)
 		// hardware.
 		AdvanceH8(nNativeRender);
 
-		// Finding 2: same segment loop as the split path -- apply
-		// each write at its frame offset within this block (from
-		// the cycle span AdvanceH8 just recorded) instead of
-		// draining the whole block up front. Segments render into
-		// successive offsets of m_NativeScratch; the ring
+		// Finding 2: shared segment loop (see RenderSegments) --
+		// apply each write at its frame offset within this block
+		// (from the cycle span AdvanceH8 just recorded) instead
+		// of draining the whole block up front. Segments render
+		// into successive offsets of m_NativeScratch; the ring
 		// round-trip below still runs over the whole block.
 		// Writes stamped at/past the block end drain after the loop.
 		const u64 nBlockStartCycle = m_nLastAdvanceStartCycle;
 		const u64 nBlockCycles     = m_nLastAdvanceCycles;
 		const bool bDiag = CDiagLog::Get().IsEnabled();
 		const u64 nSwpStartUs = bDiag ? CTimer::Get()->GetClockTicks() : 0;
-		size_t nDoneNative = 0;
-		bool bRenderOk = true;
-		while (nDoneNative < nNativeRender)
-		{
-			TWEvent Event{};
-			bool bHasEvent = false;
-			size_t nOff = nNativeRender;
-			if (m_WEventFifo.OutIndex() != m_WEventFifo.InIndex() &&
-			    m_WEventFifo.TryPeek(Event))
-			{
-				bHasEvent = true;
-				nOff = EventFrameOffset(Event.nCycle, nBlockStartCycle,
-				                        nBlockCycles, nNativeRender);
-			}
-			if (bHasEvent && nOff <= nDoneNative)
-			{
-				// Event at (or before) the current frame: apply
-				// now, with no zero-length segment.
-				if (m_pSynth)
-					m_pSynth->write_register(Event.nAddr, Event.nData);
-				m_WEventFifo.Pop();
-				continue;
-			}
-			const size_t nTarget = bHasEvent ? nOff : nNativeRender;
-			const size_t nChunk = nTarget - nDoneNative;
-			const libmu50::Status RenderStatus =
-				m_pSynth->render(&m_NativeScratch[nDoneNative * 2], nChunk);
-			if (!RenderStatus)
-			{
-				bRenderOk = false;
-				break;
-			}
-			nDoneNative += nChunk;
-			if (bHasEvent && nDoneNative == nOff)
-			{
-				if (m_pSynth)
-					m_pSynth->write_register(Event.nAddr, Event.nData);
-				m_WEventFifo.Pop();
-			}
-		}
+		// The H8 is not running during this loop (single-core),
+		// so the live in-index is stable and bounds the block's
+		// writes.
+		const size_t nDoneNative = RenderSegments(
+			nNativeRender, nBlockStartCycle, nBlockCycles,
+			m_WEventFifo.InIndex(),
+			[this](size_t nSegDone, size_t nSegChunk) -> bool {
+				const libmu50::Status RenderStatus =
+					m_pSynth->render(&m_NativeScratch[nSegDone * 2], nSegChunk);
+				return static_cast<bool>(RenderStatus);
+			});
 		// Writes stamped at or past the block end.
 		DrainWEvents();
 		if (bDiag)
 		{
 			m_nDiagSwpUs += CTimer::Get()->GetClockTicks() - nSwpStartUs;
 		}
-		if (!bRenderOk)
+		if (nDoneNative < nNativeRender)
 		{
 			// Should not happen after a successful Initialize();
 			// fail safe to silence for the rest of the call
@@ -1700,84 +1965,76 @@ bool CMU50Synth::PCMTaskIteration()
 		// no published block, but the audio thread may be mid-block
 		// with a full W FIFO (tiny-FIFO stress, or a pathological
 		// block burst over 4095 writes). Draining here throws away
-		// the drained writes' cycle stamps, so only do it when the
-		// FIFO is at least half full -- the producer waits at the
-		// cap and the consumer relieves at half, so no deadlock,
-		// and below half the producer is not blocked anyway.
-		// Writes drained this way lose timing, which only happens
-		// during bulk SysEx bursts.
-		if (m_WEventFifo.PendingForConsumer() >= m_nWEventFifoCap / 2)
-			DrainWEventsUpTo(m_WEventFifo.InIndex());
+		// the drained writes' cycle stamps, so it is bounded two
+		// ways. First, it only runs when the FIFO is actually
+		// full (pending >= cap): the producer waits only at the
+		// cap, so below it no drain is needed for liveness and
+		// draining would only throw away timing. Second, it
+		// drains only down to the half-cap level ("relieves at
+		// half"): draining everything would also eat the current
+		// (unpublished) block's later writes, landing them at
+		// frame 0 instead of their stamped offsets -- and once
+		// the out-index passes a later block's snapshot, that
+		// block's post-render drain eats its writes early too.
+		// The oldest writes are the ones the producer needs room
+		// for, and their offsets are the smallest, so the timing
+		// error is bounded to the head of the block. The producer
+		// wakes this core with sev while it waits (see
+		// OnH8SwpWrite), so the drain cannot be missed because
+		// the worker is asleep in wfe.
+		const size_t nPending = m_WEventFifo.PendingForConsumer();
+		if (nPending >= m_nWEventFifoCap)
+		{
+			const size_t nDrain = nPending - m_nWEventFifoCap / 2;
+			const size_t nSnap = (m_WEventFifo.OutIndex() + nDrain) &
+			                     decltype(m_WEventFifo)::Mask;
+			DrainWEventsUpTo(nSnap);
+		}
 		// No Yield() here (it belongs to core 0). The PCMTask
 		// loop does the spin-then-wfe backoff; this iteration
 		// just reports that it did no work.
 		return false;
 	}
-	// Finding 2: per-write frame-offset segment rendering. Walk the
-	// block in segments split at each write's frame offset (from
-	// the block's cycle span) instead of draining the whole block
-	// up front: two writes the firmware issued up to 5 ms apart no
-	// longer land with zero samples between them, so a damp-then-
-	// key-on pair in one block gets samples for the damp to act.
-	// Writes stamped at/past the block end drain after the loop.
+	// Finding 2: shared segment loop (see RenderSegments) -- walk
+	// the block in segments split at each write's frame offset
+	// (from the block's cycle span) instead of draining the whole
+	// block up front: two writes the firmware issued up to 5 ms
+	// apart no longer land with zero samples between them, so a
+	// damp-then-key-on pair in one block gets samples for the damp
+	// to act. Writes stamped at/past the block end drain after
+	// the loop.
 	const u64 nSwpStartUs = CTimer::Get()->GetClockTicks();
-	size_t nDone = 0;
-	while (nDone < Block.nFrames)
-	{
-		// Next event belonging to this block, if any.
-		TWEvent Event{};
-		bool bHasEvent = false;
-		size_t nOff = Block.nFrames;
-		if (m_WEventFifo.OutIndex() != Block.nFifoSnap &&
-		    m_WEventFifo.TryPeek(Event))
-		{
-			bHasEvent = true;
-			nOff = EventFrameOffset(Event.nCycle, Block.nStartCycle,
-			                        Block.nCycles, Block.nFrames);
-		}
-		if (bHasEvent && nOff <= nDone)
-		{
-			// Event at (or before) the current frame: apply now,
-			// with no zero-length segment (also covers an
-			// out-of-order stamp).
-			if (m_pSynth)
-				m_pSynth->write_register(Event.nAddr, Event.nData);
-			m_WEventFifo.Pop();
-			continue;
-		}
-		const size_t nTarget = bHasEvent ? nOff : Block.nFrames;
-		const size_t nChunk = Utility::Min(nTarget - nDone,
-		                                   Utility::Min(Block.nFrames - nDone, kNativeScratchFrames));
-		const libmu50::Status RenderStatus = m_pSynth->render(&m_SwpScratch[0], nChunk);
-		if (!RenderStatus)
-		{
-			// Should not happen after a successful Initialize();
-			// fail safe: enqueue silence for the remainder.
-			for (size_t i = nDone; i < Block.nFrames; ++i)
+	const size_t nDone = RenderSegments(
+		Block.nFrames, Block.nStartCycle, Block.nCycles, Block.nFifoSnap,
+		[this, &Block](size_t nSegDone, size_t nSegChunk) -> bool {
+			(void) nSegDone; // split mode renders into m_SwpScratch[0]
+			const libmu50::Status RenderStatus =
+				m_pSynth->render(&m_SwpScratch[0], nSegChunk);
+			if (!RenderStatus)
+				return false;
+			for (size_t i = 0; i < nSegChunk; ++i)
 			{
-				const TNativeFrame Frame{ 0, 0 };
+				const TNativeFrame Frame{ m_SwpScratch[i * 2], m_SwpScratch[i * 2 + 1] };
 				EnqueueSwpFrame(Block.nSeq, Frame);
 			}
-			// Drain this block's remaining events so SWP state
-			// stays consistent (the old drain-all-up-front had
-			// already applied them by this point).
-			DrainWEventsUpTo(Block.nFifoSnap);
-			__atomic_add_fetch(&m_nSwpRenderUs, CTimer::Get()->GetClockTicks() - nSwpStartUs, __ATOMIC_RELAXED);
-			UpdateRingHighWater();
 			return true;
-		}
-		for (size_t i = 0; i < nChunk; ++i)
+		});
+	if (nDone < Block.nFrames)
+	{
+		// Should not happen after a successful Initialize();
+		// fail safe: enqueue silence for the remainder.
+		for (size_t i = nDone; i < Block.nFrames; ++i)
 		{
-			const TNativeFrame Frame{ m_SwpScratch[i * 2], m_SwpScratch[i * 2 + 1] };
+			const TNativeFrame Frame{ 0, 0 };
 			EnqueueSwpFrame(Block.nSeq, Frame);
 		}
-		nDone += nChunk;
-		if (bHasEvent && nDone == nOff)
-		{
-			if (m_pSynth)
-				m_pSynth->write_register(Event.nAddr, Event.nData);
-			m_WEventFifo.Pop();
-		}
+		// Drain this block's remaining events so SWP state
+		// stays consistent (the old drain-all-up-front had
+		// already applied them by this point).
+		DrainWEventsUpTo(Block.nFifoSnap);
+		__atomic_add_fetch(&m_nSwpRenderUs, CTimer::Get()->GetClockTicks() - nSwpStartUs, __ATOMIC_RELAXED);
+		UpdateRingHighWater();
+		return true;
 	}
 	// Writes stamped at or past the block end (offset == nFrames).
 	DrainWEventsUpTo(Block.nFifoSnap);
@@ -1851,7 +2108,7 @@ bool CMU50Synth::ParkSwp()
 	// PCMTaskIteration continuously -- and the spin below runs to
 	// its bound (same gap as Nuked StopSplitPCM; Claude review
 	// 2026-11-16 round 3).
-	__asm__ volatile ("sev" ::: "memory");
+	WakeSwpCore();
 	// The worker loop calls PCMTaskIteration on wake, so the ack
 	// arrives within microseconds of the sev; the bound below is
 	// a wedge guard, not a timing assumption. Park must be
@@ -1864,7 +2121,7 @@ bool CMU50Synth::ParkSwp()
 		// Re-send sev periodically: core 3 may have re-entered
 		// wfe after the first sev (or read a stale flag).
 		if ((nSpins & 1023U) == 0)
-			__asm__ volatile ("sev" ::: "memory");
+			WakeSwpCore();
 		mu50spsc::CpuRelax();
 	}
 	return false;
@@ -1875,7 +2132,7 @@ void CMU50Synth::UnparkSwp()
 	__atomic_store_n(&m_bSwpActive, true, __ATOMIC_RELEASE);
 	// Wake core 3 if it is sleeping in wfe (it idles there
 	// instead of Yield, which belongs to core 0).
-	__asm__ volatile ("sev" ::: "memory");
+	WakeSwpCore();
 }
 
 u64 CMU50Synth::GetWqFullWaits()
