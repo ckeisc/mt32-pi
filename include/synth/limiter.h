@@ -120,13 +120,12 @@ public:
 				if (fDequeMax > fWindowMax)
 					fWindowMax = fDequeMax;
 			}
+			// Fast path: when the window max is at or below the
+			// ceiling, Ceiling / fWindowMax would be >= 1.0 and
+			// clamp to 1.0 anyway, so skip the divide.
 			float fTarget = 1.0f;
-			if (fWindowMax > 0.0f)
-			{
+			if (fWindowMax > Ceiling)
 				fTarget = Ceiling / fWindowMax;
-				if (fTarget > 1.0f)
-					fTarget = 1.0f;
-			}
 
 			// Gain law: ramp down over the lookahead window on
 			// attack, exponential release on the way back up.
@@ -154,9 +153,12 @@ public:
 
 			// Safety cap: never let the exiting frame exceed the
 			// ceiling, even if a ramp restart lagged behind.
+			// Fast path: when the exiting peak is at or below the
+			// ceiling, Ceiling / fPeakOut would be >= 1.0 and can
+			// never bind below the gain (<= 1.0), so skip it.
 			const float fPeakOut = m_DelayPeak[m_nDelayPos];
 			float fGainOut = m_fGain;
-			if (fPeakOut > 0.0f)
+			if (fPeakOut > Ceiling)
 			{
 				const float fCap = Ceiling / fPeakOut;
 				if (fCap < fGainOut)
@@ -169,8 +171,19 @@ public:
 				}
 			}
 
-			pBuffer[i * 2] = m_DelayL[m_nDelayPos] * fGainOut;
-			pBuffer[i * 2 + 1] = m_DelayR[m_nDelayPos] * fGainOut;
+			// Fast path: multiplying by exactly 1.0 is an identity
+			// in IEEE float, so copy the delayed frame out
+			// without the multiply when the gain is untouched.
+			if (fGainOut == 1.0f)
+			{
+				pBuffer[i * 2] = m_DelayL[m_nDelayPos];
+				pBuffer[i * 2 + 1] = m_DelayR[m_nDelayPos];
+			}
+			else
+			{
+				pBuffer[i * 2] = m_DelayL[m_nDelayPos] * fGainOut;
+				pBuffer[i * 2 + 1] = m_DelayR[m_nDelayPos] * fGainOut;
+			}
 			if (pGainTrace != nullptr)
 				pGainTrace[i] = fGainOut;
 
