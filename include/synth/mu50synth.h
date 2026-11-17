@@ -180,6 +180,14 @@ private:
 	// m_NativeScratch, and resample them. Audio-thread only.
 	void ResamplePendingFront(float* pOutBuffer);
 
+	// Clear the resampler history (item D): the FIR history, cubic
+	// prev/leftover frames, carry and primed flag carry stale samples
+	// from the previous MU50 session across a switch, so the new
+	// session would play them under its fade-in. Called from
+	// SplitActivate (switch-to-MU50). Mirrors the constructor's
+	// zero-init of these fields.
+	void ResetResamplerState();
+
 	// Advance the H8 by the emulated cycles for nNativeFrames of
 	// audio (10 MHz / 44.1 kHz). Single-core mode: caller must hold
 	// m_Lock. Split mode: no m_Lock; drains the MIDI staging queue

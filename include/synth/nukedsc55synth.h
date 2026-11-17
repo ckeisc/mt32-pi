@@ -287,8 +287,23 @@ private:
 	// one, the first ConcealFadeFrames fade back in from zero.
 	// m_bConcealed is true when the previous RenderFrames call
 	// ended starved (faded out). 96 frames = 2 ms at 48 kHz.
+	//
+	// Clean mute (item F): under SUSTAINED overload the per-call
+	// fade-out/fade-in above cycles every DAC block (128 frames
+	// = 375 Hz), heard as a buzz. Instead, when an underrun
+	// leaves the ring unable to fill even one requested block,
+	// the synth latches m_bMuted: it fades out once (the entering
+	// call's fade-out), then outputs pure zeros -- resampler
+	// skipped, no fade-in/out -- until the ring recovers to
+	// MuteRecoverFill (the prefill target, 512 native frames).
+	// The exit fades back in once via the m_bConcealed mechanism
+	// (m_bConcealed stays true while muted). Hysteresis: the low
+	// threshold (fill < nNeed, ~256-341 native frames) is well
+	// below the high threshold (512), so the mute does not flap.
 	static constexpr size_t ConcealFadeFrames = 96;
+	static constexpr size_t MuteRecoverFill = 512; // prefill target (mt32pi.cpp)
 	bool m_bConcealed;
+	bool m_bMuted;
 
 	// Last output sample of the previous RenderFrames call
 	// (left/right, after any fade/decay). On an underrun that
@@ -345,6 +360,7 @@ private:
 	u64 m_nLastSplitFifoFullWaits = 0;
 	u64 m_nLastSplitFifoDrops = 0;
 	u64 m_nLastSplitPCMUs = 0;
+	u64 m_nLastSplitFifoResync = 0; // last-seen fifo_resync (item E)
 
 	// Sounding-note tracking for power management: written by
 	// DrainMidiStage on the audio thread (core 2) and read by

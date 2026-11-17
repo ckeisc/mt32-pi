@@ -654,8 +654,13 @@ void CMT32Pi::UITask()
 
 	const bool bMisterEnabled = m_pConfig->ControlMister;
 
-	// Nothing for this core to do; bail out
-	if (!(m_pLCD || bMisterEnabled))
+	// Nothing for this core to do; bail out. But when diagnostics
+	// are enabled, this core must stay alive to drain the diag-log
+	// ring (item B): LogLine() only enqueues, and the SD write
+	// happens here in Drain(). Without this, a no-LCD / no-MiSTer
+	// build would never drain the ring and LogLine would drop
+	// every line once it filled.
+	if (!(m_pLCD || bMisterEnabled || CDiagLog::Get().IsEnabled()))
 	{
 		m_bUITaskDone = true;
 		return;
@@ -667,6 +672,11 @@ void CMT32Pi::UITask()
 	while (m_bRunning)
 	{
 		const unsigned int nTicks = CTimer::GetClockTicks();
+
+		// Drain the diag-log ring to SD (item B). No-op when
+		// diagnostics are disabled. Runs every iteration so a
+		// queued line reaches the card within one loop pass.
+		CDiagLog::Get().Drain();
 
 		// Update LCD
 		if (m_pLCD && (nTicks - m_nLCDUpdateTime) >= Utility::MillisToTicks(LCDUpdatePeriodMillis))

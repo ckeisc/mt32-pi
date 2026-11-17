@@ -114,11 +114,15 @@ public:
 			// peak. The deque is updated after the frame is
 			// written into the delay line, below.
 			float fWindowMax = fPeakIn;
+			uint32_t nArgmaxSeq = m_nSeq;
 			if (m_nDequeTail != m_nDequeHead)
 			{
 				const float fDequeMax = m_Deque[m_nDequeHead].fPeak;
 				if (fDequeMax > fWindowMax)
+				{
 					fWindowMax = fDequeMax;
+					nArgmaxSeq = m_Deque[m_nDequeHead].nSeq;
+				}
 			}
 			// Fast path: when the window max is at or below the
 			// ceiling, Ceiling / fWindowMax would be >= 1.0 and
@@ -134,7 +138,24 @@ public:
 				if (!m_bRampActive || fTarget < m_fRampTarget)
 				{
 					m_fRampTarget = fTarget;
-					m_fRampStep = (fTarget - m_fGain) / static_cast<float>(LookaheadFrames);
+					// Size the ramp to the argmax peak's actual
+					// exit: it leaves the delay line in
+					// (argmaxSeq + LookaheadFrames) - m_nSeq
+					// frames, so the gain reaches the target
+					// exactly as it exits and the safety cap
+					// never needs to bind. Previously the step
+					// was always sized for the full 240-frame
+					// lookahead, so a peak already partway
+					// through the delay line arrived before the
+					// ramp finished and the cap had to jump the
+					// gain down in a single sample. The clamp
+					// covers a peak exiting on the very next
+					// frame (a one-frame ramp, still smoother
+					// than a cap jump).
+					uint32_t nFramesUntilExit = (nArgmaxSeq + static_cast<uint32_t>(LookaheadFrames)) - m_nSeq;
+					if (nFramesUntilExit < 1)
+						nFramesUntilExit = 1;
+					m_fRampStep = (fTarget - m_fGain) / static_cast<float>(nFramesUntilExit);
 					m_bRampActive = true;
 				}
 				m_fGain += m_fRampStep;

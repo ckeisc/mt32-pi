@@ -286,6 +286,7 @@ CNukedSC55Synth::CNukedSC55Synth(unsigned nSampleRate, float nGain, bool bOversa
 	  m_bCubicActive(false),
 	  m_Resampler(Resampler),
 	  m_bConcealed(false),
+	  m_bMuted(false),
 	  m_SampleRing{},
 	  m_nSampleRingFill(0),
 	  m_nSampleRingDrops(0),
@@ -462,6 +463,18 @@ void CNukedSC55Synth::InitSplitState(bool bClearRing)
 		m_nSampleRingFill = 0;
 		m_bWindowValid = false;
 		m_dReadFrac = 0.0;
+		// Resampler history (item D): the ring is cleared but the
+		// FIR history and cubic window are not, so stale samples
+		// from the previous Nuked session would play under the new
+		// synth's fade-in. Reset them here, mirroring
+		// ApplyResamplerSelection (which already does both).
+		ResetFirState();
+		m_bCubicValid = false;
+		// Clean mute (item F): the ring is cleared, so a mute
+		// latched in the previous session is stale -- start
+		// unmuted. (m_bConcealed is left alone: the volume ramp
+		// already fades in from silence on a switch.)
+		m_bMuted = false;
 	}
 	// Activation (bClearRing false) keeps the priming frames: the
 	// first RenderFrames() drains the boot silence continuously.
@@ -1082,7 +1095,6 @@ size_t CNukedSC55Synth::Prefill(size_t nTargetFill, bool (*pfnShouldStop)(void*)
 				// Wake core 3 if it is sleeping in wfe (it idles
 				// there instead of Yield, which belongs to core 0).
 				SplitSendEvent();
-				S.publishes = S.publishes + 1;
 			}
 		}
 		if (nPublishCountdown != 0)
@@ -1090,7 +1102,6 @@ size_t CNukedSC55Synth::Prefill(size_t nTargetFill, bool (*pfnShouldStop)(void*)
 			__atomic_store_n(&S.cycles_pub, MCU.cycles, __ATOMIC_RELEASE);
 			// Wake core 3 if it is sleeping in wfe.
 			SplitSendEvent();
-			S.publishes = S.publishes + 1;
 		}
 	}
 	else
@@ -1137,6 +1148,26 @@ size_t CNukedSC55Synth::RenderFrames(float* pOutBuffer, size_t nFrames)
 	u64 nUnderrunFrames      = 0;
 
 	m_Lock.Acquire();
+
+	// FIFO overflow recovery (item E): a drop means core 3 stopped
+	// draining, so the split is already broken (core 3 renders from
+	// stale register values). Wedge it and fall back to
+	// single-threaded now: in single-threaded mode SplitPCMWrite
+	// calls PCM_Write directly, so the dropped write's effect is
+	// inherently recovered (the live pcm state is the single source
+	// of truth). StopSplitPCM parks core 3 first; a timeout wedges
+	// the split the same way (the existing park-timeout path). The
+	// !m_bSplitWedged guard stops a wedged split from re-entering
+	// the park wait on every RenderFrames.
+	if (m_bSplitActive && !m_bSplitWedged && m_pSplitState
+	    && m_pSplitState->fifo_resync != m_nLastSplitFifoResync)
+	{
+		m_nLastSplitFifoResync = m_pSplitState->fifo_resync;
+		DiagLog.LogLine("split fifo_resync drops=%llu wedging single-threaded",
+		                static_cast<unsigned long long>(m_pSplitState->fifo_drops));
+		m_bSplitWedged = true;
+		StopSplitPCM();
+	}
 
 	// Lock-free MIDI input: drain the staged queue before
 	// stepping, so staged bytes land in the emulated UART ahead
@@ -1236,7 +1267,6 @@ size_t CNukedSC55Synth::RenderFrames(float* pOutBuffer, size_t nFrames)
 				// Wake core 3 if it is sleeping in wfe (it idles
 				// there instead of Yield, which belongs to core 0).
 				SplitSendEvent();
-				S.publishes = S.publishes + 1;
 			}
 		}
 		if (nPublishCountdown != 0)
@@ -1244,7 +1274,6 @@ size_t CNukedSC55Synth::RenderFrames(float* pOutBuffer, size_t nFrames)
 			__atomic_store_n(&S.cycles_pub, MCU.cycles, __ATOMIC_RELEASE);
 			// Wake core 3 if it is sleeping in wfe.
 			SplitSendEvent();
-			S.publishes = S.publishes + 1;
 		}
 		if (bDiag)
 			m_nMCUUs += CTimer::Get()->GetClockTicks() - nMCUStartUs;
@@ -1267,6 +1296,24 @@ size_t CNukedSC55Synth::RenderFrames(float* pOutBuffer, size_t nFrames)
 			}
 		}
 	}
+
+	// Clean mute (item F): if a previous call latched m_bMuted,
+	// stay silent until the ring recovers to the prefill target
+	// (MuteRecoverFill). The stepping loop above already ran, so
+	// the fill reflects the post-stepping cushion. While muted
+	// and starved, the resampler is skipped entirely (nRenderFrames
+	// = 0, so nDone stays 0): the ring must build up, not be
+	// drained a partial block at a time, and the output is pure
+	// zeros via the underrun path below (no per-block fade-in/out
+	// cycling). On recovery the mute clears and the render below
+	// runs normally; m_bConcealed is still true from the mute
+	// entry, so the existing fade-in ramps the first
+	// ConcealFadeFrames back up from zero -- one fade-in, not
+	// one per block.
+	const bool bMutedStarved = m_bMuted && m_nSampleRingFill < MuteRecoverFill;
+	if (m_bMuted && !bMutedStarved)
+		m_bMuted = false;
+	const size_t nRenderFrames = bMutedStarved ? 0 : nFrames;
 
 	// Streaming resampler: the window (m_SampleA, m_SampleB) brackets
 	// the next output position (m_dReadFrac relative to A). The lerp
@@ -1300,7 +1347,7 @@ size_t CNukedSC55Synth::RenderFrames(float* pOutBuffer, size_t nFrames)
 		// nNeed above already covers FIR consumption (4/3 per output
 		// plus margin); the 66-sample history warms up from zeros
 		// on the first call (inaudible: the emulator starts silent).
-		for (; nDone < nFrames; ++nDone)
+		for (; nDone < nRenderFrames; ++nDone)
 		{
 			const unsigned nPhase = m_FirPhase;
 			const size_t nM = (4 * m_FirOutIndex - nPhase) / 3;
@@ -1344,7 +1391,7 @@ size_t CNukedSC55Synth::RenderFrames(float* pOutBuffer, size_t nFrames)
 		// (m_dReadFrac relative to A); slides like the lerp
 		// window but 4-wide. Prime duplicates A into prev
 		// (frac starts at 0, so the first output is exactly A).
-		for (; nDone < nFrames; ++nDone)
+		for (; nDone < nRenderFrames; ++nDone)
 		{
 			if (!m_bCubicValid)
 			{
@@ -1397,7 +1444,7 @@ size_t CNukedSC55Synth::RenderFrames(float* pOutBuffer, size_t nFrames)
 	}
 	else
 	{
-		for (; nDone < nFrames; ++nDone)
+		for (; nDone < nRenderFrames; ++nDone)
 		{
 			if (!m_bWindowValid)
 			{
@@ -1498,6 +1545,16 @@ size_t CNukedSC55Synth::RenderFrames(float* pOutBuffer, size_t nFrames)
 		}
 		nUnderrunFrames += nFrames - nDone;
 		m_bConcealed = true;
+		// Enter clean mute (item F): if the ring still cannot fill
+		// even one requested block (fill < nNeed), the overload is
+		// sustained -- latch muted so following calls output pure
+		// zeros (resampler skipped) instead of fading out/in every
+		// block. The fade-out above is the single fade-out; the
+		// exit (fill >= MuteRecoverFill) fades back in once via
+		// m_bConcealed. A one-off underrun (ring refilled by the
+		// next call) never latches: fill >= nNeed by then.
+		if (!m_bMuted && m_nSampleRingFill < nNeed)
+			m_bMuted = true;
 	}
 	else
 	{

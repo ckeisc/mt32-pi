@@ -1645,10 +1645,31 @@ u64 CMU50Synth::GetUnderrunFrames()
 	return __atomic_load_n(&m_nUnderrunFrames, __ATOMIC_ACQUIRE);
 }
 
+void CMU50Synth::ResetResamplerState()
+{
+	// Zero every carried resampler field: the FIR history (32 native
+	// stereo frames before the block boundary), the cubic prev /
+	// leftover frames straddling it, the fractional carry, and the
+	// primed flag (so the first block re-primes from silence rather
+	// than interpolating from stale taps). m_Resampler itself is
+	// stateless across blocks (its phase is recomputed from
+	// m_dResampleCarry), so it needs no reset.
+	memset(m_FirHistory, 0, sizeof(m_FirHistory));
+	m_bResamplePrimed = false;
+	m_dResampleCarry = 0.0;
+	m_PrevSample[0] = 0;
+	m_PrevSample[1] = 0;
+	m_LeftoverSample[0][0] = 0;
+	m_LeftoverSample[0][1] = 0;
+	m_LeftoverSample[1][0] = 0;
+	m_LeftoverSample[1][1] = 0;
+}
+
 void CMU50Synth::SplitActivate()
 {
 	if (!m_bSplitMode || !m_pSynth)
 		return;
+	ResetResamplerState();
 	UnparkSwp();
 }
 
