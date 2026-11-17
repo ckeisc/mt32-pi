@@ -738,18 +738,7 @@ void CMT32Pi::AudioTask()
 
 	while (m_bRunning)
 	{
-		// DAC starvation: if the queue is empty, the DAC has
-		// nothing to play and Circle inserts null frames (no
-		// fade, no counter). Count the transition from non-empty
-		// to empty, only after audio is flowing (boot starts
-		// empty, which is not a starvation).
-		const size_t nQueueAvail = m_pSound->GetQueueFramesAvail();
-		const bool bQueueEmpty = (nQueueAvail == 0);
-		if (m_bAudioFlowing && bQueueEmpty && !m_bDacQueueEmpty)
-			++m_nDacStarves;
-		m_bDacQueueEmpty = bQueueEmpty;
-
-		const size_t nFrames = nQueueSizeFrames - nQueueAvail;
+		const size_t nFrames = nQueueSizeFrames - m_pSound->GetQueueFramesAvail();
 		const size_t nWriteBytes = nFrames * nBytesPerFrame;
 
 		if (nFrames == 0)
@@ -801,13 +790,30 @@ void CMT32Pi::AudioTask()
 				m_nLimiterLastLimitedFrames = m_Limiter.GetLimitedFrames();
 				const unsigned nMinGainMilli = m_Limiter.GetMinGainMilli();
 				m_Limiter.ResetWindowStats();
-				const u64 nDacStarves = m_nDacStarves - m_nDacLastStarves;
-				m_nDacLastStarves = m_nDacStarves;
+				// DAC null frames in this window, by cumulative
+				// accounting: attempted consumption (elapsed time
+				// x 48 kHz) minus frames actually written. The
+				// cumulative null count is the high-water mark of
+				// the deficit -- nulls already played are not
+				// undone when the task later catches up.
+				if (m_bAudioFlowing && m_nAudioStartUs != 0)
+				{
+					const u64 nElapsedUs = nNowUs - m_nAudioStartUs;
+					const u64 nAttempted = nElapsedUs * 48000ULL / 1000000ULL;
+					if (nAttempted > m_nTotalFramesWritten)
+					{
+						const u64 nDeficit = nAttempted - m_nTotalFramesWritten;
+						if (nDeficit > m_nDacNullFrames)
+							m_nDacNullFrames = nDeficit;
+					}
+				}
+				const u64 nDacNullFrames = m_nDacNullFrames - m_nDacLastNullFrames;
+				m_nDacLastNullFrames = m_nDacNullFrames;
 				m_nLimiterWindowStartUs = nNowUs;
-				DiagLog.LogLine("window limiter limited=%llu min_gain_milli=%u dac_starves=%llu",
+				DiagLog.LogLine("window limiter limited=%llu min_gain_milli=%u dac_null_frames=%llu",
 				                static_cast<unsigned long long>(nLimited),
 				                nMinGainMilli,
-				                static_cast<unsigned long long>(nDacStarves));
+				                static_cast<unsigned long long>(nDacNullFrames));
 			}
 		}
 
@@ -836,8 +842,14 @@ void CMT32Pi::AudioTask()
 		if (nResult != static_cast<int>(nWriteBytes))
 			LOGERR("Sound data dropped");
 		// Audio is flowing once the first block has been written;
-		// from here an empty DAC queue is a real starvation.
-		m_bAudioFlowing = true;
+		// anchor the DAC accounting clock here and count the
+		// frames written for the cumulative null-frame check.
+		if (!m_bAudioFlowing)
+		{
+			m_nAudioStartUs = CTimer::Get()->GetClockTicks();
+			m_bAudioFlowing = true;
+		}
+		m_nTotalFramesWritten += nFrames;
 
 
 	}
@@ -856,23 +868,50 @@ void CMT32Pi::PCMTask()
 	// PCM idle ack, but the ack is written only by the iteration's
 	// parked branch, so gating the call on the flag means the ack
 	// can never arrive and every stop times out. The iteration
-	// itself gates on the flag, parks (acks idle) and yields when
-	// inactive, and backs off and yields when idle, so this loop
+	// itself gates on the flag, parks (acks idle) and returns false
+	// when inactive, and returns false when idle, so this loop
 	// is also the idle path for every other synth -- no work is
 	// ever done here unless the Nuked split is live.
 	// MU50 split (M4) follows the same discipline: its iteration
 	// is called unconditionally whenever the MU50 synth exists,
-	// gating + park ack inside, yielding when parked or idle. Both
-	// iterations run each loop pass when both synths exist (only
-	// the current one does work; the other parks/yields).
+	// gating + park ack inside, returning false when parked or
+	// idle. Both iterations run each loop pass when both synths
+	// exist (only the current one does work; the other returns
+	// false).
+	// Core 3 NEVER calls CScheduler::Yield(): the scheduler
+	// belongs to core 0 (Yield has no core check and no lock, so
+	// from core 3 it can save core 3's registers into the main
+	// task's slot and resume a network task on core 3 while core 0
+	// also runs scheduler tasks). When neither iteration did work,
+	// spin briefly (SplitPause) then sleep with wfe; core 2 sends
+	// sev after each cycles_pub store / block publish and core 0
+	// after setting m_bSplitActive / m_bSwpActive, so core 3 wakes
+	// when there is work or a reactivation. No lost wake-up: sev
+	// sets a latch on every core, so a sev landing between the
+	// work check and the wfe makes the wfe return immediately, and
+	// the loop re-checks for work after every wake. The short spin
+	// before sleeping keeps the chase latency low: core 3 does not
+	// sleep while core 2 is actively publishing.
+	unsigned nIdleSpins = 0;
 	while (m_bRunning)
 	{
+		bool bWorked = false;
 		if (m_pNukedSC55Synth)
-			m_pNukedSC55Synth->PCMTaskIteration();
+			bWorked |= m_pNukedSC55Synth->PCMTaskIteration();
 		if (m_pMU50Synth)
-			m_pMU50Synth->PCMTaskIteration();
-		if (!m_pNukedSC55Synth && !m_pMU50Synth)
-			CScheduler::Get()->Yield();
+			bWorked |= m_pMU50Synth->PCMTaskIteration();
+		if (!bWorked)
+		{
+			// Short spin before sleeping (SplitPause's ARM YIELD
+			// hint, inlined here: the backend header that defines
+			// SplitPause is scoped to nukedsc55synth.cpp only).
+			if (++nIdleSpins < 64)
+				__asm__ volatile ("yield" ::: "memory");
+			else
+				__asm__ volatile ("wfe" ::: "memory");
+		}
+		else
+			nIdleSpins = 0;
 	}
 }
 

@@ -237,19 +237,25 @@ private:
 	u64 m_nLimiterWindowStartUs = 0;
 	u64 m_nLimiterLastLimitedFrames = 0;
 
-	// DAC starvation: times the DAC queue was found empty at the
-	// top of the AudioTask loop (Circle inserts null frames when
-	// the queue is empty, with no fade and no counter, so an
-	// empty queue is a real underrun the synth's underrun_frames
-	// cannot see -- Prefill keeps the synth ring full, so the
-	// starvation moves here). Counted on the transition from
-	// non-empty to empty, only after the first Write (boot starts
-	// with an empty queue, which is not a starvation). Reported
-	// as dac_starves in the limiter window line.
-	u64 m_nDacStarves = 0;
-	u64 m_nDacLastStarves = 0;
+	// DAC starvation, measured by cumulative accounting (not a
+	// point-in-time empty check, which is wrong in both
+	// directions: it misses a starvation when the task is held
+	// between the check and Write -- the diag f_sync sits in
+	// exactly that gap -- and it counts harmless momentary
+	// empties right after a DMA pull). The DAC consumes one
+	// frame per sample period (48 kHz), so in elapsed time T it
+	// has attempted to consume T*48000 frames. If that exceeds
+	// the frames actually written, the difference is null frames
+	// Circle had to insert. m_nDacNullFrames is the cumulative
+	// null-frame count; the window line reports the delta.
+	// m_nAudioStartUs is set on the first Write; the initial
+	// queue fill puts written ahead of attempted consumption,
+	// so startup does not false-trigger.
+	u64 m_nDacNullFrames = 0;
+	u64 m_nDacLastNullFrames = 0;
+	u64 m_nTotalFramesWritten = 0;
+	u64 m_nAudioStartUs = 0;
 	bool m_bAudioFlowing = false;
-	bool m_bDacQueueEmpty = false;
 
 
 	// Extra devices

@@ -761,6 +761,12 @@ void CMU50Synth::AdvanceH8(size_t nNativeFrames)
 			}
 		}
 		m_nLastPublishedSeq = nSeq;
+		// Wake core 3 if it is sleeping in wfe (it idles there
+		// instead of Yield, which belongs to core 0). Only when
+		// the block was actually published; a skipped publish
+		// (parked SWP) has no block to render.
+		if (m_bLastPublishOk)
+			__asm__ volatile ("sev" ::: "memory");
 		__atomic_store_n(&m_nPublishedCycles, m_pH8->cycles(), __ATOMIC_RELEASE);
 	}
 }
@@ -1447,22 +1453,22 @@ void CMU50Synth::SetFilter0277(bool b0277)
 		m_pSynth->set_filter_0277(b0277);
 }
 
-void CMU50Synth::PCMTaskIteration()
+bool CMU50Synth::PCMTaskIteration()
 {
 	// Unconditional-call discipline: the worker loop calls this
 	// every iteration; gating is inside. If the call itself were
 	// gated on m_bSwpActive, the park ack below would never run
 	// and ParkSwp would deadlock (the Nuked wedge).
 	if (!m_bSplitMode || !m_pSynth)
-		return;
+		return false;
 	if (!__atomic_load_n(&m_bSwpActive, __ATOMIC_ACQUIRE))
 	{
 		__atomic_store_n(&m_bSwpParkAck, true, __ATOMIC_RELEASE);
-		// M4: parked branch yields (Nuked precedent) so the core-3
-		// loop is scheduler-paced even when the Nuked synth does
-		// not exist to pace it.
-		CScheduler::Get()->Yield();
-		return;
+		// Parked: no Yield() here (it belongs to core 0; see
+		// the Nuked PCMTaskIteration). The PCMTask loop idles
+		// with wfe/sev instead; this iteration just reports
+		// that it did no work.
+		return false;
 	}
 	TPublishedBlock Block;
 	if (!m_PublishedBlocks.TryPop(Block))
@@ -1479,16 +1485,10 @@ void CMU50Synth::PCMTaskIteration()
 		// would deadlock (the SWP core could only drain up to a
 		// snapshot that does not exist yet).
 		DrainWEventsUpTo(m_WEventFifo.InIndex());
-		// M4: idle backoff (Nuked precedent: 64 yield hints, then
-		// a scheduler yield). The SWP thread spends most of its
-		// time here while the audio thread steps the next block;
-		// the Yield keeps the core-3 loop from spinning hot, and
-		// on a single-task core it returns immediately, so publish
-		// latency is unaffected.
-		for (unsigned i = 0; i < 64; ++i)
-			mu50spsc::CpuRelax();
-		CScheduler::Get()->Yield();
-		return;
+		// No Yield() here (it belongs to core 0). The PCMTask
+		// loop does the spin-then-wfe backoff; this iteration
+		// just reports that it did no work.
+		return false;
 	}
 	DrainWEventsUpTo(Block.nFifoSnap);
 	const u64 nSwpStartUs = CTimer::Get()->GetClockTicks();
@@ -1508,7 +1508,7 @@ void CMU50Synth::PCMTaskIteration()
 			}
 			__atomic_add_fetch(&m_nSwpRenderUs, CTimer::Get()->GetClockTicks() - nSwpStartUs, __ATOMIC_RELAXED);
 			UpdateRingHighWater();
-			return;
+			return true;
 		}
 		for (size_t i = 0; i < nChunk; ++i)
 		{
@@ -1539,6 +1539,7 @@ void CMU50Synth::PCMTaskIteration()
 	}
 	__atomic_add_fetch(&m_nSwpRenderUs, CTimer::Get()->GetClockTicks() - nSwpStartUs, __ATOMIC_RELAXED);
 	UpdateRingHighWater();
+	return true;
 }
 
 bool CMU50Synth::EnqueueSwpFrame(u64 nSeq, const TNativeFrame& Frame)
@@ -1592,6 +1593,9 @@ bool CMU50Synth::ParkSwp()
 void CMU50Synth::UnparkSwp()
 {
 	__atomic_store_n(&m_bSwpActive, true, __ATOMIC_RELEASE);
+	// Wake core 3 if it is sleeping in wfe (it idles there
+	// instead of Yield, which belongs to core 0).
+	__asm__ volatile ("sev" ::: "memory");
 }
 
 u64 CMU50Synth::GetWqFullWaits()

@@ -89,7 +89,7 @@ public:
 	// lock, then publish. Yields when there is no work. No-op when
 	// the split is inactive (it parks the task and acks the stop
 	// handshake instead).
-	void PCMTaskIteration();
+	bool PCMTaskIteration();
 
 	// Synth-switch split control (called by CMT32Pi::SwitchSynth,
 	// core 0): park the PCM task when switching away from this

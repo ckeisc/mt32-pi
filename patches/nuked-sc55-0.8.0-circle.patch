@@ -2482,7 +2482,7 @@ new file mode 100644
 index 0000000..ee9abaf
 --- /dev/null
 +++ b/src/backend/split_thread_circle.h
-@@ -0,0 +1,348 @@
+@@ -0,0 +1,366 @@
 +/*
 + * mt32-pi dual-core Nuked-SC55 split: ROMACCLZ sync (trim + FIFO).
 + *
@@ -2515,8 +2515,16 @@ index 0000000..ee9abaf
 + * The state layout keeps the trim cache-line discipline: each writer
 + * group's fields sit on their own 64-byte lines, separated by 64-byte
 + * spacing (spacing, not base alignment, is what keeps two groups off
-+ * one hardware line). There is deliberately no sev/wfe handling here:
-+ * no wait-for-event exists on this path to lose a wakeup for.
++ * one hardware line). Core 3 idles with wfe/sev, not Yield():
++ * CScheduler::Yield() belongs to core 0 (it has no core check and no
++ * lock, so from core 3 it can save core 3's registers into the main
++ * task's slot and resume a network task on core 3 while core 0 also
++ * runs scheduler tasks). Core 3 spins briefly (SplitPause), then
++ * sleeps with wfe; core 2 sends sev after each cycles_pub store and
++ * core 0 after setting m_bSplitActive. No lost wake-up: sev sets a
++ * latch on every core, so a sev landing between core 3's check and
++ * its wfe makes the wfe return immediately, and core 3 re-checks
++ * for work after every wake.
 + */
 +
 +#ifndef _split_thread_circle_h
@@ -2543,6 +2551,16 @@ index 0000000..ee9abaf
 +static inline void SplitPause()
 +{
 +    __asm__ volatile ("yield" ::: "memory");
++}
++
++// Send an event to wake a core sleeping in wfe. Core 2 calls this
++// after each cycles_pub store and core 0 after setting
++// m_bSplitActive, so core 3 (which idles with wfe) wakes when there
++// is work or a reactivation. A single instruction; the cost on the
++// binding core (core 2) is negligible against the MCU stepping.
++static inline void SplitSendEvent()
++{
++    __asm__ volatile ("sev" ::: "memory");
 +}
 +
 +// Trim split state. See the file comment for the layout discipline.

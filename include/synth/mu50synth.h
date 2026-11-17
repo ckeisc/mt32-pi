@@ -120,7 +120,7 @@ public:
 	// (sweep + cutoff cap) in the SWP00 core. Call before the SWP
 	// thread starts; afterwards the flag is read-only.
 	void SetFilter0277(bool b0277);
-	void PCMTaskIteration();
+	bool PCMTaskIteration();
 	bool ParkSwp(); // request park, wait for ack; false on timeout
 	void UnparkSwp();
 	// Test-only atomic snapshots (safe from any thread).

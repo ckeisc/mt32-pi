@@ -461,6 +461,9 @@ void CNukedSC55Synth::InitSplitState(bool bClearRing)
 	SplitDMB();
 	m_bSplitActive = true;
 	SplitDMB();
+	// Wake core 3 if it is sleeping in wfe (it idles there
+	// instead of Yield, which belongs to core 0).
+	SplitSendEvent();
 }
 
 void CNukedSC55Synth::SplitActivate()
@@ -507,7 +510,7 @@ void CNukedSC55Synth::LogSplitState(const char* pTag)
 }
 
 
-void CNukedSC55Synth::PCMTaskIteration()
+bool CNukedSC55Synth::PCMTaskIteration()
 {
 	if (!m_bSplitActive || !m_pEmulator || !m_pSplitState)
 	{
@@ -519,10 +522,15 @@ void CNukedSC55Synth::PCMTaskIteration()
 		// the task again instead of letting it render. Conversely,
 		// m_bPCMIdle is false throughout any work batch (set below),
 		// so a stop waiter can never observe true mid-batch.
+		// No Yield() here: CScheduler::Yield() belongs to core 0
+		// (it has no core check and no lock, so from core 3 it can
+		// save core 3's registers into the main task's slot and
+		// resume a network task on core 3 while core 0 also runs
+		// scheduler tasks). The PCMTask loop idles with wfe/sev
+		// instead; this iteration just reports that it did no work.
 		m_bPCMIdle = true;
 		SplitDMB();
-		CScheduler::Get()->Yield();
-		return;
+		return false;
 	}
 
 	ThreadSplitStateCircle& S = *m_pSplitState;
@@ -538,13 +546,12 @@ void CNukedSC55Synth::PCMTaskIteration()
 	const uint64_t nTick = static_cast<uint64_t>(PCM.config.reg_slots + 1) * 25ULL;
 	if (nPublished <= PCM.cycles + ThreadSplitStateCircle::MaxTickCycles)
 	{
-		// Idle: back off 64 yield hints, then yield to the scheduler
-		// (the fork has tasks; the minimal kernel spun here).
+		// Idle: caught up with core 2, nothing to render. No
+		// Yield() here (see the parked branch: Yield belongs to
+		// core 0). The PCMTask loop does the spin-then-wfe backoff;
+		// this iteration just reports that it did no work.
 		S.core3_phase = 1;
-		for (unsigned i = 0; i < 64; ++i)
-			SplitPause();
-		CScheduler::Get()->Yield();
-		return;
+		return false;
 	}
 
 	m_bPCMIdle = false;
@@ -566,6 +573,7 @@ void CNukedSC55Synth::PCMTaskIteration()
 	if (nLag > static_cast<int64_t>(S.max_pcm_lag))
 		S.max_pcm_lag = static_cast<uint64_t>(nLag);
 	S.pcm_task_us = S.pcm_task_us + CTimer::Get()->GetClockTicks() - nWorkStartUs;
+	return true;
 }
 
 bool CNukedSC55Synth::Initialize()
@@ -1027,6 +1035,12 @@ size_t CNukedSC55Synth::Prefill(size_t nTargetFill, bool (*pfnShouldStop)(void*)
 		ThreadSplitStateCircle& S = *m_pSplitState;
 		unsigned nRingCheckdown = 1;
 		unsigned nPublishCountdown = 0;
+		// Stop-callback check interval: the callback takes
+		// Circle's sound spinlock, so checking it every 16
+		// steps cost ~1% of core 2. Every 64 steps is nearly as
+		// responsive (the DAC block is ~5 ms; 64 steps is a
+		// fraction of that) for a quarter of the cost.
+		unsigned nStopCheckdown = 1;
 		while (m_nSampleRingFill < nTargetFill && nSteps < nStepBudget)
 		{
 			if (--nRingCheckdown == 0)
@@ -1034,9 +1048,13 @@ size_t CNukedSC55Synth::Prefill(size_t nTargetFill, bool (*pfnShouldStop)(void*)
 				nRingCheckdown = 16;
 				if (m_nSampleRingFill >= nTargetFill)
 					break;
-				// Interruptible: if the DAC queue has room, stop
-				// prefill so AudioTask can Render instead of
-				// sitting here while the queue drains.
+			}
+			// Interruptible: if the DAC queue has room, stop
+			// prefill so AudioTask can Render instead of
+			// sitting here while the queue drains.
+			if (--nStopCheckdown == 0)
+			{
+				nStopCheckdown = 64;
 				if (pfnShouldStop && pfnShouldStop(pStopContext))
 					break;
 			}
@@ -1048,17 +1066,25 @@ size_t CNukedSC55Synth::Prefill(size_t nTargetFill, bool (*pfnShouldStop)(void*)
 			{
 				nPublishCountdown = 0;
 				__atomic_store_n(&S.cycles_pub, MCU.cycles, __ATOMIC_RELEASE);
+				// Wake core 3 if it is sleeping in wfe (it idles
+				// there instead of Yield, which belongs to core 0).
+				SplitSendEvent();
 				S.publishes = S.publishes + 1;
 			}
 		}
 		if (nPublishCountdown != 0)
 		{
 			__atomic_store_n(&S.cycles_pub, MCU.cycles, __ATOMIC_RELEASE);
+			// Wake core 3 if it is sleeping in wfe.
+			SplitSendEvent();
 			S.publishes = S.publishes + 1;
 		}
 	}
 	else
 	{
+		// Stop-callback interval is 64 steps (see the split
+		// path): the callback takes Circle's sound spinlock,
+		// and every 16 steps cost ~1% of core 2.
 		unsigned nStopCheckdown = 1;
 		while (m_nSampleRingFill < nTargetFill && nSteps < nStepBudget)
 		{
@@ -1066,7 +1092,7 @@ size_t CNukedSC55Synth::Prefill(size_t nTargetFill, bool (*pfnShouldStop)(void*)
 			++nSteps;
 			if (--nStopCheckdown == 0)
 			{
-				nStopCheckdown = 16;
+				nStopCheckdown = 64;
 				if (pfnShouldStop && pfnShouldStop(pStopContext))
 					break;
 			}
@@ -1130,8 +1156,12 @@ size_t CNukedSC55Synth::RenderFrames(float* pOutBuffer, size_t nFrames)
 	// and let the resampler produce what it can (a counted,
 	// concealed underrun) instead of running long and letting
 	// the DAC queue drain to Circle-inserted nulls. Checked
-	// every 16 steps alongside the ring check.
-	const u64 nDeadlineUs = static_cast<u64>(nFrames) * 1000000ULL / m_nSampleRate;
+	// every 16 steps alongside the ring check. Capped at one DMA
+	// block (128 frames): a 256-frame request means the queue is
+	// already empty, yet an uncapped deadline would allow
+	// another 5.3 ms of stepping while the DAC stays dry.
+	const u64 nDeadlineUs = std::min(static_cast<u64>(nFrames) * 1000000ULL / m_nSampleRate,
+	                                 static_cast<u64>(128) * 1000000ULL / m_nSampleRate);
 
 	if (m_bSplitActive && m_pSplitState)
 	{
@@ -1188,12 +1218,17 @@ size_t CNukedSC55Synth::RenderFrames(float* pOutBuffer, size_t nFrames)
 			{
 				nPublishCountdown = 0;
 				__atomic_store_n(&S.cycles_pub, MCU.cycles, __ATOMIC_RELEASE);
+				// Wake core 3 if it is sleeping in wfe (it idles
+				// there instead of Yield, which belongs to core 0).
+				SplitSendEvent();
 				S.publishes = S.publishes + 1;
 			}
 		}
 		if (nPublishCountdown != 0)
 		{
 			__atomic_store_n(&S.cycles_pub, MCU.cycles, __ATOMIC_RELEASE);
+			// Wake core 3 if it is sleeping in wfe.
+			SplitSendEvent();
 			S.publishes = S.publishes + 1;
 		}
 		if (bDiag)
@@ -1404,13 +1439,22 @@ size_t CNukedSC55Synth::RenderFrames(float* pOutBuffer, size_t nFrames)
 		// resumes from where it left off instead of re-priming
 		// (which stepped on the way back in). The next call fades
 		// back in (above).
-		const size_t nFadeOut = nDone < ConcealFadeFrames ? nDone : ConcealFadeFrames;
-		for (size_t j = 0; j < nFadeOut; ++j)
+		// When only a few frames were produced (nDone below
+		// ConcealFadeFrames), skip the fade-out: squeezing it
+		// into those frames drops the level sharply (with three
+		// frames it falls to 25% in three samples). The tail
+		// decay below starts from the last produced sample at
+		// full value and ramps it down smoothly instead.
+		if (nDone >= ConcealFadeFrames)
 		{
-			const float fGain = 1.0f - static_cast<float>(j + 1) / static_cast<float>(nFadeOut + 1);
-			const size_t nIdx = nDone - nFadeOut + j;
-			pOutBuffer[nIdx * 2]     *= fGain;
-			pOutBuffer[nIdx * 2 + 1] *= fGain;
+			const size_t nFadeOut = ConcealFadeFrames;
+			for (size_t j = 0; j < nFadeOut; ++j)
+			{
+				const float fGain = 1.0f - static_cast<float>(j + 1) / static_cast<float>(nFadeOut + 1);
+				const size_t nIdx = nDone - nFadeOut + j;
+				pOutBuffer[nIdx * 2]     *= fGain;
+				pOutBuffer[nIdx * 2 + 1] *= fGain;
+			}
 		}
 		// Decay the gap forward from the boundary value instead
 		// of writing hard zeros. The boundary is the faded last
