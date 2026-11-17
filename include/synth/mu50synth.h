@@ -215,12 +215,16 @@ private:
 	// failed block pop and the pending-count read), or the ring
 	// lapped the snapshot. A drain/segment loop that only stops on
 	// an exact index match would then wrap the whole ring and eat
-	// later blocks' writes early. Residual corner: the guard is
-	// exact unless >= N pushes land between the snapshot and the
-	// check (a full ring lap, which also makes the snapshot
-	// indistinguishable from a fresh one); production bounds that
-	// away (max burst 602 < cap 4095), and the bounded loop below
-	// caps the damage to the entries actually pending.
+	// later blocks' writes early. Residual corner: if the
+	// out-index already passed the snapshot by k entries, the
+	// masked distance reads N - k, so the guard reports "ahead"
+	// whenever the pending count is >= N - k (buffer size minus
+	// the overshoot) -- not only after a full ring lap of pushes.
+	// The idle-drain arithmetic bounds that away at the production
+	// cap: the drain relieves only to half cap, so the pending
+	// count at the check stays below N - k for the overshoots
+	// that occur there (max burst 602 < cap 4095), and the bounded
+	// loop below caps the damage to the entries actually pending.
 	bool FifoSnapAhead(size_t nSnap);
 
 	// Shared per-write segment loop (Finding 2; review item 9):

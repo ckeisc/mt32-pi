@@ -746,7 +746,8 @@ bool CMU50Synth::FifoSnapAhead(size_t nSnap)
 	// Forward distance from the out-index to the snapshot, masked
 	// (indices wrap mod kWEventFifoSize); the snapshot is ahead iff
 	// that distance is within the pending count. See the header
-	// comment for the exactness bound (full ring lap).
+	// comment for the exactness bound (buffer size minus the
+	// overshoot, not a full ring lap).
 	const size_t nDist = (nSnap - m_WEventFifo.OutIndex()) &
 	                     decltype(m_WEventFifo)::Mask;
 	return nDist <= m_WEventFifo.PendingForConsumer();

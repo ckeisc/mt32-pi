@@ -560,26 +560,31 @@ void CMT32Pi::MainTask()
 	// loading on Core 1: wait for it (bounded) so we never
 	// activate an unloaded synth. For any other initial synth
 	// this is skipped entirely -- the main loop starts at once.
-	// On load failure, fall back to another working synth, as in
-	// Initialize().
-	if (m_pCurrentSynth == m_pSoundFontSynth &&
-	    !m_pSoundFontSynth->WaitForLoad())
+	// WaitForLoad only waits for a load in progress; whether
+	// the load succeeded is checked separately below. On load
+	// failure (or a wait timeout), fall back to another working
+	// synth, as in Initialize().
+	if (m_pCurrentSynth == m_pSoundFontSynth)
 	{
-		LOGERR("SoundFont failed to load; falling back to another synth");
-		m_pCurrentSynth = nullptr;
-
-		if (m_pMT32Synth)
-			m_pCurrentSynth = m_pMT32Synth;
-		else if (m_pEmuSCSynth)
-			m_pCurrentSynth = m_pEmuSCSynth;
-		else if (m_pNukedSC55Synth)
-			m_pCurrentSynth = m_pNukedSC55Synth;
-		else if (m_pMU50Synth)
-			m_pCurrentSynth = m_pMU50Synth;
-		else
+		m_pSoundFontSynth->WaitForLoad();
+		if (!m_pSoundFontSynth->IsLoaded())
 		{
-			LOGPANIC("No synths available; ROMs/SoundFonts not found");
-			return;
+			LOGERR("SoundFont failed to load; falling back to another synth");
+			m_pCurrentSynth = nullptr;
+
+			if (m_pMT32Synth)
+				m_pCurrentSynth = m_pMT32Synth;
+			else if (m_pEmuSCSynth)
+				m_pCurrentSynth = m_pEmuSCSynth;
+			else if (m_pNukedSC55Synth)
+				m_pCurrentSynth = m_pNukedSC55Synth;
+			else if (m_pMU50Synth)
+				m_pCurrentSynth = m_pMU50Synth;
+			else
+			{
+				LOGPANIC("No synths available; ROMs/SoundFonts not found");
+				return;
+			}
 		}
 	}
 
@@ -1009,7 +1014,18 @@ void CMT32Pi::Run(unsigned nCore)
 			// before the load finishes waits for it (see
 			// SwitchSynth).
 			if (m_pSoundFontSynth)
+			{
 				m_pSoundFontSynth->LoadSoundFont();
+				// A failed boot load used to stay silent: the
+				// synth object exists (Initialize returned true)
+				// but nothing is loaded, and the failure only
+				// ever surfaced if the user later tried to switch
+				// to SoundFont. Show it now, whatever the default
+				// synth is; a USB rescan retries the load (see
+				// UpdateUSB).
+				if (!m_pSoundFontSynth->IsLoaded())
+					LCDLog(TLCDLogType::Warning, "SF load failed!");
+			}
 			return UITask();
 
 		case 2:
@@ -1197,12 +1213,26 @@ void CMT32Pi::UpdateUSB(bool bStartup)
 
 				LCDLog(TLCDLogType::Spinner, "SoundFont rescan");
 				if (m_pSoundFontSynth)
+				{
 					m_pSoundFontSynth->GetSoundFontManager().ScanSoundFonts();
+					// A failed boot load leaves the synth unloaded
+					// (Initialize already returned true, so the
+					// pointer is non-null); retry it now that the
+					// font list is fresh. RetryLoad reports a
+					// failure only if a load was attempted and
+					// failed.
+					if (!m_pSoundFontSynth->RetryLoad())
+						LCDLog(TLCDLogType::Warning, "SF load failed!");
+				}
 				else if (InitSoundFontSynth())
+				{
 					// Runtime re-init (after boot): no background
 					// load task runs now, so load synchronously
 					// as before.
 					m_pSoundFontSynth->LoadSoundFont();
+					if (!m_pSoundFontSynth->IsLoaded())
+						LCDLog(TLCDLogType::Warning, "SF load failed!");
+				}
 
 				if (!m_pEmuSCSynth)
 				{
@@ -1692,12 +1722,17 @@ void CMT32Pi::SwitchSynth(TSynth NewSynth)
 	}
 
 	// SoundFont still loading on Core 1: wait for it (bounded)
-	// rather than activating an unloaded synth.
-	if (pNewSynth == m_pSoundFontSynth &&
-	    !m_pSoundFontSynth->WaitForLoad())
+	// rather than activating an unloaded synth. WaitForLoad
+	// only waits for a load in progress; whether the load
+	// succeeded is checked separately below.
+	if (pNewSynth == m_pSoundFontSynth)
 	{
-		LCDLog(TLCDLogType::Warning, "SF load failed!");
-		return;
+		m_pSoundFontSynth->WaitForLoad();
+		if (!m_pSoundFontSynth->IsLoaded())
+		{
+			LCDLog(TLCDLogType::Warning, "SF load failed!");
+			return;
+		}
 	}
 
 	CSynthBase* pOldSynth = m_pCurrentSynth;

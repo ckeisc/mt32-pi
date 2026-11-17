@@ -120,5 +120,55 @@ int main() {
     VoiceMix mix{};
     for (int i = 0; i < 4; ++i) mix = open_rom.render_one(encoded_rom.data(), encoded_rom.size());
     assert(mix.dry_l != 0 || mix.dry_r != 0);
+    // Filter sweep state reset on key-on (PR #15, reviewer clue):
+    // a key-on with the sweep flag (bit 7 of the filter speed)
+    // starts a sweep (HEAD: m_k rises from 0x800 toward 0xfff;
+    // 0277: a hidden timer counts down). A later key-on WITHOUT
+    // the flag must reset the sweep state: MAME HEAD leaves
+    // m_sweep untouched in that branch, so a stale SWEEP_UP leaks
+    // into the new note. Observed via filter_status(): the 0xc0
+    // "done" bit is set only when the sweep is DONE (or NONE with
+    // m_k at target), and the low 6 bits are (m_k >> 6) ^ 0x3f.
+    // Voice target 0xc00 (info 0x2400), sweep speed 0x40: after
+    // 8 frames the sweep is still in progress, so the second
+    // key-on must report done (0xcf) immediately and still do so
+    // 1024 frames later (m_k unmoved).
+    for (bool filter_0277 : {false, true}) {
+        Swp0277Core c;
+        c.reset();
+        c.set_filter_0277(filter_0277);
+        c.set_format(0, 0x00);
+        c.set_address(0, 0);
+        c.set_start(0, 0);
+        c.set_loop(0, 32);
+        c.set_pitch(0, 0x0800);
+        c.set_lpf_info(0, 0x2400);
+        c.set_lpf_speed(0, 0x80 | 0x40);
+        c.set_lfo_lamod(0, 0);
+        c.set_lfo_speed(0, 0);
+        c.set_lfo_fmod(0, 0);
+        c.set_attack_speed(0, 0);
+        c.set_attack_level(0, 0);
+        c.set_decay_speed(0, 0);
+        c.set_decay_level(0, 0);
+        c.set_glo_level(0, 0);
+        c.set_pan(0, 0x80);
+        c.set_dry_level(0, 0);
+        c.set_reverb_level(0, 0);
+        c.set_chorus_level(0, 0);
+        c.set_variation_level(0, 0);
+        c.keyon(0);
+        assert((c.filter_status(0) & 0xc0) == 0); // sweeping
+        for (int i = 0; i < 8; ++i)
+            (void)c.render_one(encoded_rom.data(), encoded_rom.size());
+        assert((c.filter_status(0) & 0xc0) == 0); // still sweeping
+        c.set_lpf_speed(0, 0x40);
+        c.keyon(0);
+        assert(c.filter_status(0) == 0xcf); // done, m_k at target
+        for (int i = 0; i < 1024; ++i)
+            (void)c.render_one(encoded_rom.data(), encoded_rom.size());
+        assert(c.filter_status(0) == 0xcf); // m_k unmoved
+    }
+
     return 0;
 }

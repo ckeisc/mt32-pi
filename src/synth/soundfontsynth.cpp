@@ -286,13 +286,16 @@ bool CSoundFontSynth::WaitForLoad(unsigned nTimeoutMillis)
 		m_Lock.Acquire();
 		const bool bLoading = m_bLoading;
 		const bool bPending = m_bLoadPending;
-		const bool bLoaded = m_bLoaded;
 		m_Lock.Release();
 
 		// Wait for the load to start (pending) as well as finish:
-		// Core 1 may not have picked it up yet.
+		// Core 1 may not have picked it up yet. The return value
+		// reports only that no load is running anymore, NOT
+		// whether it succeeded: after a failed load, a later
+		// font switch must still proceed (SwitchSoundFont), and
+		// callers that need a loaded synth check IsLoaded().
 		if (!bLoading && !bPending)
-			return bLoaded;
+			return true;
 
 		if (CTimer::GetClockTicks() - nStartTicks >= nTimeoutTicks)
 		{
@@ -302,6 +305,59 @@ bool CSoundFontSynth::WaitForLoad(unsigned nTimeoutMillis)
 
 		pScheduler->Yield();
 	}
+}
+
+bool CSoundFontSynth::IsLoaded()
+{
+	m_Lock.Acquire();
+	const bool bLoaded = IsLoadedLocked();
+	m_Lock.Release();
+	return bLoaded;
+}
+
+bool CSoundFontSynth::RetryLoad()
+{
+	// Re-resolve the font from the freshly scanned list and
+	// re-arm the pending load under one lock hold, so the Core 1
+	// boot load (which may still be pending) cannot start
+	// concurrently: re-arming supersedes it, and WaitForLoad()
+	// in SwitchSoundFont sees the pending load and waits. The
+	// manager takes no lock and is only ever rebuilt on Core 0,
+	// so resolving it under m_Lock is deadlock-free.
+	m_Lock.Acquire();
+	if (m_bLoaded || m_bLoading)
+	{
+		m_Lock.Release();
+		return true; // already loaded, or a load is running
+	}
+
+	const char* pSoundFontPath = m_SoundFontManager.GetSoundFontPath(m_nCurrentSoundFontIndex);
+	if (!pSoundFontPath)
+	{
+		pSoundFontPath = m_SoundFontManager.GetFirstValidSoundFontPath();
+		m_nCurrentSoundFontIndex = 0;
+	}
+	if (!pSoundFontPath)
+	{
+		m_Lock.Release();
+		return false; // no font available to load
+	}
+
+	m_PendingSoundFontPath = pSoundFontPath;
+	m_PendingFXProfile = m_SoundFontManager.GetSoundFontFXProfile(m_nCurrentSoundFontIndex);
+	m_bLoadPending = true;
+	m_Lock.Release();
+
+	LoadSoundFont();
+
+	// LoadSoundFont() returns false when another core claimed
+	// the re-armed pending load first -- the load is then
+	// running there, which is not a failure. Report the settled
+	// state instead of its return value.
+	m_Lock.Acquire();
+	const bool bSettled = m_bLoaded || m_bLoading || m_bLoadPending;
+	m_Lock.Release();
+	return bSettled;
 }
 
 void CSoundFontSynth::HandleMIDIShortMessage(u32 nMessage)

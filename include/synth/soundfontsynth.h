@@ -64,11 +64,31 @@ public:
 	// Returns true once the synth is loaded.
 	bool LoadSoundFont();
 
-	// Wait (bounded) for a load in progress to finish; returns
-	// true if the synth is loaded afterwards. Core 0 only: yields
+	// Wait (bounded) for a load in progress to finish. Returns
+	// true once no load is pending or in progress, false only on
+	// timeout. This deliberately does NOT report whether the load
+	// succeeded: a wait must gate on "a load is running", never
+	// on "a previous load succeeded" -- after a failed load, a
+	// later font switch must still be able to proceed (see
+	// SwitchSoundFont). Callers that must not use an unloaded
+	// synth check IsLoaded() after waiting. Core 0 only: yields
 	// to the (core-0) scheduler while waiting. Returns
 	// immediately if no load is pending or in progress.
 	bool WaitForLoad(unsigned nTimeoutMillis = 30000);
+
+	// True once the .sf2 is parsed and no load is in progress.
+	// Takes m_Lock; safe from any core.
+	bool IsLoaded();
+
+	// Retry loading the current SoundFont from the (freshly
+	// scanned) manager list, synchronously. Used by the USB
+	// rescan after a failed boot load: the synth object exists
+	// but nothing is loaded, and LoadSoundFont() has no pending
+	// load left to run. Returns true if the synth is loaded
+	// afterwards, or if a load is already running or pending
+	// (the retry is then deferred to that load); false only if
+	// a load was attempted and failed, or no font is available.
+	bool RetryLoad();
 
 private:
 	bool Reinitialize(const char* pSoundFontPath, const TFXProfile* pFXProfile);
