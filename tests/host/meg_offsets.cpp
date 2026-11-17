@@ -75,6 +75,9 @@ int main(int argc, char **argv) {
       char *hex = std::strstr(line, "SYSEX");
       if (!hex) continue;
       hex += 5;
+      // Skip whitespace after "SYSEX": the original parsed from the
+      // space, hexval(' ')==-1, so every SysEx was silently dropped.
+      while (*hex == ' ' || *hex == '\t') ++hex;
       e.sysex = true;
       for (char *p = hex; *p && *(p+1); p += 2) {
         int hi = hexval((unsigned char)*p), lo = hexval((unsigned char)*(p+1));
@@ -82,6 +85,11 @@ int main(int argc, char **argv) {
         e.bytes.push_back((unsigned char)((hi << 4) | lo));
       }
       if (e.bytes.empty()) continue;
+      // The firmware expects the complete message including the
+      // leading F0. New events files (fixed midi_to_events.py) carry
+      // it; old ones don't -- prepend it when absent, never twice.
+      if (e.bytes[0] != 0xf0)
+        e.bytes.insert(e.bytes.begin(), 0xf0);
     } else {
       continue;
     }

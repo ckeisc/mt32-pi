@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Parse 01_XG.mid into a time-ordered event list for the MU50 host renderer.
 Output: text lines: <frame> SHORT <status> <data1> <data2>   (48 kHz frames)
-                  <frame> SYSEX <hex bytes>
+                  <frame> SYSEX <hex bytes>   (SysEx hex includes the leading F0)
 Tempo map is honoured (meta 0x51). Only events up to --seconds are emitted.
 """
 import struct, sys, argparse
@@ -52,6 +52,10 @@ def main():
             elif b in (0xF0, 0xF7):
                 ln, i2 = parse_vlq(data, i+1)
                 payload = data[i2:i2+ln]
+                # Keep the leading F0: the events file must carry the
+                # complete SysEx message, as the firmware expects.
+                if b == 0xF0:
+                    payload = bytes([0xF0]) + payload
                 raw.append((tick, 'sysex', bytes(payload)))
                 i = i2 + ln
             else:
