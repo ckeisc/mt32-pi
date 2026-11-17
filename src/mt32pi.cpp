@@ -701,6 +701,23 @@ void CMT32Pi::UITask()
 	m_bUITaskDone = true;
 }
 
+// Prefill stop callback (see synthbase.h): Prefill runs while
+// the DAC queue is full; it must stop the moment the queue has
+// room so AudioTask can Render instead of sitting inside
+// Prefill while the queue drains. GetQueueFramesAvail is the
+// FILLED count, so room exists when it is below the queue size.
+struct TPrefillStopContext
+{
+	CSoundBaseDevice* pSound;
+	size_t nQueueSizeFrames;
+};
+
+static bool PrefillShouldStop(void* pContext)
+{
+	const TPrefillStopContext* pCtx = static_cast<const TPrefillStopContext*>(pContext);
+	return pCtx->pSound->GetQueueFramesAvail() < pCtx->nQueueSizeFrames;
+}
+
 void CMT32Pi::AudioTask()
 {
 	LOGNOTE("Audio task on Core 2 starting up");
@@ -721,7 +738,18 @@ void CMT32Pi::AudioTask()
 
 	while (m_bRunning)
 	{
-		const size_t nFrames = nQueueSizeFrames - m_pSound->GetQueueFramesAvail();
+		// DAC starvation: if the queue is empty, the DAC has
+		// nothing to play and Circle inserts null frames (no
+		// fade, no counter). Count the transition from non-empty
+		// to empty, only after audio is flowing (boot starts
+		// empty, which is not a starvation).
+		const size_t nQueueAvail = m_pSound->GetQueueFramesAvail();
+		const bool bQueueEmpty = (nQueueAvail == 0);
+		if (m_bAudioFlowing && bQueueEmpty && !m_bDacQueueEmpty)
+			++m_nDacStarves;
+		m_bDacQueueEmpty = bQueueEmpty;
+
+		const size_t nFrames = nQueueSizeFrames - nQueueAvail;
 		const size_t nWriteBytes = nFrames * nBytesPerFrame;
 
 		if (nFrames == 0)
@@ -734,9 +762,13 @@ void CMT32Pi::AudioTask()
 			// frames, 8 ms at 48 kHz). This idle time builds
 			// a cushion so the next Render does not starve.
 			// Prefill is a no-op for synths without a
-			// prefillable ring. Then loop back to re-check
+			// prefillable ring. The stop callback lets Prefill
+			// return the moment the queue has room, so the
+			// audio task does not sit inside Prefill while
+			// the DAC drains. Then loop back to re-check
 			// the queue.
-			m_pCurrentSynth->Prefill(512);
+			TPrefillStopContext StopCtx{ m_pSound, nQueueSizeFrames };
+			m_pCurrentSynth->Prefill(512, PrefillShouldStop, &StopCtx);
 			continue;
 		}
 
@@ -769,10 +801,13 @@ void CMT32Pi::AudioTask()
 				m_nLimiterLastLimitedFrames = m_Limiter.GetLimitedFrames();
 				const unsigned nMinGainMilli = m_Limiter.GetMinGainMilli();
 				m_Limiter.ResetWindowStats();
+				const u64 nDacStarves = m_nDacStarves - m_nDacLastStarves;
+				m_nDacLastStarves = m_nDacStarves;
 				m_nLimiterWindowStartUs = nNowUs;
-				DiagLog.LogLine("window limiter limited=%llu min_gain_milli=%u",
+				DiagLog.LogLine("window limiter limited=%llu min_gain_milli=%u dac_starves=%llu",
 				                static_cast<unsigned long long>(nLimited),
-				                nMinGainMilli);
+				                nMinGainMilli,
+				                static_cast<unsigned long long>(nDacStarves));
 			}
 		}
 
@@ -800,6 +835,9 @@ void CMT32Pi::AudioTask()
 		const int nResult = m_pSound->Write(IntBuffer, nWriteBytes);
 		if (nResult != static_cast<int>(nWriteBytes))
 			LOGERR("Sound data dropped");
+		// Audio is flowing once the first block has been written;
+		// from here an empty DAC queue is a real starvation.
+		m_bAudioFlowing = true;
 
 
 	}

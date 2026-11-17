@@ -237,6 +237,20 @@ private:
 	u64 m_nLimiterWindowStartUs = 0;
 	u64 m_nLimiterLastLimitedFrames = 0;
 
+	// DAC starvation: times the DAC queue was found empty at the
+	// top of the AudioTask loop (Circle inserts null frames when
+	// the queue is empty, with no fade and no counter, so an
+	// empty queue is a real underrun the synth's underrun_frames
+	// cannot see -- Prefill keeps the synth ring full, so the
+	// starvation moves here). Counted on the transition from
+	// non-empty to empty, only after the first Write (boot starts
+	// with an empty queue, which is not a starvation). Reported
+	// as dac_starves in the limiter window line.
+	u64 m_nDacStarves = 0;
+	u64 m_nDacLastStarves = 0;
+	bool m_bAudioFlowing = false;
+	bool m_bDacQueueEmpty = false;
+
 
 	// Extra devices
 	CPisound* m_pPisound;

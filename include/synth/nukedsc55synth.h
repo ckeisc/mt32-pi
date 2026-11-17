@@ -23,6 +23,7 @@
 #ifndef _nukedsc55synth_h
 #define _nukedsc55synth_h
 
+#include <atomic>
 #include <circle/types.h>
 
 #include "ringbuffer.h"
@@ -283,13 +284,25 @@ private:
 	static constexpr size_t ConcealFadeFrames = 96;
 	bool m_bConcealed;
 
+	// Last output sample of the previous RenderFrames call
+	// (left/right, after any fade/decay). On an underrun that
+	// produces nothing (nDone == 0), the gap decays forward
+	// from this value instead of stepping to zero -- the
+	// previous block is already in the DAC queue and cannot be
+	// faded, so the tail has to start from where the signal
+	// actually was.
+	float m_fLastOutL = 0.0f;
+	float m_fLastOutR = 0.0f;
+
 	// Prefill: step the emulator until the sample ring holds at
 	// least nTargetFill native frames (or the step budget is
 	// exhausted). Called from AudioTask when the DAC queue is
 	// full, so idle time builds a cushion instead of spinning
 	// on zero-frame Render calls. Returns the ring fill after
-	// prefill.
-	size_t Prefill(size_t nTargetFill) override;
+	// prefill. pfnShouldStop is polled during the prefill (see
+	// synthbase.h); when it returns true the prefill stops early
+	// so AudioTask can Render instead.
+	size_t Prefill(size_t nTargetFill, bool (*pfnShouldStop)(void*) = nullptr, void* pStopContext = nullptr) override;
 
 	CRingBuffer<TSplitSample, SplitRingFrames> m_SampleRing;
 	volatile size_t m_nSampleRingFill;
@@ -327,16 +340,19 @@ private:
 	u64 m_nLastSplitFifoDrops = 0;
 	u64 m_nLastSplitPCMUs = 0;
 
-	// Sounding-note tracking for power management (core 0 only:
-	// written by the MIDI path, read by IsActive, both on MainTask,
-	// so no lock is needed). A held or pedal-sustained note keeps
-	// the synth "active" even through a quiet passage, so the clock
-	// cannot drop to power-save mid-performance; silence with no
-	// notes held still idles normally. Reset by AllSoundOff and by
-	// the MIDI system-reset path.
-	unsigned m_nHeldNotes = 0;
-	bool m_bSustain = false;
-	bool m_bSustainedNotes = false;
+	// Sounding-note tracking for power management: written by
+	// DrainMidiStage on the audio thread (core 2) and read by
+	// IsActive on core 0, so these are atomic -- the old comment
+	// claiming "core 0 only, no lock is needed" predates the
+	// lock-free MIDI staging, which moved the writes to core 2.
+	// A held or pedal-sustained note keeps the synth "active"
+	// even through a quiet passage, so the clock cannot drop to
+	// power-save mid-performance; silence with no notes held
+	// still idles normally. Reset by AllSoundOff and by the MIDI
+	// system-reset path.
+	std::atomic<unsigned> m_nHeldNotes{0};
+	std::atomic<bool> m_bSustain{false};
+	std::atomic<bool> m_bSustainedNotes{false};
 
 	// Lock-free MIDI input (single-producer/single-consumer):
 	// the MIDI thread (core 0) stages messages here without taking
@@ -353,9 +369,11 @@ private:
 		u8 nB1;
 		u8 nB2;
 	};
-	mu50spsc::TSpscQueue<TMidiStage, 1024> m_MidiStage;
+	mu50spsc::TSpscQueue<TMidiStage, 4096> m_MidiStage;
 	// Staged entries dropped because the queue was full (diagnostic;
-	// the queue holds 1023 entries, far above any MIDI burst).
+	// the queue holds 4095 entries, far above any MIDI burst).
+	// Reported as stage_drops in the window diag line; any
+	// non-zero value means a burst was truncated.
 	u32 m_nStageDrops = 0;
 
 

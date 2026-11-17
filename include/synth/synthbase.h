@@ -63,7 +63,12 @@ public:
 	// calls. Default is a no-op (synths without a prefillable
 	// ring); Nuked overrides it. Returns the ring fill after
 	// prefill (native frames), or 0 if not supported.
-	virtual size_t Prefill(size_t /* nTargetFill */) { return 0; }
+	// pfnShouldStop (optional) is polled during the prefill; when
+	// it returns true the prefill stops early so the caller can
+	// Render instead -- this keeps Prefill from holding the
+	// audio thread while the DAC queue drains. pStopContext is
+	// passed through to the callback.
+	virtual size_t Prefill(size_t /* nTargetFill */, bool (* /* pfnShouldStop */)(void*) = nullptr, void* /* pStopContext */ = nullptr) { return 0; }
 	virtual void ReportStatus() const = 0;
 	virtual void UpdateLCD(CLCD& LCD, unsigned int nTicks) = 0;
 	void SetUserInterface(CUserInterface* pUI) { m_pUI = pUI; }

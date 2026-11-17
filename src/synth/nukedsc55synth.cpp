@@ -984,12 +984,24 @@ void CNukedSC55Synth::DrainMidiStage()
 	}
 }
 
-size_t CNukedSC55Synth::Prefill(size_t nTargetFill)
+size_t CNukedSC55Synth::Prefill(size_t nTargetFill, bool (*pfnShouldStop)(void*), void* pStopContext)
 {
 	if (!m_pEmulator)
 		return 0;
 
 	m_Lock.Acquire();
+
+	// Drain staged MIDI before stepping: all stepping now
+	// happens here (not only in RenderFrames), so events must
+	// land in the emulator before the MCU runs ahead of the
+	// playback position. Without this, an event staged during a
+	// Prefill waits up to a whole DAC block (~5 ms) plus the
+	// ring cushion (~8 ms), landing 8-11 ms late in an MCU that
+	// is already ahead -- audible as a timing shift on dense
+	// passages. DrainMidiStage is the same drain RenderFrames
+	// runs; calling it here is safe because Prefill holds
+	// m_Lock, as RenderFrames does.
+	DrainMidiStage();
 
 	// Step the emulator until the sample ring holds at least
 	// nTargetFill native frames, or the step budget is exhausted.
@@ -998,8 +1010,15 @@ size_t CNukedSC55Synth::Prefill(size_t nTargetFill)
 	// but without producing output -- the caller (AudioTask) has
 	// no room in the DAC queue, so this idle time builds a
 	// cushion for the next Render instead of spinning on
-	// zero-frame Render calls.
-	const u64 nStepBudget = static_cast<u64>(nTargetFill + 2) * StepsPerFrameBudget;
+	// zero-frame Render calls. The budget is sized to the
+	// DEFICIT (frames still needed), not the full target: if the
+	// ring already holds most of the cushion, Prefill only
+	// budgets for the few frames actually missing. Budgeting the
+	// full target every call let a slow emulator block the audio
+	// task for ~65 ms (vs ~22 ms for a Render budget) while the
+	// DAC queue drained.
+	const size_t nDeficit = nTargetFill > m_nSampleRingFill ? nTargetFill - m_nSampleRingFill : 0;
+	const u64 nStepBudget = static_cast<u64>(nDeficit + 2) * StepsPerFrameBudget;
 	u64 nSteps = 0;
 
 	if (m_bSplitActive && m_pSplitState)
@@ -1014,6 +1033,11 @@ size_t CNukedSC55Synth::Prefill(size_t nTargetFill)
 			{
 				nRingCheckdown = 16;
 				if (m_nSampleRingFill >= nTargetFill)
+					break;
+				// Interruptible: if the DAC queue has room, stop
+				// prefill so AudioTask can Render instead of
+				// sitting here while the queue drains.
+				if (pfnShouldStop && pfnShouldStop(pStopContext))
 					break;
 			}
 			SplitFoldIrq0(S, MCU);
@@ -1035,10 +1059,17 @@ size_t CNukedSC55Synth::Prefill(size_t nTargetFill)
 	}
 	else
 	{
+		unsigned nStopCheckdown = 1;
 		while (m_nSampleRingFill < nTargetFill && nSteps < nStepBudget)
 		{
 			m_pEmulator->Step();
 			++nSteps;
+			if (--nStopCheckdown == 0)
+			{
+				nStopCheckdown = 16;
+				if (pfnShouldStop && pfnShouldStop(pStopContext))
+					break;
+			}
 		}
 	}
 
@@ -1052,12 +1083,18 @@ size_t CNukedSC55Synth::RenderFrames(float* pOutBuffer, size_t nFrames)
 	if (!m_pEmulator)
 	{
 		memset(pOutBuffer, 0, nFrames * 2 * sizeof(float));
+		// No emulator: output is silence, so the underrun tail
+		// boundary for a later call is zero.
+		m_fLastOutL = 0.0f;
+		m_fLastOutR = 0.0f;
 		return nFrames;
 	}
 
 	CDiagLog& DiagLog        = CDiagLog::Get();
 	const bool bDiag         = DiagLog.IsEnabled();
-	const u64 nStartUs       = bDiag ? CTimer::Get()->GetClockTicks() : 0;
+	// Start time is captured unconditionally: it drives the
+	// wall-clock Render deadline below, not only the diag.
+	const u64 nStartUs       = CTimer::Get()->GetClockTicks();
 	u64 nUnderrunFrames      = 0;
 
 	m_Lock.Acquire();
@@ -1087,6 +1124,14 @@ size_t CNukedSC55Synth::RenderFrames(float* pOutBuffer, size_t nFrames)
 	const size_t nNeed = static_cast<size_t>(m_dReadFrac + static_cast<double>(nFrames) * m_dResampleRatio) + 3;
 	u64 nSteps           = 0;
 	const u64 nStepBudget = static_cast<u64>(nFrames * m_dResampleRatio + 2.0) * StepsPerFrameBudget;
+	// Wall-clock Render deadline: the real-time duration of the
+	// requested frames. If stepping has not filled the ring by
+	// then, the synth is falling behind real time; stop stepping
+	// and let the resampler produce what it can (a counted,
+	// concealed underrun) instead of running long and letting
+	// the DAC queue drain to Circle-inserted nulls. Checked
+	// every 16 steps alongside the ring check.
+	const u64 nDeadlineUs = static_cast<u64>(nFrames) * 1000000ULL / m_nSampleRate;
 
 	if (m_bSplitActive && m_pSplitState)
 	{
@@ -1118,6 +1163,12 @@ size_t CNukedSC55Synth::RenderFrames(float* pOutBuffer, size_t nFrames)
 			{
 				nRingCheckdown = 16;
 				if (m_nSampleRingFill >= nNeed)
+					break;
+				// Wall-clock deadline: stop stepping if this
+				// Render has already consumed its real-time
+				// budget; the resampler below will produce what
+				// it can and conceal the shortfall.
+				if (CTimer::Get()->GetClockTicks() - nStartUs >= nDeadlineUs)
 					break;
 			}
 			// Fold a pending voice-end IRQ0 request into
@@ -1153,10 +1204,17 @@ size_t CNukedSC55Synth::RenderFrames(float* pOutBuffer, size_t nFrames)
 		// Single-threaded path (split off, or a non-MK1 romset):
 		// exactly the old stepping, now feeding the same ring and
 		// streaming resampler as the split path.
+		unsigned nDeadlineCheckdown = 1;
 		while (m_nSampleRingFill < nNeed && nSteps < nStepBudget)
 		{
 			m_pEmulator->Step();
 			++nSteps;
+			if (--nDeadlineCheckdown == 0)
+			{
+				nDeadlineCheckdown = 16;
+				if (CTimer::Get()->GetClockTicks() - nStartUs >= nDeadlineUs)
+					break;
+			}
 		}
 	}
 
@@ -1253,14 +1311,21 @@ size_t CNukedSC55Synth::RenderFrames(float* pOutBuffer, size_t nFrames)
 			bool bStarved = false;
 			while (m_dReadFrac >= 1.0)
 			{
-				m_CubicPrev = m_CubicA;
-				m_CubicA = m_CubicB;
-				m_CubicB = m_CubicNext;
-				if (!DequeueOne(m_CubicNext))
+				// Dequeue BEFORE shifting: if the ring is dry,
+				// the window and m_dReadFrac are untouched, so the
+				// retry re-attempts the same slide. Shifting first
+				// (as before) skipped one native sample and
+				// duplicated the stale Next on the retry.
+				TSplitSample Next;
+				if (!DequeueOne(Next))
 				{
 					bStarved = true;
 					break;
 				}
+				m_CubicPrev = m_CubicA;
+				m_CubicA = m_CubicB;
+				m_CubicB = m_CubicNext;
+				m_CubicNext = Next;
 				m_dReadFrac -= 1.0;
 			}
 			if (bStarved)
@@ -1334,11 +1399,11 @@ size_t CNukedSC55Synth::RenderFrames(float* pOutBuffer, size_t nFrames)
 		// Underrun (emulator too slow, or still booting): conceal
 		// instead of stepping to hard zero. Fade out over the last
 		// ConcealFadeFrames produced frames so the signal ramps to
-		// silence smoothly, then zero the rest. The resampler state
-		// (read frac, window, FIR history, cubic window) is KEPT --
-		// the next call resumes from where it left off instead of
-		// re-priming (which stepped on the way back in). The next
-		// call fades back in (above).
+		// silence smoothly. The resampler state (read frac, window,
+		// FIR history, cubic window) is KEPT -- the next call
+		// resumes from where it left off instead of re-priming
+		// (which stepped on the way back in). The next call fades
+		// back in (above).
 		const size_t nFadeOut = nDone < ConcealFadeFrames ? nDone : ConcealFadeFrames;
 		for (size_t j = 0; j < nFadeOut; ++j)
 		{
@@ -1347,7 +1412,27 @@ size_t CNukedSC55Synth::RenderFrames(float* pOutBuffer, size_t nFrames)
 			pOutBuffer[nIdx * 2]     *= fGain;
 			pOutBuffer[nIdx * 2 + 1] *= fGain;
 		}
-		for (size_t j = nDone; j < nFrames; ++j)
+		// Decay the gap forward from the boundary value instead
+		// of writing hard zeros. The boundary is the faded last
+		// produced sample (nDone > 0), or the stored last sample
+		// of the previous call (nDone == 0 -- nothing was produced
+		// this call, so the old fade-out had nothing to fade and
+		// the signal would otherwise step straight to zero). The
+		// previous block is already in the DAC queue and cannot be
+		// faded, so the tail must start from where the signal
+		// actually was. Decay over min(gap, ConcealFadeFrames),
+		// then zeros.
+		const float fBoundaryL = nDone > 0 ? pOutBuffer[(nDone - 1) * 2] : m_fLastOutL;
+		const float fBoundaryR = nDone > 0 ? pOutBuffer[(nDone - 1) * 2 + 1] : m_fLastOutR;
+		const size_t nGap = nFrames - nDone;
+		const size_t nTail = nGap < ConcealFadeFrames ? nGap : ConcealFadeFrames;
+		for (size_t j = 0; j < nTail; ++j)
+		{
+			const float fGain = 1.0f - static_cast<float>(j + 1) / static_cast<float>(nTail + 1);
+			pOutBuffer[(nDone + j) * 2]     = fBoundaryL * fGain;
+			pOutBuffer[(nDone + j) * 2 + 1] = fBoundaryR * fGain;
+		}
+		for (size_t j = nDone + nTail; j < nFrames; ++j)
 		{
 			pOutBuffer[j * 2]     = 0.0f;
 			pOutBuffer[j * 2 + 1] = 0.0f;
@@ -1377,6 +1462,16 @@ size_t CNukedSC55Synth::RenderFrames(float* pOutBuffer, size_t nFrames)
 			++m_Stats.nMisses;
 		m_Stats.nUnderrunFrames += nUnderrunFrames;
 		m_StatsLock.Release();
+	}
+
+	// Remember the last output sample for the next call's
+	// underrun tail (see the gap decay above). This is the
+	// value the DAC already holds, so a following starved call
+	// can decay forward from it instead of stepping to zero.
+	if (nFrames > 0)
+	{
+		m_fLastOutL = pOutBuffer[(nFrames - 1) * 2];
+		m_fLastOutR = pOutBuffer[(nFrames - 1) * 2 + 1];
 	}
 
 	m_Lock.Release();
@@ -1496,7 +1591,7 @@ void CNukedSC55Synth::UpdateLCD(CLCD& LCD, unsigned int nTicks)
 				// when invalid (0 = no reading).
 				if (nTempC != 0)
 				{
-					DiagLog.LogLine("window synth=nuked pct=%llu avg_us=%llu max_us=%llu miss_pct=%llu underrun_frames=%llu temp_c=%u core2_pct=%llu core3_pct=%llu fifo_full_waits=%llu fifo_drops=%llu ring_drops=%llu max_lag=%llu",
+					DiagLog.LogLine("window synth=nuked pct=%llu avg_us=%llu max_us=%llu miss_pct=%llu underrun_frames=%llu temp_c=%u core2_pct=%llu core3_pct=%llu fifo_full_waits=%llu fifo_drops=%llu ring_drops=%llu max_lag=%llu stage_drops=%llu",
 					                static_cast<unsigned long long>(nPct),
 					                static_cast<unsigned long long>(nAvgUs),
 					                static_cast<unsigned long long>(Stats.nMaxUs),
@@ -1508,11 +1603,12 @@ void CNukedSC55Synth::UpdateLCD(CLCD& LCD, unsigned int nTicks)
 					                static_cast<unsigned long long>(nFifoFullWaits),
 					                static_cast<unsigned long long>(nFifoDrops),
 					                static_cast<unsigned long long>(m_nSampleRingDrops),
-					                static_cast<unsigned long long>(S.max_pcm_lag));
+					                static_cast<unsigned long long>(S.max_pcm_lag),
+				                static_cast<unsigned long long>(__atomic_load_n(&m_nStageDrops, __ATOMIC_RELAXED)));
 				}
 				else
 				{
-					DiagLog.LogLine("window synth=nuked pct=%llu avg_us=%llu max_us=%llu miss_pct=%llu underrun_frames=%llu core2_pct=%llu core3_pct=%llu fifo_full_waits=%llu fifo_drops=%llu ring_drops=%llu max_lag=%llu",
+					DiagLog.LogLine("window synth=nuked pct=%llu avg_us=%llu max_us=%llu miss_pct=%llu underrun_frames=%llu core2_pct=%llu core3_pct=%llu fifo_full_waits=%llu fifo_drops=%llu ring_drops=%llu max_lag=%llu stage_drops=%llu",
 					                static_cast<unsigned long long>(nPct),
 					                static_cast<unsigned long long>(nAvgUs),
 					                static_cast<unsigned long long>(Stats.nMaxUs),
@@ -1523,7 +1619,8 @@ void CNukedSC55Synth::UpdateLCD(CLCD& LCD, unsigned int nTicks)
 					                static_cast<unsigned long long>(nFifoFullWaits),
 					                static_cast<unsigned long long>(nFifoDrops),
 					                static_cast<unsigned long long>(m_nSampleRingDrops),
-					                static_cast<unsigned long long>(S.max_pcm_lag));
+					                static_cast<unsigned long long>(S.max_pcm_lag),
+				                static_cast<unsigned long long>(__atomic_load_n(&m_nStageDrops, __ATOMIC_RELAXED)));
 				}
 				m_nLastSplitFifoFullWaits = S.fifo_full_waits;
 				m_nLastSplitFifoDrops = S.fifo_drops;
@@ -1545,7 +1642,7 @@ void CNukedSC55Synth::UpdateLCD(CLCD& LCD, unsigned int nTicks)
 
 								if (nTempC != 0)
 				{
-					DiagLog.LogLine("window synth=nuked pct=%llu avg_us=%llu max_us=%llu miss_pct=%llu underrun_frames=%llu temp_c=%u emu_pct=%llu mcu_pct=%llu pcm_pct=%llu insn_per_sec=%llu",
+					DiagLog.LogLine("window synth=nuked pct=%llu avg_us=%llu max_us=%llu miss_pct=%llu underrun_frames=%llu temp_c=%u emu_pct=%llu mcu_pct=%llu pcm_pct=%llu insn_per_sec=%llu stage_drops=%llu",
 					                static_cast<unsigned long long>(nPct),
 					                static_cast<unsigned long long>(nAvgUs),
 					                static_cast<unsigned long long>(Stats.nMaxUs),
@@ -1555,11 +1652,12 @@ void CNukedSC55Synth::UpdateLCD(CLCD& LCD, unsigned int nTicks)
 					                static_cast<unsigned long long>(nWindowUs > 0 ? nTotalDelta * 100 / nWindowUs : 0),
 					                static_cast<unsigned long long>(nTotalDelta > 0 ? (nTotalDelta - nPCMDelta) * 100 / nTotalDelta : 0),
 					                static_cast<unsigned long long>(nTotalDelta > 0 ? nPCMDelta * 100 / nTotalDelta : 0),
-					                static_cast<unsigned long long>(nWindowUs > 0 ? nInsnDelta * 1000000ULL / nWindowUs : 0));
+					                static_cast<unsigned long long>(nWindowUs > 0 ? nInsnDelta * 1000000ULL / nWindowUs : 0),
+				                static_cast<unsigned long long>(__atomic_load_n(&m_nStageDrops, __ATOMIC_RELAXED)));
 				}
 				else
 				{
-					DiagLog.LogLine("window synth=nuked pct=%llu avg_us=%llu max_us=%llu miss_pct=%llu underrun_frames=%llu emu_pct=%llu mcu_pct=%llu pcm_pct=%llu insn_per_sec=%llu",
+					DiagLog.LogLine("window synth=nuked pct=%llu avg_us=%llu max_us=%llu miss_pct=%llu underrun_frames=%llu emu_pct=%llu mcu_pct=%llu pcm_pct=%llu insn_per_sec=%llu stage_drops=%llu",
 					                static_cast<unsigned long long>(nPct),
 					                static_cast<unsigned long long>(nAvgUs),
 					                static_cast<unsigned long long>(Stats.nMaxUs),
@@ -1568,7 +1666,8 @@ void CNukedSC55Synth::UpdateLCD(CLCD& LCD, unsigned int nTicks)
 					                static_cast<unsigned long long>(nWindowUs > 0 ? nTotalDelta * 100 / nWindowUs : 0),
 					                static_cast<unsigned long long>(nTotalDelta > 0 ? (nTotalDelta - nPCMDelta) * 100 / nTotalDelta : 0),
 					                static_cast<unsigned long long>(nTotalDelta > 0 ? nPCMDelta * 100 / nTotalDelta : 0),
-					                static_cast<unsigned long long>(nWindowUs > 0 ? nInsnDelta * 1000000ULL / nWindowUs : 0));
+					                static_cast<unsigned long long>(nWindowUs > 0 ? nInsnDelta * 1000000ULL / nWindowUs : 0),
+				                static_cast<unsigned long long>(__atomic_load_n(&m_nStageDrops, __ATOMIC_RELAXED)));
 				}
 			}
 		}
