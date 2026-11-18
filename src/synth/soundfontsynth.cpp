@@ -20,8 +20,11 @@
 // mt32-pi. If not, see <http://www.gnu.org/licenses/>.
 //
 
+#include <cstring>
+
 #include <fatfs/ff.h>
 #include <circle/logger.h>
+#include <circle/sched/scheduler.h>
 #include <circle/timer.h>
 
 #include "config.h"
@@ -136,7 +139,11 @@ CSoundFontSynth::CSoundFontSynth(unsigned nSampleRate)
 	  m_nInitialGain(0.2f),
 
 	  m_nPercussionMask(1 << 9),
-	  m_nCurrentSoundFontIndex(0)
+	  m_nCurrentSoundFontIndex(0),
+
+	  m_bLoaded(false),
+	  m_bLoading(false),
+	  m_bLoadPending(false)
 {
 }
 
@@ -201,11 +208,169 @@ bool CSoundFontSynth::Initialize()
 	// existing reverb settings and per-SoundFont effect profiles sound the same
 	fluid_settings_setstr(m_pSettings, "synth.reverb.engine", "fdn");
 
-	return Reinitialize(pSoundFontPath, &FXProfile);
+	// Background load at boot: do NOT parse the .sf2 here. The
+	// synth instance is created and the .sf2 loaded by
+	// LoadSoundFont() on Core 1 after boot init, so the ~3 s parse
+	// does not delay the other engines or the main loop.
+	// m_nCurrentSoundFontIndex above already records which
+	// SoundFont that load will use; copy the path and FX profile
+	// now, because a SoundFont rescan can rebuild the manager's
+	// list while the load is still pending.
+	m_PendingSoundFontPath = pSoundFontPath;
+	m_PendingFXProfile = FXProfile;
+	m_bLoadPending = true;
+	m_bLoading = false;
+	m_bLoaded = false;
+
+	return true;
+}
+
+bool CSoundFontSynth::LoadSoundFont()
+{
+	m_Lock.Acquire();
+	if (m_bLoaded)
+	{
+		m_Lock.Release();
+		return true;
+	}
+	if (m_bLoading || !m_bLoadPending)
+	{
+		// A load is already running elsewhere, or there is
+		// nothing to load; the caller should WaitForLoad()
+		// instead of starting a second load.
+		m_Lock.Release();
+		return false;
+	}
+
+	// Claim the pending load
+	const CString SoundFontPath = m_PendingSoundFontPath;
+	const TFXProfile FXProfile = m_PendingFXProfile;
+	m_bLoadPending = false;
+	m_Lock.Release();
+
+	return ReloadSoundFont(static_cast<const char*>(SoundFontPath), &FXProfile);
+}
+
+bool CSoundFontSynth::ReloadSoundFont(const char* pSoundFontPath, const TFXProfile* pFXProfile)
+{
+	// Mark the load in progress so no other thread calls into
+	// FluidSynth while the .sf2 is parsed (see header). The lock
+	// is NOT held across Reinitialize(): it re-acquires m_Lock
+	// itself, and the parse runs outside the lock there.
+	m_Lock.Acquire();
+	m_bLoading = true;
+	m_Lock.Release();
+
+	const bool bResult = Reinitialize(pSoundFontPath, pFXProfile);
+
+	m_Lock.Acquire();
+	m_bLoading = false;
+	m_bLoaded = bResult;
+	m_Lock.Release();
+
+	return bResult;
+}
+
+bool CSoundFontSynth::WaitForLoad(unsigned nTimeoutMillis)
+{
+	// Core 0 only: uses the (core-0) scheduler to yield while
+	// the Core 1 load task runs. GetClockTicks() is
+	// microseconds; the unsigned subtraction stays correct across
+	// its wrap for any timeout far below 2^31 us.
+	const unsigned nTimeoutTicks = nTimeoutMillis * 1000;
+	const unsigned nStartTicks = CTimer::GetClockTicks();
+	CScheduler* const pScheduler = CScheduler::Get();
+
+	while (true)
+	{
+		m_Lock.Acquire();
+		const bool bLoading = m_bLoading;
+		const bool bPending = m_bLoadPending;
+		m_Lock.Release();
+
+		// Wait for the load to start (pending) as well as finish:
+		// Core 1 may not have picked it up yet. The return value
+		// reports only that no load is running anymore, NOT
+		// whether it succeeded: after a failed load, a later
+		// font switch must still proceed (SwitchSoundFont), and
+		// callers that need a loaded synth check IsLoaded().
+		if (!bLoading && !bPending)
+			return true;
+
+		if (CTimer::GetClockTicks() - nStartTicks >= nTimeoutTicks)
+		{
+			LOGWARN("Timed out waiting for SoundFont load");
+			return false;
+		}
+
+		pScheduler->Yield();
+	}
+}
+
+bool CSoundFontSynth::IsLoaded()
+{
+	m_Lock.Acquire();
+	const bool bLoaded = IsLoadedLocked();
+	m_Lock.Release();
+	return bLoaded;
+}
+
+bool CSoundFontSynth::RetryLoad()
+{
+	// Re-resolve the font from the freshly scanned list and
+	// re-arm the pending load under one lock hold, so the Core 1
+	// boot load (which may still be pending) cannot start
+	// concurrently: re-arming supersedes it, and WaitForLoad()
+	// in SwitchSoundFont sees the pending load and waits. The
+	// manager takes no lock and is only ever rebuilt on Core 0,
+	// so resolving it under m_Lock is deadlock-free.
+	m_Lock.Acquire();
+	if (m_bLoaded || m_bLoading)
+	{
+		m_Lock.Release();
+		return true; // already loaded, or a load is running
+	}
+
+	const char* pSoundFontPath = m_SoundFontManager.GetSoundFontPath(m_nCurrentSoundFontIndex);
+	if (!pSoundFontPath)
+	{
+		pSoundFontPath = m_SoundFontManager.GetFirstValidSoundFontPath();
+		m_nCurrentSoundFontIndex = 0;
+	}
+	if (!pSoundFontPath)
+	{
+		m_Lock.Release();
+		return false; // no font available to load
+	}
+
+	m_PendingSoundFontPath = pSoundFontPath;
+	m_PendingFXProfile = m_SoundFontManager.GetSoundFontFXProfile(m_nCurrentSoundFontIndex);
+	m_bLoadPending = true;
+	m_Lock.Release();
+
+	LoadSoundFont();
+
+	// LoadSoundFont() returns false when another core claimed
+	// the re-armed pending load first -- the load is then
+	// running there, which is not a failure. Report the settled
+	// state instead of its return value.
+	m_Lock.Acquire();
+	const bool bSettled = m_bLoaded || m_bLoading || m_bLoadPending;
+	m_Lock.Release();
+	return bSettled;
 }
 
 void CSoundFontSynth::HandleMIDIShortMessage(u32 nMessage)
 {
+	// Not loaded yet (background load still running): nothing
+	// can sound, so drop the message. The synth is loaded
+	// before it can become current (see SwitchSynth).
+	m_Lock.Acquire();
+	const bool bLoaded = IsLoadedLocked();
+	m_Lock.Release();
+	if (!bLoaded)
+		return;
+
 	const u8 nStatus  = nMessage & 0xFF;
 	const u8 nChannel = nMessage & 0x0F;
 	const u8 nData1   = (nMessage >> 8) & 0xFF;
@@ -269,6 +434,14 @@ void CSoundFontSynth::HandleMIDIShortMessage(u32 nMessage)
 
 void CSoundFontSynth::HandleMIDISysExMessage(const u8* pData, size_t nSize)
 {
+	// Not loaded yet (background load still running): drop the
+	// message (see HandleMIDIShortMessage).
+	m_Lock.Acquire();
+	const bool bLoaded = IsLoadedLocked();
+	m_Lock.Release();
+	if (!bLoaded)
+		return;
+
 	// Return early if it wasn't a GM Mode On/Off message and was consumed as a text/display dots message
 	if (!ParseGMSysEx(pData, nSize) && (ParseRolandSysEx(pData, nSize) || ParseYamahaSysEx(pData, nSize)))
 		return;
@@ -282,7 +455,9 @@ void CSoundFontSynth::HandleMIDISysExMessage(const u8* pData, size_t nSize)
 bool CSoundFontSynth::IsActive()
 {
 	m_Lock.Acquire();
-	int nVoices = fluid_synth_get_active_voice_count(m_pSynth);
+	// Not loaded yet (background load still running): no voices
+	// can be sounding.
+	const int nVoices = IsLoadedLocked() ? fluid_synth_get_active_voice_count(m_pSynth) : 0;
 	m_Lock.Release();
 
 	return nVoices > 0;
@@ -291,7 +466,8 @@ bool CSoundFontSynth::IsActive()
 void CSoundFontSynth::AllSoundOff()
 {
 	m_Lock.Acquire();
-	fluid_synth_all_sounds_off(m_pSynth, -1);
+	if (IsLoadedLocked())
+		fluid_synth_all_sounds_off(m_pSynth, -1);
 	m_Lock.Release();
 
 	// Reset MIDI monitor
@@ -301,14 +477,26 @@ void CSoundFontSynth::AllSoundOff()
 void CSoundFontSynth::SetMasterVolume(u8 nVolume)
 {
 	m_nVolume = nVolume;
+	// Not loaded yet (background load still running): just store
+	// the volume; it is applied in Reinitialize when the synth
+	// is created.
 	m_Lock.Acquire();
-	fluid_synth_set_gain(m_pSynth, m_nVolume / 100.0f * m_nInitialGain);
+	if (IsLoadedLocked())
+		fluid_synth_set_gain(m_pSynth, m_nVolume / 100.0f * m_nInitialGain);
 	m_Lock.Release();
 }
 
 size_t CSoundFontSynth::Render(float* pOutBuffer, size_t nFrames)
 {
 	m_Lock.Acquire();
+	if (!IsLoadedLocked())
+	{
+		// Not loaded yet (background load still running):
+		// output silence.
+		memset(pOutBuffer, 0, nFrames * 2 * sizeof(float));
+		m_Lock.Release();
+		return nFrames;
+	}
 	assert(fluid_synth_write_float(m_pSynth, nFrames, pOutBuffer, 0, 2, pOutBuffer, 1, 2) == FLUID_OK);
 	m_Lock.Release();
 	return nFrames;
@@ -317,6 +505,14 @@ size_t CSoundFontSynth::Render(float* pOutBuffer, size_t nFrames)
 size_t CSoundFontSynth::Render(s16* pOutBuffer, size_t nFrames)
 {
 	m_Lock.Acquire();
+	if (!IsLoadedLocked())
+	{
+		// Not loaded yet (background load still running):
+		// output silence.
+		memset(pOutBuffer, 0, nFrames * 2 * sizeof(s16));
+		m_Lock.Release();
+		return nFrames;
+	}
 	assert(fluid_synth_write_s16(m_pSynth, nFrames, pOutBuffer, 0, 2, pOutBuffer, 1, 2) == FLUID_OK);
 	m_Lock.Release();
 	return nFrames;
@@ -338,6 +534,18 @@ void CSoundFontSynth::UpdateLCD(CLCD& LCD, unsigned int nTicks)
 
 bool CSoundFontSynth::SwitchSoundFont(size_t nIndex)
 {
+	// If a background load (or another font switch) is still
+	// parsing a .sf2, wait for it: Reinitialize below deletes
+	// and recreates the synth, which must not run concurrently
+	// with a load in progress (FluidSynth's API is not
+	// thread-safe).
+	if (!WaitForLoad())
+	{
+		if (m_pUI)
+			m_pUI->ShowSystemMessage("SF load failed!");
+		return false;
+	}
+
 	// Is this SoundFont already active?
 	if (m_nCurrentSoundFontIndex == nIndex)
 	{
@@ -360,8 +568,11 @@ bool CSoundFontSynth::SwitchSoundFont(size_t nIndex)
 
 	TFXProfile FXProfile = m_SoundFontManager.GetSoundFontFXProfile(nIndex);
 
-	// We can't use fluid_synth_sfunload() as we don't support the lazy SoundFont unload timer, so trash the entire synth and create a new one
-	if (!Reinitialize(pSoundFontPath, &FXProfile))
+	// We can't use fluid_synth_sfunload() as we don't support the lazy SoundFont unload timer, so trash the entire synth and create a new one.
+	// ReloadSoundFont marks the load in progress (see header):
+	// the audio thread renders silence instead of calling into
+	// FluidSynth while the new .sf2 is parsed.
+	if (!ReloadSoundFont(pSoundFontPath, &FXProfile))
 	{
 		if (m_pUI)
 			m_pUI->ShowSystemMessage("SF switch failed!");

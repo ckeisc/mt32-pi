@@ -53,8 +53,55 @@ public:
 	size_t GetSoundFontIndex() const { return m_nCurrentSoundFontIndex; }
 	CSoundFontManager& GetSoundFontManager() { return m_SoundFontManager; }
 
+	// Background load at boot: Initialize() only resolves the
+	// SoundFont and creates the FluidSynth settings; the ~3 s
+	// .sf2 parse is done by LoadSoundFont() on Core 1 after boot
+	// init, so it does not delay the other engines or the main
+	// loop. Until the load finishes the synth renders silence
+	// and drops MIDI; selecting it waits for the load (see
+	// WaitForLoad). LoadSoundFont() is also used for a runtime
+	// re-init (USB rescan), where it loads synchronously.
+	// Returns true once the synth is loaded.
+	bool LoadSoundFont();
+
+	// Wait (bounded) for a load in progress to finish. Returns
+	// true once no load is pending or in progress, false only on
+	// timeout. This deliberately does NOT report whether the load
+	// succeeded: a wait must gate on "a load is running", never
+	// on "a previous load succeeded" -- after a failed load, a
+	// later font switch must still be able to proceed (see
+	// SwitchSoundFont). Callers that must not use an unloaded
+	// synth check IsLoaded() after waiting. Core 0 only: yields
+	// to the (core-0) scheduler while waiting. Returns
+	// immediately if no load is pending or in progress.
+	bool WaitForLoad(unsigned nTimeoutMillis = 30000);
+
+	// True once the .sf2 is parsed and no load is in progress.
+	// Takes m_Lock; safe from any core.
+	bool IsLoaded();
+
+	// Retry loading the current SoundFont from the (freshly
+	// scanned) manager list, synchronously. Used by the USB
+	// rescan after a failed boot load: the synth object exists
+	// but nothing is loaded, and LoadSoundFont() has no pending
+	// load left to run. Returns true if the synth is loaded
+	// afterwards, or if a load is already running or pending
+	// (the retry is then deferred to that load); false only if
+	// a load was attempted and failed, or no font is available.
+	bool RetryLoad();
+
 private:
 	bool Reinitialize(const char* pSoundFontPath, const TFXProfile* pFXProfile);
+
+	// Sets m_bLoading around Reinitialize() and records the
+	// result in m_bLoaded. Used by LoadSoundFont() and
+	// SwitchSoundFont().
+	bool ReloadSoundFont(const char* pSoundFontPath, const TFXProfile* pFXProfile);
+
+	// True once the .sf2 is parsed and no load is in progress.
+	// Callers hold m_Lock.
+	bool IsLoadedLocked() const { return m_bLoaded && !m_bLoading; }
+
 	void ResetMIDIMonitor();
 #ifndef NDEBUG
 	void DumpFXSettings() const;
@@ -73,6 +120,23 @@ private:
 	size_t m_nCurrentSoundFontIndex;
 
 	CSoundFontManager m_SoundFontManager;
+
+	// Background-load state. m_bLoadPending is set by
+	// Initialize() when the .sf2 load is deferred; LoadSoundFont()
+	// consumes it. m_bLoading is set around every Reinitialize()
+	// (background load and font switch) so no other thread calls
+	// into FluidSynth while a .sf2 is parsed -- the API is not
+	// thread-safe (synth.threadsafe-api is false). All three are
+	// only read or written under m_Lock, which also orders them
+	// across cores.
+	bool m_bLoaded;
+	bool m_bLoading;
+	bool m_bLoadPending;
+
+	// Resolved at Initialize() time: the manager's list can be
+	// rebuilt by a rescan, so the path is copied, not borrowed.
+	CString m_PendingSoundFontPath;
+	TFXProfile m_PendingFXProfile;
 
 	static void FluidSynthLogCallback(int nLevel, const char* pMessage, void* pUser);
 };

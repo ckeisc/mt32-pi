@@ -45,6 +45,7 @@
 // memory, string, tuple, utility, vector), no threads, no mutex, and it
 // reports errors via return values rather than exceptions.
 #include <libmu50/synth.hpp>
+#include <libmu50/keyon_status.hpp>
 
 LOGMODULE("mu50synth");
 
@@ -73,8 +74,54 @@ bool ROMPathComparator(const CString& LHS, const CString& RHS)
 	return strcasecmp(static_cast<const char*>(LHS), static_cast<const char*>(RHS)) < 0;
 }
 
+// Native-frame to float scale (18-bit DAC render path). The SWP00
+// DAC is 18-bit (full scale 0x20000 = 131072), but the chip leaves
+// 12 dB headroom above one full-scale voice, so real material sits
+// far below full scale: Doom E1M1 peaks at 0.31 and Silpheed at 0.37
+// of 18-bit full scale. Before the HEAD overhaul the wrapper scaled
+// by kMHeadroom = 0.639 and Silpheed peaked at 0.95 of full scale,
+// so the post-overhaul level is ~8 dB too quiet
+// (20*log10(0.374/0.95) = -8.1 dB). kNativeTrim = 2.5 restores that
+// tuned level (Silpheed 0.374 -> 0.94). Material denser than
+// Silpheed will exceed 1.0, and the shared lookahead limiter in
+// AudioTask holds it without clipping. '[mu50] gain' multiplies
+// on top of this trim.
+constexpr float kNativeFullScale = 131072.0f; // 18-bit DAC full scale
+constexpr float kNativeTrim      = 2.5f;
+constexpr float kNativeToFloat   = kNativeTrim / kNativeFullScale;
+
 // H8 CPU clock (10 MHz) per libmu50 native audio frame (44.1 kHz).
 constexpr double H8CyclesPerNativeFrame = 10000000.0 / 44100.0;
+
+// Map a cycle-stamped W event to the native frame within its block
+// (Finding 2): the firmware issued the write at nCycle, inside the
+// block's [nStartCycle, nStartCycle + nCycles) span, so it takes
+// effect that many frames into the block instead of at frame 0.
+// 0 when the block advanced no cycles (halted / carry-only) or the
+// event predates the block; nFrames when at/past the block end
+// (the caller drains those after the loop). d * nFrames cannot
+// overflow: d < nCycles (~54k max) and nFrames <= 1024.
+size_t EventFrameOffset(u64 nCycle, u64 nStartCycle, u64 nCycles, size_t nFrames)
+{
+	if (nCycles == 0 || nCycle <= nStartCycle)
+		return 0;
+	const u64 nDelta = nCycle - nStartCycle;
+	if (nDelta >= nCycles)
+		return nFrames;
+	return static_cast<size_t>(nDelta * nFrames / nCycles);
+}
+
+// Wake the SWP core from wfe (ARM only). On the host the worker
+// thread never sleeps in wfe, so this is a no-op there. The bare
+// `sev` asm does not assemble on x86, so it must be guarded --
+// without this the file cannot build in the host harnesses
+// (mu50spsc.h documents the same ARM/host split).
+inline void WakeSwpCore()
+{
+#if defined(__aarch64__)
+	__asm__ volatile ("sev" ::: "memory");
+#endif
+}
 
 // H8 hook targets: the hook address is the SWP00 window offset
 // (0x0000-0x07ff), which is exactly libmu50's register address.
@@ -146,10 +193,14 @@ CMU50Synth::CMU50Synth(unsigned nSampleRate, float nGain, TMU50Resampler Resampl
 	  m_SwpShadow{},
 	  m_StateSnapVoice{},
 	  m_StateSnapCounter(0),
+	  m_nStateSnapBlockSeq(0),
 	  m_nStateSeq(0),
 	  m_LastGoodVoice{},
 	  m_LastGoodCounter(0),
+	  m_nLastGoodBlockSeq(0),
 	  m_bLastGoodValid(false),
+	  m_VoiceOverlay{},
+	  m_bFilter0277(false),
 	  m_NativeRing{},
 	  m_PublishedBlocks{},
 	  m_MidiStage{},
@@ -160,6 +211,8 @@ CMU50Synth::CMU50Synth(unsigned nSampleRate, float nGain, TMU50Resampler Resampl
 	  m_nRenderedEnqueued(0),
 	  m_nConsumed(0),
 	  m_nPublishedCycles(0),
+	  m_nLastAdvanceStartCycle(0),
+	  m_nLastAdvanceCycles(0),
 	  m_nUnderrunFrames(0),
 	  m_nSwpRenderUs(0),
 	  m_nRingHighWater(0),
@@ -176,6 +229,33 @@ CMU50Synth::CMU50Synth(unsigned nSampleRate, float nGain, TMU50Resampler Resampl
 	  m_Pending{},
 	  m_nPendingCount(0)
 {
+	// Finding 3: seed the per-channel shadow with the EFFECTIVE
+	// reset values for the registers the key-on overlay reads:
+	// phase hi 0x80 (reg 0x08), LPF info 0x27ff (regs 0x20/0x21),
+	// glo 0xff (reg 0x2e) and pan 0xff (reg 0x2f). Without this a
+	// voice the firmware keys on without first writing a register
+	// would get an overlay computed from zeros instead of the
+	// reset values (e.g. filter 0xff instead of 0xc0). NOTE: for
+	// 0x08/0x20/0x21 these match Synth::Impl::reset's channel_regs
+	// seeds, but for 0x2e/0x2f they do NOT -- channel_regs resets
+	// glo/pan to 0x00, while the MixerBlock's own m_glo/m_pan
+	// reset to 0xff, which is the value the overlay must use
+	// (a live core reports status 0xff for a never-written
+	// glo/pan). The split-mode read path therefore returns 0x00
+	// for a never-written 0x2e/0x2f via the written-mask
+	// (Finding 7) instead of the shadow's 0xff. Address decoding
+	// mirrors Synth::write_register's rchan window:
+	// addr = ((reg & 0x3e) << 5) | (reg & 1) | (voice << 1).
+	// All other overlay registers reset to 0, matching the shadow.
+	for (unsigned nChan = 0; nChan < 32; ++nChan)
+	{
+		const unsigned nBase = nChan << 1;
+		m_SwpShadow[0x100 | nBase] = 0x80; // reg 0x08 phase hi
+		m_SwpShadow[0x400 | nBase] = 0x27; // reg 0x20 LPF info hi
+		m_SwpShadow[0x401 | nBase] = 0xff; // reg 0x21 LPF info lo
+		m_SwpShadow[0x5c0 | nBase] = 0xff; // reg 0x2e glo
+		m_SwpShadow[0x5c1 | nBase] = 0xff; // reg 0x2f pan
+	}
 }
 
 CMU50Synth::~CMU50Synth()
@@ -437,8 +517,193 @@ void CMU50Synth::OnH8SwpWrite(u64 nCycle, u16 nAddr, u8 nData)
 	if (m_pSynth)
 	{
 		const TWEvent Event{ nCycle, nAddr, nData };
+		// Pre-write shadow value (for the overlay target
+		// comparisons below: the shadow is updated next, so the
+		// old value must be captured here).
+		u8 nOldShadow = 0;
 		if (nAddr < sizeof(m_SwpShadow))
+		{
+			nOldShadow = m_SwpShadow[nAddr];
 			m_SwpShadow[nAddr] = nData;
+		}
+		// Single-core only: apply the state-address write (reg
+		// 0x01) to the core immediately, as well as queueing it.
+		// The firmware writes the state address and then reads
+		// 0x01 to get that voice's status, so a 0x01 read must
+		// observe it -- but draining the whole FIFO on a read
+		// (see OnH8SwpRead) applies every pending voice write
+		// early and collapses damp/key-on timing to frame 0. The
+		// state address has no audio effect, so applying it
+		// eagerly is free; the segment loop re-applies the same
+		// value later (no read can observe the transient, reads
+		// only happen during AdvanceH8). Split mode must NOT do
+		// this: the core is SWP-thread-owned there.
+		if (!m_bSplitMode && nAddr == 0x01)
+			m_pSynth->write_register(nAddr, nData);
+		// Finding 3: track key-ons / releases for the 0x01
+		// overlay (audio thread only, BOTH modes). The overlay
+		// gives a 0x01 read the post-key-on voice state while
+		// the key-on write is still queued for the segment
+		// loop: split mode compares the write sequence against
+		// the snapshot sequence, single-core mode checks
+		// whether the key-on write is still in the FIFO (see
+		// OnH8SwpRead). nWriteSeq is the publish sequence of
+		// the block this write will drain into: the block
+		// published at the end of the AdvanceH8 running now
+		// (split mode only; single-core never publishes, so
+		// the sequence is unused there).
+		{
+			const u64 nWriteSeq = m_nNextPublishSeq + 1;
+			if (nAddr >= 0x08 && nAddr <= 0x0b)
+			{
+				// Key-on trigger (Synth::write_register):
+				// address 0x0b = voices 0-7, 0x0a = 8-15,
+				// 0x09 = 16-23, 0x08 = 24-31; each set bit
+				// keys on one voice. NOTE: this is NOT
+				// registers 0x20-0x2b -- those are per-voice
+				// filter/envelope parameters, read below
+				// from the shadow.
+				const unsigned nGroup = 0x0b - nAddr;
+				for (unsigned nBit = 0; nBit < 8; ++nBit)
+				{
+					if (!(nData & (1u << nBit)))
+						continue;
+					const unsigned nChan = nGroup * 8 + nBit;
+					auto ChanReg = [&](u8 nReg) -> u8 {
+						// rchan window decode, mirroring
+						// Synth::write_register.
+						const u16 nShadowAddr = static_cast<u16>(((nReg & 0x3e) << 5) | (nReg & 1) | (nChan << 1));
+						return m_SwpShadow[nShadowAddr];
+					};
+					libmu50::KeyOnRegs Regs;
+					Regs.attack_speed = ChanReg(0x26);
+					Regs.attack_level = ChanReg(0x27);
+					Regs.decay_speed = ChanReg(0x28);
+					Regs.lpf_info = static_cast<u16>(ChanReg(0x21) | (ChanReg(0x20) << 8));
+					Regs.lpf_speed = ChanReg(0x22);
+					Regs.glo = ChanReg(0x2e);
+					Regs.pan = ChanReg(0x2f);
+					Regs.filter_0277 = m_bFilter0277;
+					TVoiceOverlay& Overlay = m_VoiceOverlay[nChan];
+					libmu50::KeyOnStatus(Regs, Overlay.Status);
+					Overlay.nKeyOnSeq = nWriteSeq;
+					Overlay.nReleaseSeq = 0;
+					Overlay.bReleased = false;
+				}
+			}
+			else if (nAddr < 0x800)
+			{
+				// Per-channel window (rchan decode).
+				const u8 nReg = static_cast<u8>(((nAddr >> 5) & 0x3e) | (nAddr & 1));
+				const unsigned nChan = (nAddr >> 1) & 0x1f;
+				TVoiceOverlay& Overlay = m_VoiceOverlay[nChan];
+				if (nReg == 0x28 && (nData & 0x80))
+				{
+					// A decay speed write (reg 0x28) with bit
+					// 7 set forces the envelope mode to DECAY
+					// (EnvelopeBlock::decay_speed_w) -- the
+					// release. Record it so a read before the
+					// snapshot catches up reports DECAY, not
+					// the snapshot's pre-release mode.
+					Overlay.nReleaseSeq = nWriteSeq;
+					Overlay.bReleased = true;
+				}
+				// A write to a register whose status byte the
+				// overlay reports clears that byte's done bit
+				// -- but only when the write actually moves the
+				// target the core tracks. The core sets a NEW
+				// target on the write and reports not-done until
+				// the ramp/sweep reaches it (MixerBlock glo_w /
+				// pan_w, FilterBlock info_w), so the overlay
+				// must not keep reporting the old target as done
+				// -- the firmware would otherwise see a fade as
+				// finished while the voice is still ramping and
+				// could steal the voice early. The level bits
+				// are untouched: the write itself does not change
+				// the current level. Comparing the new target
+				// against the old target (from the pre-write
+				// shadow value) is exact whenever the done bit
+				// is set -- then the current level equals the
+				// old target (keyon() sets current = target,
+				// and nothing moves it while the target is
+				// unchanged), so the new done state is exactly
+				// (new target == old target); when the done bit
+				// is already clear the clear is a no-op. A
+				// blind clear would over-clear: e.g. pan
+				// 0x40->0x60 moves panl (0x100->0x180) but
+				// leaves panr at 0x000, so panr must stay done.
+				// Clearing is harmless when the overlay is not
+				// consulted: a never-keyed voice has a zero
+				// Status[], and a snapshot-covered voice only
+				// uses Status[1], which this never touches.
+				switch (nReg)
+				{
+				case 0x20: // LPF info (high byte)
+				case 0x21: // LPF info (low byte)
+				{
+					// Filter target (FilterBlock::info_w):
+					// level = info & 0x7ff, capped at 0x7c0
+					// under the 0277 hybrid when the resonance
+					// bits are below 4; target = level | 0x800
+					// (or 0 when level is 0). The write changes
+					// one byte of the 16-bit pair; the other
+					// byte comes from the shadow (unchanged by
+					// this write).
+					const auto FilterTarget = [&](u16 nInfo) -> u16 {
+						u16 nLevel = static_cast<u16>(nInfo & 0x7ff);
+						if (m_bFilter0277 && (nInfo >> 11) < 4 && nLevel > 0x7c0)
+							nLevel = 0x7c0;
+						return nLevel ? static_cast<u16>(nLevel | 0x800) : 0;
+					};
+					const u16 nAddr20 = static_cast<u16>(0x400 | (nChan << 1));
+					const u16 nAddr21 = static_cast<u16>(0x401 | (nChan << 1));
+					const u16 nNewInfo = static_cast<u16>(
+						((nReg == 0x20 ? nData : m_SwpShadow[nAddr20]) << 8) |
+						(nReg == 0x21 ? nData : m_SwpShadow[nAddr21]));
+					const u16 nOldInfo = static_cast<u16>(
+						((nReg == 0x20 ? nOldShadow : m_SwpShadow[nAddr20]) << 8) |
+						(nReg == 0x21 ? nOldShadow : m_SwpShadow[nAddr21]));
+					if (FilterTarget(nNewInfo) != FilterTarget(nOldInfo))
+						Overlay.Status[0] &= 0x3f; // filter
+					break;
+				}
+				case 0x2e: // glo (master level)
+					// glo_w: target = data << 4 (injective),
+					// so the target moves iff the value does.
+					if (nData != nOldShadow)
+						Overlay.Status[2] &= 0x3f;
+					// Finding 7: record that this voice's glo
+					// has been written (see m_nGloPanWrittenMask).
+					m_nGloPanWrittenMask |= (1ULL << (nChan * 2));
+					break;
+				case 0x2f: // pan
+				{
+					// Pan targets (MixerBlock::pan_w): the two
+					// sides derive from different bits of the
+					// pan byte, so each side clears only when
+					// ITS target moves.
+					const auto PanTargetL = [](u8 nPan) -> u16 {
+						const u16 nT = static_cast<u16>((nPan << 2) & 0x3c0);
+						return nT == 0x3c0 ? 0xfff : nT;
+					};
+					const auto PanTargetR = [](u8 nPan) -> u16 {
+						const u16 nT = static_cast<u16>((nPan << 6) & 0x3c0);
+						return nT == 0x3c0 ? 0xfff : nT;
+					};
+					if (PanTargetL(nData) != PanTargetL(nOldShadow))
+						Overlay.Status[3] &= 0x3f; // panl
+					if (PanTargetR(nData) != PanTargetR(nOldShadow))
+						Overlay.Status[4] &= 0x3f; // panr
+					// Finding 7: record that this voice's pan
+					// has been written.
+					m_nGloPanWrittenMask |= (1ULL << (nChan * 2 + 1));
+					break;
+				}
+				default:
+					break;
+				}
+			}
+		}
 		if (m_bSplitMode)
 		{
 			// Cap-gated backpressure (cap <= 4095 usable; the
@@ -449,7 +714,17 @@ void CMU50Synth::OnH8SwpWrite(u64 nCycle, u16 nAddr, u8 nData)
 			{
 				__atomic_add_fetch(&m_nWqFullWaits, 1, __ATOMIC_RELAXED);
 				while (m_WEventFifo.PendingForProducer() >= m_nWEventFifoCap)
+				{
+					// Wake the SWP core: it may be asleep in
+					// wfe (PCMTask sleeps after 64 idle spins)
+					// with no block published, so no publish
+					// sev is coming -- without this the wait
+					// could outlast the consumer's sleep. On
+					// the host this is a no-op (see
+					// WakeSwpCore).
+					WakeSwpCore();
 					mu50spsc::CpuRelax();
+				}
 			}
 			m_WEventFifo.TryPush(Event);
 		}
@@ -466,6 +741,18 @@ void CMU50Synth::OnH8SwpWrite(u64 nCycle, u16 nAddr, u8 nData)
 	}
 }
 
+bool CMU50Synth::FifoSnapAhead(size_t nSnap)
+{
+	// Forward distance from the out-index to the snapshot, masked
+	// (indices wrap mod kWEventFifoSize); the snapshot is ahead iff
+	// that distance is within the pending count. See the header
+	// comment for the exactness bound (buffer size minus the
+	// overshoot, not a full ring lap).
+	const size_t nDist = (nSnap - m_WEventFifo.OutIndex()) &
+	                     decltype(m_WEventFifo)::Mask;
+	return nDist <= m_WEventFifo.PendingForConsumer();
+}
+
 void CMU50Synth::DrainWEventsUpTo(size_t nSnap)
 {
 	// Applies pending events in firmware order up to the producer
@@ -474,7 +761,18 @@ void CMU50Synth::DrainWEventsUpTo(size_t nSnap)
 	// published block's snapshot (drain exactly that block's writes).
 	// Never called concurrently: single-core mode drains on the
 	// audio thread, split mode on the SWP thread, modes exclusive.
-	while (m_WEventFifo.OutIndex() != nSnap)
+	// Stale-snapshot guard (review round 2, issue 2): if the
+	// out-index already passed nSnap (the idle drain ran after this
+	// block was published), return immediately -- the old loop only
+	// stopped on an exact index match, so it wrapped the whole ring
+	// and emptied the queue, landing later writes early. The loop
+	// is also bounded by the entry distance, so it can never
+	// over-drain even if the producer laps the ring mid-drain.
+	if (!FifoSnapAhead(nSnap))
+		return;
+	size_t nRemaining = (nSnap - m_WEventFifo.OutIndex()) &
+	                    decltype(m_WEventFifo)::Mask;
+	while (nRemaining-- > 0)
 	{
 		TWEvent Event;
 		if (!m_WEventFifo.TryPeek(Event))
@@ -489,20 +787,97 @@ void CMU50Synth::DrainWEvents()
 {
 	// Caller must hold m_Lock (single-core, synchronous).
 	// Applies every pending event in firmware order. Runs before
-	// each block render and before each SWP read, so no read ever
-	// observes a stale register.
+	// each block render and before each non-0x01 SWP read (0x01
+	// reads do not drain; see OnH8SwpRead).
 	DrainWEventsUpTo(m_WEventFifo.InIndex());
 }
 
 u8 CMU50Synth::OnH8SwpRead(u16 nAddr)
 {
-	// Single-core (M1): drain first, then read live register state.
+	// Single-core (M1): read live register state. Register 0x01
+	// (the state readback port, the firmware's only SWP read) is
+	// read WITHOUT draining: draining the whole FIFO here applies
+	// every pending voice write before the block renders, so a
+	// status poll shortly after a damp/key-on pair collapses both
+	// to frame 0 -- the zero-gap click Finding 2 fixed (measured
+	// on the synthetic feed: the E4 note-on landed 116 frames
+	// early in single-core vs split, exactly its key-on offset).
+	// The read still observes the state address: 0x01 writes are
+	// applied eagerly at push time (see OnH8SwpWrite), and the
+	// address has no audio effect. The voice state itself would
+	// lag by up to one block (the key-on is still queued) -- so
+	// the read is corrected with the key-on overlay, exactly as
+	// split mode does: if the voice's key-on write is still in
+	// the FIFO, the live value is pre-key-on and the overlay's
+	// post-key-on byte is returned instead. Without the overlay
+	// the firmware would read a just-keyed voice as DECAY_DONE
+	// (0xFF) and could steal it for the next note. A release
+	// write still queued likewise forces the envelope byte to
+	// DECAY. Reads of any other address keep the old drain-first
+	// behaviour (fresh values; the firmware never reads them in
+	// practice).
 	if (!m_bSplitMode)
 	{
-		DrainWEvents();
+		if (nAddr != 0x01)
+		{
+			DrainWEvents();
+			u8 nValue = 0;
+			if (m_pSynth)
+				m_pSynth->read_register(nAddr, nValue);
+			return nValue;
+		}
 		u8 nValue = 0;
 		if (m_pSynth)
 			m_pSynth->read_register(nAddr, nValue);
+		// State address (control reg 1, kept current by the
+		// eager apply in OnH8SwpWrite): low 5 bits = voice,
+		// high bits = slot (0 filter, 1 sample counter,
+		// 2 envelope, 3 glo, 4 panl, 5 panr). The overlay
+		// covers every slot but the sample counter, with
+		// Status[] indexed [0] filter, [1] envelope,
+		// [2] glo, [3] panl, [4] panr.
+		const u8 nStateAddr = m_SwpShadow[1];
+		const unsigned nChan = nStateAddr & 0x1f;
+		const unsigned nSlot = nStateAddr >> 5;
+		if (nSlot == 0 || (nSlot >= 2 && nSlot <= 5))
+		{
+			const int nStatusIdx = (nSlot == 0) ? 0 : static_cast<int>(nSlot) - 1;
+			const TVoiceOverlay &Overlay = m_VoiceOverlay[nChan];
+			// Is this voice's key-on write still queued? The
+			// key-on is the write to 0x0b-(chan/8) with the
+			// voice's bit set; any such pending write means
+			// the newest key-on has not taken effect yet.
+			const u16 nKeyAddr = static_cast<u16>(0x0b - (nChan >> 3));
+			const u8 nKeyBit = static_cast<u8>(1u << (nChan & 7));
+			TWEvent UnusedEvent;
+			const bool bKeyPending = m_WEventFifo.FindNewest(
+				[&](const TWEvent &E) {
+					return E.nAddr == nKeyAddr && (E.nData & nKeyBit) != 0;
+				},
+				UnusedEvent);
+			if (bKeyPending)
+			{
+				if (nStatusIdx == 1 && Overlay.bReleased)
+					return libmu50::DecayEnvelopeStatus(Overlay.Status[1]);
+				return Overlay.Status[nStatusIdx];
+			}
+			if (nStatusIdx == 1 && Overlay.bReleased)
+			{
+				// Key-on applied, but a release write for
+				// this voice is still queued (it must have
+				// been issued after the key-on: FIFO order).
+				// The live envelope is pre-release; force
+				// DECAY, keeping the live level bits.
+				const u16 nRelAddr = static_cast<u16>(0x500 | (nChan << 1));
+				const bool bRelPending = m_WEventFifo.FindNewest(
+					[&](const TWEvent &E) {
+						return E.nAddr == nRelAddr && (E.nData & 0x80) != 0;
+					},
+					UnusedEvent);
+				if (bRelPending)
+					return libmu50::DecayEnvelopeStatus(nValue);
+			}
+		}
 		return nValue;
 	}
 	// Split: the SWP thread owns live register state, so the audio
@@ -521,6 +896,29 @@ u8 CMU50Synth::OnH8SwpRead(u16 nAddr)
 	// M2 harness stub behavior.
 	if (nAddr == 0x01)
 	{
+		// Finding 3: apply the key-on overlay to one state_r
+		// byte. nSnapSeq is the publish sequence the snapshot
+		// reflects; nSlot is the voice-status slot (0 filter,
+		// 1 envelope, 2 glo, 3 panl, 4 panr). If the snapshot
+		// predates the voice's key-on, the overlay's
+		// post-key-on bytes win (a release after the key-on
+		// forces the envelope mode to DECAY). Otherwise a
+		// release newer than the snapshot still forces the
+		// envelope byte to DECAY, keeping the snapshot's
+		// level bits. The sample-counter case never reaches
+		// here (it has no per-voice state to overlay).
+		auto OverlayState = [&](int nChan, int nSlot, u8 nSnapValue, u64 nSnapSeq) -> u8 {
+			const TVoiceOverlay& Overlay = m_VoiceOverlay[nChan];
+			if (Overlay.nKeyOnSeq > nSnapSeq)
+			{
+				if (nSlot == 1 && Overlay.bReleased)
+					return libmu50::DecayEnvelopeStatus(Overlay.Status[1]);
+				return Overlay.Status[nSlot];
+			}
+			if (nSlot == 1 && Overlay.bReleased && Overlay.nReleaseSeq > nSnapSeq)
+				return libmu50::DecayEnvelopeStatus(nSnapValue);
+			return nSnapValue;
+		};
 		// Seqlock read (Copilot review on PR #12): spin while the SWP
 		// thread is mid-write (odd seq) -- the writer's critical
 		// section is only ~160 bytes, so it finishes quickly. Never
@@ -550,6 +948,7 @@ u8 CMU50Synth::OnH8SwpRead(u16 nAddr)
 				for (int s = 0; s < 5; ++s)
 					Voice[c][s] = m_StateSnapVoice[c][s];
 			const u32 nCounter = m_StateSnapCounter;
+			const u64 nBlockSeq = m_nStateSnapBlockSeq;
 			// ACQUIRE fence: the copy above must not be reordered
 			// after the nSeq1 load. An acquire load on nSeq1 keeps
 			// later accesses from moving above it, but not earlier
@@ -568,17 +967,18 @@ u8 CMU50Synth::OnH8SwpRead(u16 nAddr)
 				for (int s = 0; s < 5; ++s)
 					m_LastGoodVoice[c][s] = Voice[c][s];
 			m_LastGoodCounter = nCounter;
+			m_nLastGoodBlockSeq = nBlockSeq;
 			m_bLastGoodValid = true;
 			const u8 nStateAddr = m_SwpShadow[1];
 			const int nChan = nStateAddr & 0x1f;
 			switch (nStateAddr >> 5)
 			{
-			case 0: return Voice[nChan][0]; // filter_status
+			case 0: return OverlayState(nChan, 0, Voice[nChan][0], nBlockSeq); // filter_status
 			case 1: return static_cast<u8>(0xc0 | (nCounter >> 13)); // sample counter
-			case 2: return Voice[nChan][1]; // envelope_status
-			case 3: return Voice[nChan][2]; // mixer_status_glo
-			case 4: return Voice[nChan][3]; // mixer_status_panl
-			case 5: return Voice[nChan][4]; // mixer_status_panr
+			case 2: return OverlayState(nChan, 1, Voice[nChan][1], nBlockSeq); // envelope_status
+			case 3: return OverlayState(nChan, 2, Voice[nChan][2], nBlockSeq); // mixer_status_glo
+			case 4: return OverlayState(nChan, 3, Voice[nChan][3], nBlockSeq); // mixer_status_panl
+			case 5: return OverlayState(nChan, 4, Voice[nChan][4], nBlockSeq); // mixer_status_panr
 			default: return 0;
 			}
 		}
@@ -592,12 +992,12 @@ u8 CMU50Synth::OnH8SwpRead(u16 nAddr)
 			const int nChan = nStateAddr & 0x1f;
 			switch (nStateAddr >> 5)
 			{
-			case 0: return m_LastGoodVoice[nChan][0];
+			case 0: return OverlayState(nChan, 0, m_LastGoodVoice[nChan][0], m_nLastGoodBlockSeq);
 			case 1: return static_cast<u8>(0xc0 | (m_LastGoodCounter >> 13));
-			case 2: return m_LastGoodVoice[nChan][1];
-			case 3: return m_LastGoodVoice[nChan][2];
-			case 4: return m_LastGoodVoice[nChan][3];
-			case 5: return m_LastGoodVoice[nChan][4];
+			case 2: return OverlayState(nChan, 1, m_LastGoodVoice[nChan][1], m_nLastGoodBlockSeq);
+			case 3: return OverlayState(nChan, 2, m_LastGoodVoice[nChan][2], m_nLastGoodBlockSeq);
+			case 4: return OverlayState(nChan, 3, m_LastGoodVoice[nChan][3], m_nLastGoodBlockSeq);
+			case 5: return OverlayState(nChan, 4, m_LastGoodVoice[nChan][4], m_nLastGoodBlockSeq);
 			default: return 0;
 			}
 		}
@@ -606,7 +1006,30 @@ u8 CMU50Synth::OnH8SwpRead(u16 nAddr)
 	if (m_WEventFifo.FindNewest([nAddr](const TWEvent& E) { return E.nAddr == nAddr; }, Event))
 		return Event.nData;
 	if (nAddr < sizeof(m_SwpShadow))
+	{
+		// Finding 7: the shadow seeds glo (0x2e) and pan (0x2f)
+		// at 0xff -- the MixerBlock's effective reset target,
+		// which the key-on overlay needs -- but the core's
+		// channel_regs reset those two registers to 0, so a
+		// read before the first write must return 0x00, not
+		// 0xff. The written-mask records which (voice, reg)
+		// pairs have actually been written; never-written
+		// 0x2e/0x2f read as the channel_regs reset (0x00).
+		// (0x2e/0x2f are the only shadow seeds that differ
+		// from channel_regs reset; 0x08/0x20/0x21 match.)
+		if (nAddr >= 0x400 && nAddr < 0x800)
+		{
+			const u8 nReg = static_cast<u8>(((nAddr >> 5) & 0x3e) | (nAddr & 1));
+			if (nReg == 0x2e || nReg == 0x2f)
+			{
+				const unsigned nChan = (nAddr >> 1) & 0x1f;
+				const u64 nBit = 1ULL << (nChan * 2 + (nReg == 0x2f ? 1 : 0));
+				if ((m_nGloPanWrittenMask & nBit) == 0)
+					return 0x00;
+			}
+		}
 		return m_SwpShadow[nAddr];
+	}
 	return 0;
 }
 
@@ -697,8 +1120,18 @@ void CMU50Synth::AdvanceH8(size_t nNativeFrames)
 	DrainMidiStage();
 
 	if (!m_pH8 || nNativeFrames == 0)
+	{
+		m_nLastAdvanceStartCycle = 0;
+		m_nLastAdvanceCycles      = 0;
 		return;
+	}
 
+	// Finding 2: record the block's cycle span so W events can be
+	// mapped to frame offsets (single-core: the members below;
+	// split: the published block). nCycles is the cycles actually
+	// advanced -- 0 when halted (run_until never runs) or when the
+	// advance was carry-only (nAdvance == 0).
+	const u64 nStartCycle = m_pH8->cycles();
 	if (!m_bH8Halted)
 	{
 		m_dH8CycleCarry += static_cast<double>(nNativeFrames) * H8CyclesPerNativeFrame;
@@ -725,6 +1158,8 @@ void CMU50Synth::AdvanceH8(size_t nNativeFrames)
 			}
 		}
 	}
+	m_nLastAdvanceStartCycle = nStartCycle;
+	m_nLastAdvanceCycles     = m_pH8->cycles() - nStartCycle;
 	// Split mode: publish the block (RELEASE) even when halted --
 	// M1 still renders every block after a halt (decay/silence),
 	// so the SWP thread must still render it, or the audio thread
@@ -737,7 +1172,8 @@ void CMU50Synth::AdvanceH8(size_t nNativeFrames)
 	if (m_bSplitMode)
 	{
 		const u64 nSeq = ++m_nNextPublishSeq;
-		const TPublishedBlock Block{ m_WEventFifo.InIndex(), nNativeFrames, nSeq };
+		const TPublishedBlock Block{ m_WEventFifo.InIndex(), nNativeFrames, nSeq,
+		                             m_nLastAdvanceStartCycle, m_nLastAdvanceCycles };
 		m_bLastPublishOk = true;
 		if (!m_PublishedBlocks.TryPush(Block))
 		{
@@ -767,7 +1203,7 @@ void CMU50Synth::AdvanceH8(size_t nNativeFrames)
 		// the block was actually published; a skipped publish
 		// (parked SWP) has no block to render.
 		if (m_bLastPublishOk)
-			__asm__ volatile ("sev" ::: "memory");
+			WakeSwpCore();
 		__atomic_store_n(&m_nPublishedCycles, m_pH8->cycles(), __ATOMIC_RELEASE);
 	}
 }
@@ -959,10 +1395,14 @@ double CMU50Synth::ResamplePulledBlock(float* pOutBuffer, size_t nOutDone,
 		m_fVolumeRampStep = (fVolumeTarget - m_fVolumeApplied) / static_cast<float>(VolumeRampFrames);
 	}
 	// Activity for IsActive(): any non-zero native sample in this
-	// block marks the block's end as the last active frame.
+	// block marks the block's end as the last active frame. The
+	// threshold is one 16-bit LSB on the 18-bit scale: rounding
+	// residue of 1-3 DAC LSBs must not keep the synth "active"
+	// forever and block power save.
 	for (size_t i = 0; i < nNativeRender * 2; ++i)
 	{
-		if (m_NativeScratch[i] != 0)
+		const s32 nSample = m_NativeScratch[i];
+		if (nSample > 4 || nSample < -4)
 		{
 			m_nLastActiveNativeFrame = m_nWrittenNativeFrames + nNativeRender;
 			break;
@@ -986,7 +1426,7 @@ double CMU50Synth::ResamplePulledBlock(float* pOutBuffer, size_t nOutDone,
 	// Effective native frame k: primed blocks start with the two
 	// carried frames, then the freshly rendered scratch frames;
 	// the first block has no carried frames
-	auto NativeFrame = [&](size_t nIndex) -> const s16*
+	auto NativeFrame = [&](size_t nIndex) -> const s32*
 	{
 		if (m_bResamplePrimed)
 		{
@@ -1001,7 +1441,7 @@ double CMU50Synth::ResamplePulledBlock(float* pOutBuffer, size_t nOutDone,
 	// take it from the carried prev frame; the first block has
 	// no previous frame, so it duplicates frame 0 (Nuked's prime
 	// behavior — at t = 0 the output is exactly frame 0 anyway).
-	auto PrevFrame = [&](size_t nIndex) -> const s16*
+	auto PrevFrame = [&](size_t nIndex) -> const s32*
 	{
 		if (nIndex == 0)
 			return m_bResamplePrimed ? m_PrevSample : NativeFrame(0);
@@ -1027,16 +1467,20 @@ double CMU50Synth::ResamplePulledBlock(float* pOutBuffer, size_t nOutDone,
 		//     per-output double dPos/dFrac and no accumulating
 		//     rounding error.
 		//   - Integer FIR: Q15 coefficients (kFir44k48kQ15) and
-		//     int64 accumulation. This drops the per-tap s16->float
+		//     int64 accumulation. This drops the per-tap s32->float
 		//     conversion and float multiply-add; each tap is one
 		//     smull/madd + add. int64 is required: max |sum| is
-		//     2.95e9 (sum|coeff_q15| = 90116), over the int32 limit.
-		//   - One float multiply per output: the /32768 and the gain
-		//     are folded into fOutScale = fScale / 2^30 (the Q15
-		//     table carries one factor of 32768, the output scale
-		//     the other). Q15 quantization error is < 1 LSB per tap;
-		//     per-phase DC gain stays within 2e-4 of 1.0.
-		auto FirFrame = [&](long nIdx) -> const s16*
+		//     1.18e10 (sum|coeff_q15| = 90116 times the 18-bit
+		//     full scale 131072), over the int32 limit.
+		//   - One float multiply per output: the native-to-float
+		//     scale and the gain are folded into fOutScale =
+		//     fScale * kNativeToFloat / 32768 (the Q15 table
+		//     carries one factor of 32768, the output scale the
+		//     other, and kNativeToFloat carries the 18-bit scale
+		//     plus the 2.5x make-up trim). Q15 quantization error
+		//     is < 1 LSB per tap; per-phase DC gain stays within
+		//     2e-4 of 1.0.
+		auto FirFrame = [&](long nIdx) -> const s32*
 		{
 			if (nIdx < 0)
 				return m_FirHistory[32 + nIdx];
@@ -1076,7 +1520,7 @@ double CMU50Synth::ResamplePulledBlock(float* pOutBuffer, size_t nOutDone,
 			int64_t nLeft = 0, nRight = 0;
 			if (nBase >= nScratchBase)
 			{
-				const s16* pS = &m_NativeScratch[(static_cast<size_t>(nBase - nScratchBase)) * 2];
+				const s32* pS = &m_NativeScratch[(static_cast<size_t>(nBase - nScratchBase)) * 2];
 				for (size_t t = 0; t < 64; ++t)
 				{
 					nLeft  += static_cast<int64_t>(pCoeff[t]) * pS[t * 2];
@@ -1087,14 +1531,15 @@ double CMU50Synth::ResamplePulledBlock(float* pOutBuffer, size_t nOutDone,
 			{
 				for (size_t t = 0; t < 64; ++t)
 				{
-					const s16* pF = FirFrame(nBase + static_cast<long>(t));
+					const s32* pF = FirFrame(nBase + static_cast<long>(t));
 					nLeft  += static_cast<int64_t>(pCoeff[t]) * pF[0];
 					nRight += static_cast<int64_t>(pCoeff[t]) * pF[1];
 				}
 			}
 			// Per-frame volume scale (advances the ramp); the Q15
-			// output scale folds in the /2^30 factor.
-			const float fOutScale = NextVolumeScale() * (1.0f / 1073741824.0f);
+			// output scale folds in the native-to-float scale
+			// (18-bit full scale + 2.5x trim, see kNativeToFloat).
+			const float fOutScale = NextVolumeScale() * (kNativeToFloat / 32768.0f);
 			pOutBuffer[(nOutDone + i) * 2]     = static_cast<float>(nLeft) * fOutScale;
 			pOutBuffer[(nOutDone + i) * 2 + 1] = static_cast<float>(nRight) * fOutScale;
 			nFracNum += nNum;
@@ -1112,10 +1557,10 @@ double CMU50Synth::ResamplePulledBlock(float* pOutBuffer, size_t nOutDone,
 			const double dPos = dBlockStart + static_cast<double>(i) * dRatio;
 			const size_t nIndex = static_cast<size_t>(dPos);
 			const double dFrac  = dPos - static_cast<double>(nIndex);
-			const s16* pFrameM1 = PrevFrame(nIndex);
-			const s16* pFrame0 = NativeFrame(nIndex);
-			const s16* pFrame1 = NativeFrame(nIndex + 1);
-			const s16* pFrame2 = NativeFrame(nIndex + 2);
+			const s32* pFrameM1 = PrevFrame(nIndex);
+			const s32* pFrame0 = NativeFrame(nIndex);
+			const s32* pFrame1 = NativeFrame(nIndex + 1);
+			const s32* pFrame2 = NativeFrame(nIndex + 2);
 			// Catmull-Rom weights (identical to Nuked's cubic)
 			const float t = static_cast<float>(dFrac);
 			const float t2 = t * t;
@@ -1124,8 +1569,10 @@ double CMU50Synth::ResamplePulledBlock(float* pOutBuffer, size_t nOutDone,
 			const float w1 = 1.0f - 2.5f * t2 + 1.5f * t3;
 			const float w2 = 0.5f * t + 2.0f * t2 - 1.5f * t3;
 			const float w3 = -0.5f * t2 + 0.5f * t3;
-			const float fLeft  = (w0 * pFrameM1[0] + w1 * pFrame0[0] + w2 * pFrame1[0] + w3 * pFrame2[0]) / 32768.0f;
-			const float fRight = (w0 * pFrameM1[1] + w1 * pFrame0[1] + w2 * pFrame1[1] + w3 * pFrame2[1]) / 32768.0f;
+			// 18-bit native frames to float, with the 2.5x make-up
+			// trim (see kNativeToFloat).
+			const float fLeft  = (w0 * pFrameM1[0] + w1 * pFrame0[0] + w2 * pFrame1[0] + w3 * pFrame2[0]) * kNativeToFloat;
+			const float fRight = (w0 * pFrameM1[1] + w1 * pFrame0[1] + w2 * pFrame1[1] + w3 * pFrame2[1]) * kNativeToFloat;
 			const float fScale = NextVolumeScale();
 			pOutBuffer[(nOutDone + i) * 2]     = fLeft * fScale;
 			pOutBuffer[(nOutDone + i) * 2 + 1] = fRight * fScale;
@@ -1139,11 +1586,11 @@ double CMU50Synth::ResamplePulledBlock(float* pOutBuffer, size_t nOutDone,
 	// below overwrite.
 	const double dEndPos = dBlockStart + static_cast<double>(nBlockOut) * dRatio;
 	const size_t nConsumed = static_cast<size_t>(dEndPos);
-	const s16* pPrev = NativeFrame(nConsumed > 0 ? nConsumed - 1 : 0);
-	const s16 nPrev0 = pPrev[0];
-	const s16 nPrev1 = pPrev[1];
-	const s16* pLeftover0 = NativeFrame(nConsumed);
-	const s16* pLeftover1 = NativeFrame(nConsumed + 1);
+	const s32* pPrev = NativeFrame(nConsumed > 0 ? nConsumed - 1 : 0);
+	const s32 nPrev0 = pPrev[0];
+	const s32 nPrev1 = pPrev[1];
+	const s32* pLeftover0 = NativeFrame(nConsumed);
+	const s32* pLeftover1 = NativeFrame(nConsumed + 1);
 	m_PrevSample[0] = nPrev0;
 	m_PrevSample[1] = nPrev1;
 	m_LeftoverSample[0][0] = pLeftover0[0];
@@ -1162,7 +1609,7 @@ double CMU50Synth::ResamplePulledBlock(float* pOutBuffer, size_t nOutDone,
 			long nIdx = static_cast<long>(nConsumed) - 32 + static_cast<long>(j);
 			if (nIdx >= 0)
 			{
-				const s16* pF = NativeFrame(static_cast<size_t>(nIdx));
+				const s32* pF = NativeFrame(static_cast<size_t>(nIdx));
 				m_FirHistory[j][0] = pF[0];
 				m_FirHistory[j][1] = pF[1];
 			}
@@ -1175,6 +1622,62 @@ double CMU50Synth::ResamplePulledBlock(float* pOutBuffer, size_t nOutDone,
 	}
 	return dEndPos - static_cast<double>(nConsumed);
 
+}
+
+template <class RenderChunkFn>
+size_t CMU50Synth::RenderSegments(size_t nFrames, u64 nStartCycle, u64 nCycles,
+                                  size_t nFifoSnap, RenderChunkFn&& RenderChunk)
+{
+	// Stale-snapshot guard (review round 2, issue 2): the same
+	// hazard as DrainWEventsUpTo -- if the out-index already passed
+	// this block's snapshot (the idle drain ran after it was
+	// published), the per-iteration OutIndex() != nFifoSnap check
+	// below would wrap the whole ring and treat later blocks'
+	// writes as this block's. Clamp the snapshot to the current
+	// out-index so the block renders with no writes (they were
+	// already applied, early, by the idle drain). A snapshot that
+	// is still ahead is untouched: consumption only moves the
+	// out-index toward it, so the entry check stays valid.
+	if (!FifoSnapAhead(nFifoSnap))
+		nFifoSnap = m_WEventFifo.OutIndex();
+	size_t nDone = 0;
+	while (nDone < nFrames)
+	{
+		// Next event belonging to this block, if any.
+		TWEvent Event{};
+		bool bHasEvent = false;
+		size_t nOff = nFrames;
+		if (m_WEventFifo.OutIndex() != nFifoSnap &&
+		    m_WEventFifo.TryPeek(Event))
+		{
+			bHasEvent = true;
+			nOff = EventFrameOffset(Event.nCycle, nStartCycle,
+			                        nCycles, nFrames);
+		}
+		if (bHasEvent && nOff <= nDone)
+		{
+			// Event at (or before) the current frame: apply
+			// now, with no zero-length segment (also covers an
+			// out-of-order stamp).
+			if (m_pSynth)
+				m_pSynth->write_register(Event.nAddr, Event.nData);
+			m_WEventFifo.Pop();
+			continue;
+		}
+		const size_t nTarget = bHasEvent ? nOff : nFrames;
+		const size_t nChunk = Utility::Min(nTarget - nDone,
+		                                   Utility::Min(nFrames - nDone, kNativeScratchFrames));
+		if (!RenderChunk(nDone, nChunk))
+			return nDone;
+		nDone += nChunk;
+		if (bHasEvent && nDone == nOff)
+		{
+			if (m_pSynth)
+				m_pSynth->write_register(Event.nAddr, Event.nData);
+			m_WEventFifo.Pop();
+		}
+	}
+	return nDone;
 }
 
 void CMU50Synth::RenderResampled(float* pOutBuffer, size_t nFrames)
@@ -1232,19 +1735,35 @@ void CMU50Synth::RenderResampled(float* pOutBuffer, size_t nFrames)
 		// hardware.
 		AdvanceH8(nNativeRender);
 
-		// M1: apply this block's W events before rendering it
-		// (identity mode: exactly today's advance-then-render
-		// semantics, with the FIFO as the only new step).
-		DrainWEvents();
-
+		// Finding 2: shared segment loop (see RenderSegments) --
+		// apply each write at its frame offset within this block
+		// (from the cycle span AdvanceH8 just recorded) instead
+		// of draining the whole block up front. Segments render
+		// into successive offsets of m_NativeScratch; the ring
+		// round-trip below still runs over the whole block.
+		// Writes stamped at/past the block end drain after the loop.
+		const u64 nBlockStartCycle = m_nLastAdvanceStartCycle;
+		const u64 nBlockCycles     = m_nLastAdvanceCycles;
 		const bool bDiag = CDiagLog::Get().IsEnabled();
 		const u64 nSwpStartUs = bDiag ? CTimer::Get()->GetClockTicks() : 0;
-		const libmu50::Status RenderStatus = m_pSynth->render(m_NativeScratch, nNativeRender);
+		// The H8 is not running during this loop (single-core),
+		// so the live in-index is stable and bounds the block's
+		// writes.
+		const size_t nDoneNative = RenderSegments(
+			nNativeRender, nBlockStartCycle, nBlockCycles,
+			m_WEventFifo.InIndex(),
+			[this](size_t nSegDone, size_t nSegChunk) -> bool {
+				const libmu50::Status RenderStatus =
+					m_pSynth->render(&m_NativeScratch[nSegDone * 2], nSegChunk);
+				return static_cast<bool>(RenderStatus);
+			});
+		// Writes stamped at or past the block end.
+		DrainWEvents();
 		if (bDiag)
 		{
 			m_nDiagSwpUs += CTimer::Get()->GetClockTicks() - nSwpStartUs;
 		}
-		if (!RenderStatus)
+		if (nDoneNative < nNativeRender)
 		{
 			// Should not happen after a successful Initialize();
 			// fail safe to silence for the rest of the call
@@ -1450,6 +1969,9 @@ void CMU50Synth::SetFilter0277(bool b0277)
 {
 	// Contract: call before the SWP thread starts; afterwards the
 	// flag is read-only (thread-creation happens-before covers it).
+	// Finding 3: keep the audio-side copy for the key-on overlay
+	// filter formula, which must match the core's mode.
+	m_bFilter0277 = b0277;
 	if (m_pSynth)
 		m_pSynth->set_filter_0277(b0277);
 }
@@ -1474,50 +1996,83 @@ bool CMU50Synth::PCMTaskIteration()
 	TPublishedBlock Block;
 	if (!m_PublishedBlocks.TryPop(Block))
 	{
-		// Idle drain: no published block, but the audio thread may
-		// be mid-block with a full W FIFO (tiny-FIFO stress, or a
-		// pathological block burst over 4095 writes). Draining all
-		// pending events here relieves the backpressure -- and it
-		// cannot change output: the audio core is at most one block
-		// ahead (lag-2), so idle-drained writes always belong to
-		// the immediately-next block, whose render happens after
-		// its publish anyway; the snapshot drain at pop time then
-		// finds nothing new. Without this, a mid-block full FIFO
-		// would deadlock (the SWP core could only drain up to a
-		// snapshot that does not exist yet).
-		DrainWEventsUpTo(m_WEventFifo.InIndex());
+		// Idle drain, restricted to real backpressure (Finding 2):
+		// no published block, but the audio thread may be mid-block
+		// with a full W FIFO (tiny-FIFO stress, or a pathological
+		// block burst over 4095 writes). Draining here throws away
+		// the drained writes' cycle stamps, so it is bounded two
+		// ways. First, it only runs when the FIFO is actually
+		// full (pending >= cap): the producer waits only at the
+		// cap, so below it no drain is needed for liveness and
+		// draining would only throw away timing. Second, it
+		// drains only down to the half-cap level ("relieves at
+		// half"): draining everything would also eat the current
+		// (unpublished) block's later writes, landing them at
+		// frame 0 instead of their stamped offsets -- and once
+		// the out-index passes a later block's snapshot, that
+		// block's post-render drain eats its writes early too.
+		// The oldest writes are the ones the producer needs room
+		// for, and their offsets are the smallest, so the timing
+		// error is bounded to the head of the block. The producer
+		// wakes this core with sev while it waits (see
+		// OnH8SwpWrite), so the drain cannot be missed because
+		// the worker is asleep in wfe.
+		const size_t nPending = m_WEventFifo.PendingForConsumer();
+		if (nPending >= m_nWEventFifoCap)
+		{
+			const size_t nDrain = nPending - m_nWEventFifoCap / 2;
+			const size_t nSnap = (m_WEventFifo.OutIndex() + nDrain) &
+			                     decltype(m_WEventFifo)::Mask;
+			DrainWEventsUpTo(nSnap);
+		}
 		// No Yield() here (it belongs to core 0). The PCMTask
 		// loop does the spin-then-wfe backoff; this iteration
 		// just reports that it did no work.
 		return false;
 	}
-	DrainWEventsUpTo(Block.nFifoSnap);
+	// Finding 2: shared segment loop (see RenderSegments) -- walk
+	// the block in segments split at each write's frame offset
+	// (from the block's cycle span) instead of draining the whole
+	// block up front: two writes the firmware issued up to 5 ms
+	// apart no longer land with zero samples between them, so a
+	// damp-then-key-on pair in one block gets samples for the damp
+	// to act. Writes stamped at/past the block end drain after
+	// the loop.
 	const u64 nSwpStartUs = CTimer::Get()->GetClockTicks();
-	size_t nDone = 0;
-	while (nDone < Block.nFrames)
-	{
-		const size_t nChunk = Utility::Min(Block.nFrames - nDone, kNativeScratchFrames);
-		const libmu50::Status RenderStatus = m_pSynth->render(&m_SwpScratch[0], nChunk);
-		if (!RenderStatus)
-		{
-			// Should not happen after a successful Initialize();
-			// fail safe: enqueue silence for the remainder.
-			for (size_t i = nDone; i < Block.nFrames; ++i)
+	const size_t nDone = RenderSegments(
+		Block.nFrames, Block.nStartCycle, Block.nCycles, Block.nFifoSnap,
+		[this, &Block](size_t nSegDone, size_t nSegChunk) -> bool {
+			(void) nSegDone; // split mode renders into m_SwpScratch[0]
+			const libmu50::Status RenderStatus =
+				m_pSynth->render(&m_SwpScratch[0], nSegChunk);
+			if (!RenderStatus)
+				return false;
+			for (size_t i = 0; i < nSegChunk; ++i)
 			{
-				const TNativeFrame Frame{ 0, 0 };
+				const TNativeFrame Frame{ m_SwpScratch[i * 2], m_SwpScratch[i * 2 + 1] };
 				EnqueueSwpFrame(Block.nSeq, Frame);
 			}
-			__atomic_add_fetch(&m_nSwpRenderUs, CTimer::Get()->GetClockTicks() - nSwpStartUs, __ATOMIC_RELAXED);
-			UpdateRingHighWater();
 			return true;
-		}
-		for (size_t i = 0; i < nChunk; ++i)
+		});
+	if (nDone < Block.nFrames)
+	{
+		// Should not happen after a successful Initialize();
+		// fail safe: enqueue silence for the remainder.
+		for (size_t i = nDone; i < Block.nFrames; ++i)
 		{
-			const TNativeFrame Frame{ m_SwpScratch[i * 2], m_SwpScratch[i * 2 + 1] };
+			const TNativeFrame Frame{ 0, 0 };
 			EnqueueSwpFrame(Block.nSeq, Frame);
 		}
-		nDone += nChunk;
+		// Drain this block's remaining events so SWP state
+		// stays consistent (the old drain-all-up-front had
+		// already applied them by this point).
+		DrainWEventsUpTo(Block.nFifoSnap);
+		__atomic_add_fetch(&m_nSwpRenderUs, CTimer::Get()->GetClockTicks() - nSwpStartUs, __ATOMIC_RELAXED);
+		UpdateRingHighWater();
+		return true;
 	}
+	// Writes stamped at or past the block end (offset == nFrames).
+	DrainWEventsUpTo(Block.nFifoSnap);
 	// Publish the SWP00 state snapshot for the split-mode 0x01 readback
 	// (Claude review 2026-11-15): the state at the end of this block.
 	// Seqlock write: odd seq = writing, even = stable. The audio thread
@@ -1536,6 +2091,10 @@ bool CMU50Synth::PCMTaskIteration()
 			for (int s = 0; s < 5; ++s)
 				m_StateSnapVoice[c][s] = Snap.voice[c][s];
 		m_StateSnapCounter = Snap.sample_counter;
+		// Finding 3: stamp the snapshot with the block it
+		// reflects, so the 0x01 read can tell whether it
+		// already includes a key-on (overlay comparison).
+		m_nStateSnapBlockSeq = Block.nSeq;
 		__atomic_add_fetch(&m_nStateSeq, 1, __ATOMIC_RELEASE); // -> even
 	}
 	__atomic_add_fetch(&m_nSwpRenderUs, CTimer::Get()->GetClockTicks() - nSwpStartUs, __ATOMIC_RELAXED);
@@ -1584,7 +2143,7 @@ bool CMU50Synth::ParkSwp()
 	// PCMTaskIteration continuously -- and the spin below runs to
 	// its bound (same gap as Nuked StopSplitPCM; Claude review
 	// 2026-11-16 round 3).
-	__asm__ volatile ("sev" ::: "memory");
+	WakeSwpCore();
 	// The worker loop calls PCMTaskIteration on wake, so the ack
 	// arrives within microseconds of the sev; the bound below is
 	// a wedge guard, not a timing assumption. Park must be
@@ -1597,7 +2156,7 @@ bool CMU50Synth::ParkSwp()
 		// Re-send sev periodically: core 3 may have re-entered
 		// wfe after the first sev (or read a stale flag).
 		if ((nSpins & 1023U) == 0)
-			__asm__ volatile ("sev" ::: "memory");
+			WakeSwpCore();
 		mu50spsc::CpuRelax();
 	}
 	return false;
@@ -1608,7 +2167,7 @@ void CMU50Synth::UnparkSwp()
 	__atomic_store_n(&m_bSwpActive, true, __ATOMIC_RELEASE);
 	// Wake core 3 if it is sleeping in wfe (it idles there
 	// instead of Yield, which belongs to core 0).
-	__asm__ volatile ("sev" ::: "memory");
+	WakeSwpCore();
 }
 
 u64 CMU50Synth::GetWqFullWaits()
@@ -1931,7 +2490,9 @@ void CMU50Synth::UpdateLCD(CLCD& LCD, unsigned int nTicks)
 			// above is unchanged): per-window MIDI bytes accepted
 			// into the SCI1 queue, SCI1 RDR reads by the firmware,
 			// SWP00 register writes, and the peak native SWP sample
-			// before resampling/gain. Read against the window line,
+			// before resampling/gain (18-bit DAC scale, full scale
+			// 0x20000, since the s32 render path; pre-change logs
+			// show the 16-bit scale, 4x smaller). Read against the window line,
 			// it separates "MIDI never reaches the firmware"
 			// (midi_queued=0) from "firmware reads nothing"
 			// (sci_read=0) from "firmware writes no notes"

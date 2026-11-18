@@ -71,6 +71,13 @@ public:
     // MAME-derived MEG variation programs, chorus and reverb networks.
     Status render(std::int16_t* interleaved_stereo, std::size_t frames);
 
+    // Render stereo interleaved signed 18-bit DAC samples (full scale
+    // 0x20000) as int32 at 44.1 kHz. Same samples as render(int16_t*),
+    // without the >>2 truncation to 16-bit: the DAC is 18-bit, and the
+    // caller (the mt32-pi wrapper) applies its own scale/trim to the
+    // full 18-bit value instead of losing the two low DAC bits here.
+    Status render(std::int32_t* interleaved_stereo, std::size_t frames);
+
     void reset();
     const Config& config() const noexcept;
     bool wave_rom_loaded() const noexcept;

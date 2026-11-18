@@ -4,6 +4,7 @@
 // decoding mirrors MAME HEAD's rchan/rctrl maps; the voice semantics
 // live in Swp0277Core and the MEG tail in MegState.
 #include "libmu50/synth.hpp"
+#include "libmu50/keyon_status.hpp"
 #include "swp00_0277.hpp"
 #include "swp00_meg.hpp"
 
@@ -13,6 +14,30 @@
 #include <utility>
 
 namespace libmu50 {
+
+// Post-key-on SWP00 voice status (see keyon_status.hpp): runs the
+// core's own keyon()/status() on a scratch Swp0277Core seeded with the
+// audio-side register shadow, so the overlay can never drift from the
+// core. One ~5 KB scratch core per call, on the key-on write path (not
+// the per-sample render path); key-ons arrive at MIDI rates.
+void KeyOnStatus(const KeyOnRegs& r, std::uint8_t out[5]) noexcept {
+    detail::Swp0277Core core;
+    core.set_filter_0277(r.filter_0277);
+    core.set_attack_speed(0, r.attack_speed);
+    core.set_attack_level(0, r.attack_level);
+    core.set_decay_speed(0, r.decay_speed);
+    core.set_lpf_info(0, r.lpf_info);
+    core.set_lpf_speed(0, r.lpf_speed);
+    core.set_glo_level(0, r.glo);
+    core.set_pan(0, r.pan);
+    core.keyon(0);
+    out[0] = core.filter_status(0);
+    out[1] = core.envelope_status(0);
+    out[2] = core.mixer_status_glo(0);
+    out[3] = core.mixer_status_panl(0);
+    out[4] = core.mixer_status_panr(0);
+}
+
 namespace {
 constexpr std::size_t kWaveRomSize = 0x400000;
 constexpr std::uint32_t kNativeRate = 44100;
@@ -231,7 +256,7 @@ Status Synth::sysex(const std::uint8_t*, std::size_t) {
     return {Error::unsupported_operation, "MU50 MIDI SysEx and tone-map handling are not implemented"};
 }
 
-Status Synth::render(std::int16_t* output, std::size_t frames) {
+Status Synth::render(std::int32_t* output, std::size_t frames) {
     if (frames && !output)
         return {Error::invalid_argument, "Output buffer is null"};
     if (impl_->config.sample_rate != kNativeRate)
@@ -249,20 +274,54 @@ Status Synth::render(std::int16_t* output, std::size_t frames) {
         // MAME HEAD output staging: the MEG runs on the full 16.6
         // voice buses, and its dry output is converted to a signed
         // 18-bit ADC sample by >>6 with clamp to ±0x20000
-        // (put_int_clamp), then to host signed 16-bit PCM by >>2.
-        // Running the MEG on unshifted buses (instead of pre-shifting
-        // >>6 in render_one) lets the distortion stage's saturate()
-        // in variation variant 0x80 engage exactly as in HEAD. The
-        // final clamp_s16 handles the 0x20000>>2 = 0x8000 edge (one
-        // above int16 max).
+        // (put_int_clamp). Running the MEG on unshifted buses
+        // (instead of pre-shifting >>6 in render_one) lets the
+        // distortion stage's saturate() in variation variant 0x80
+        // engage exactly as in HEAD. This 32-bit render returns
+        // that 18-bit DAC sample as-is (full scale 0x20000); the
+        // 16-bit render below applies the >>2 truncation.
         auto adc = [](std::int64_t v) -> std::int32_t {
             v >>= 6;
             if (v > 0x20000) v = 0x20000;
             if (v < -0x20000) v = -0x20000;
             return static_cast<std::int32_t>(v);
         };
-        output[2 * i] = clamp_s16(adc(routed[0]) >> 2);
-        output[2 * i + 1] = clamp_s16(adc(routed[1]) >> 2);
+        output[2 * i] = adc(routed[0]);
+        output[2 * i + 1] = adc(routed[1]);
+    }
+    return {};
+}
+
+Status Synth::render(std::int16_t* output, std::size_t frames) {
+    // Same guards as render(int32_t*) and as the pre-PR#15 direct
+    // path (c4d640c): null output, sample rate and ROM are validated
+    // even for a 0-frame call, so render(nullptr, N) cannot write
+    // through the null pointer and a 0-frame call still reports a
+    // bad rate / missing ROM instead of silently succeeding.
+    if (frames && !output)
+        return {Error::invalid_argument, "Output buffer is null"};
+    if (impl_->config.sample_rate != kNativeRate)
+        return {Error::unsupported_sample_rate, "The SWP00 core currently renders at its native 44100 Hz rate"};
+    if (impl_->wave_rom.empty())
+        return {Error::rom_not_loaded, "Load the MU50 waveform ROM before rendering"};
+    // 16-bit PCM via the 18-bit render, in chunks: the >>2 discards
+    // the two low DAC bits, exactly as the old direct path did
+    // (clamp_s16(adc >> 2)), so this is bit-identical to it. The
+    // final clamp_s16 handles the 0x20000>>2 = 0x8000 edge (one
+    // above int16 max).
+    constexpr std::size_t kChunkFrames = 512;
+    std::int32_t buf[2 * kChunkFrames];
+    std::size_t done = 0;
+    while (done < frames) {
+        const std::size_t chunk = std::min(kChunkFrames, frames - done);
+        Status st = render(buf, chunk);
+        if (!st)
+            return st;
+        for (std::size_t i = 0; i < chunk; ++i) {
+            output[2 * (done + i)] = clamp_s16(buf[2 * i] >> 2);
+            output[2 * (done + i) + 1] = clamp_s16(buf[2 * i + 1] >> 2);
+        }
+        done += chunk;
     }
     return {};
 }

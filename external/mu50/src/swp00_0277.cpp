@@ -425,7 +425,19 @@ void Swp0277Core::FilterBlock::keyon() noexcept {
             m_k = 0x800;
         }
     } else {
+        // Deviation from MAME HEAD (filter_block::keyon in
+        // swp00.cpp): HEAD also leaves m_sweep untouched here, so
+        // a previous sweep note's state leaks into the next
+        // non-sweep note on the same voice -- a stale SWEEP_UP
+        // keeps stepping m_k in step() (HEAD) or leaves the sweep
+        // timer running and the status bit clear (0277),
+        // corrupting the filter for the following notes. A key-on
+        // starts a new note, so reset the sweep state: with
+        // SWEEP_NONE and m_k == m_k_target, step() is a no-op and
+        // status() still reports done (0xc0).
         m_k = m_k_target;
+        m_sweep = SWEEP_NONE;
+        m_sweep_timer = 0;
     }
 }
 
